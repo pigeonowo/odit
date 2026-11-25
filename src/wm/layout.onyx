@@ -138,6 +138,7 @@ WindowManager :: struct {
     saved_panes:       [..] SavedPaneLayout;
     has_saved_layout:  bool;
     autosave:          bool;
+    last_cursor:       i32;
 
     // Status toast notification
     toast_text:        str;
@@ -181,6 +182,7 @@ wm_init :: (wm: &WindowManager) {
     wm.saved_panes       = make([..] SavedPaneLayout);
     wm.has_saved_layout  = false;
     wm.autosave          = true;
+    wm.last_cursor       = 0;
     wm.toast_text        = "";
     wm.toast_timer       = 0.0f;
 }
@@ -514,7 +516,7 @@ wm_point_over_floating :: (wm: &WindowManager, px, py: f32) -> bool {
 wm_content_pane_at :: (wm: &WindowManager, px, py: f32) -> u32 {
     // Floating windows occlude everything beneath them (check top-most z_order first)
     floats := wm_floating_indices_sorted(wm, context.temp_allocator);
-    fi := floats.count - 1;
+    fi: i32 = cast(i32) floats.count - 1;
     while fi >= 0 {
         p := &wm.panes[floats[fi]];
         if hit_rect(px, py, p.rect) {
@@ -787,32 +789,35 @@ wm_update_layout :: (wm: &WindowManager, screen_w, screen_h, dt: f32, block_mous
         wm.hovered_splitter = .None;
     }
 
-    // Visual mouse cursor hint (Raylib MouseCursor: 0=Default, 5=EW, 6=NS, 7=NWSE, 9=All)
-    cursor_id: i32 = 0;
+    // Visual mouse cursor hint (only call SetMouseCursor on change, using universally supported X11/GLFW shapes)
+    cursor_id: i32 = 0; // DEFAULT
     if wm.resize_window_id != 0 {
-        cursor_id = 7;
+        cursor_id = 4; // POINTING_HAND (avoids X11 missing NWSE cursor warning 65547)
     } elseif wm.drag_active {
-        cursor_id = 9;
+        cursor_id = 4; // POINTING_HAND
     } elseif wm.active_splitter == .Left || wm.active_splitter == .Right ||
              wm.hovered_splitter == .Left || wm.hovered_splitter == .Right {
-        cursor_id = 5;
+        cursor_id = 5; // RESIZE_EW
     } elseif wm.active_splitter == .Bottom || wm.hovered_splitter == .Bottom {
-        cursor_id = 6;
+        cursor_id = 6; // RESIZE_NS
     } elseif !block_mouse {
         // Check hover over top-most floating window's bottom-right resize grip
         fl := wm_floating_indices_sorted(wm, context.temp_allocator);
-        fi_c := fl.count - 1;
+        fi_c: i32 = cast(i32) fl.count - 1;
         while fi_c >= 0 {
             fp := &wm.panes[fl[fi_c]];
             if hit_rect(mpos.x, mpos.y, fp.rect) {
                 grip := PaneRect.{ fp.rect.x + fp.rect.w - RESIZE_GRIP, fp.rect.y + fp.rect.h - RESIZE_GRIP, RESIZE_GRIP, RESIZE_GRIP };
-                if hit_rect(mpos.x, mpos.y, grip) do cursor_id = 7;
+                if hit_rect(mpos.x, mpos.y, grip) do cursor_id = 4;
                 break;
             }
             fi_c -= 1;
         }
     }
-    raylib.SetMouseCursor(cursor_id);
+    if cursor_id != wm.last_cursor {
+        wm.last_cursor = cursor_id;
+        raylib.SetMouseCursor(cursor_id);
+    }
 
     // 1. Continue active floating-window resize
     if wm.resize_window_id != 0 {
@@ -910,7 +915,7 @@ wm_update_layout :: (wm: &WindowManager, screen_w, screen_h, dt: f32, block_mous
     if pressed {
         // 4a. Floating panes in reverse z_order (top-most first)
         floats := wm_floating_indices_sorted(wm, context.temp_allocator);
-        fi := floats.count - 1;
+        fi: i32 = cast(i32) floats.count - 1;
         while fi >= 0 {
             p := &wm.panes[floats[fi]];
             if hit_rect(mpos.x, mpos.y, p.rect) {

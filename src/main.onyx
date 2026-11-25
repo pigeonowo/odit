@@ -557,6 +557,14 @@ run_headless_selftest :: () {
     }
 
     // 4) Window Manager docking, swapping, floating z-order occlusion, and layout persistence tests
+    // First test wm_content_pane_at when ZERO floating panes exist (regression for u32 count-1 underflow)
+    wm.wm_compute_rects(&g_app.window_mgr, 1440.0f, 900.0f);
+    hit0 := wm.wm_content_pane_at(&g_app.window_mgr, 100.0f, 100.0f);
+    if hit0 != 0 {
+        printf("[odit] FAIL: Expected editor hit (0) with zero floating panes, got {}\n", hit0);
+        os.exit(1);
+    }
+
     wm.wm_set_pane_dock(&g_app.window_mgr, wid_fe, .LeftSide);
     wm.wm_set_pane_dock(&g_app.window_mgr, wid_br, .Bottom);
     wm.wm_set_pane_dock(&g_app.window_mgr, wid_wat, .RightGrid);
