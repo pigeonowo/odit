@@ -557,8 +557,17 @@ run_headless_selftest :: () {
     }
 
     // 4) Window Manager docking, swapping, floating z-order occlusion, and layout persistence tests
-    // First test wm_content_pane_at when ZERO floating panes exist (regression for u32 count-1 underflow)
+    // First test default RightGrid layout (like startup) & wm_content_pane_at with ZERO floating panes
     wm.wm_compute_rects(&g_app.window_mgr, 1440.0f, 900.0f);
+    printf("[odit] Default layout: editor=({},{},{}x{}), pane0=({},{},{}x{})\n",
+           cast(i32) g_app.window_mgr.editor_rect.x, cast(i32) g_app.window_mgr.editor_rect.y,
+           cast(i32) g_app.window_mgr.editor_rect.w, cast(i32) g_app.window_mgr.editor_rect.h,
+           cast(i32) g_app.window_mgr.panes[0].rect.x, cast(i32) g_app.window_mgr.panes[0].rect.y,
+           cast(i32) g_app.window_mgr.panes[0].rect.w, cast(i32) g_app.window_mgr.panes[0].rect.h);
+    if g_app.window_mgr.panes[0].rect.w < 100.0f || g_app.window_mgr.panes[0].rect.h < 100.0f {
+        println("[odit] FAIL: Default RightGrid pane has degenerate size");
+        os.exit(1);
+    }
     hit0 := wm.wm_content_pane_at(&g_app.window_mgr, 100.0f, 100.0f);
     if hit0 != 0 {
         printf("[odit] FAIL: Expected editor hit (0) with zero floating panes, got {}\n", hit0);

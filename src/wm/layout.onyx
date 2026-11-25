@@ -568,11 +568,16 @@ wm_compute_rects :: (wm: &WindowManager, screen_w, screen_h: f32) {
     wm.has_right  = right_idxs.count > 0;
     wm.has_bottom = bottom_idxs.count > 0;
 
-    left_w:  f32 = (work_w * wm.left_ratio)  if wm.has_left  else 0.0f;
-    right_w: f32 = (work_w * wm.right_ratio) if wm.has_right else 0.0f;
+    left_w:  f32 = 0.0f;
+    if wm.has_left  do left_w  = work_w * wm.left_ratio;
+    right_w: f32 = 0.0f;
+    if wm.has_right do right_w = work_w * wm.right_ratio;
 
     min_center: f32 = 240.0f;
-    splits_w: f32 = (SPLITTER_W if wm.has_left else 0.0f) + (SPLITTER_W if wm.has_right else 0.0f);
+    splits_w: f32 = 0.0f;
+    if wm.has_left  do splits_w += SPLITTER_W;
+    if wm.has_right do splits_w += SPLITTER_W;
+
     if left_w + right_w > work_w - min_center - splits_w {
         avail := work_w - min_center - splits_w;
         if avail < 0.0f do avail = 0.0f;
@@ -583,9 +588,13 @@ wm_compute_rects :: (wm: &WindowManager, screen_w, screen_h: f32) {
         }
     }
 
-    center_x := work_x + ((left_w + SPLITTER_W) if wm.has_left else 0.0f);
-    center_w := work_w - ((left_w + SPLITTER_W) if wm.has_left else 0.0f)
-                       - ((right_w + SPLITTER_W) if wm.has_right else 0.0f);
+    left_total: f32 = 0.0f;
+    if wm.has_left do left_total = left_w + SPLITTER_W;
+    right_total: f32 = 0.0f;
+    if wm.has_right do right_total = right_w + SPLITTER_W;
+
+    center_x := work_x + left_total;
+    center_w := work_w - left_total - right_total;
     if center_w < 160.0f do center_w = 160.0f;
 
     wm.center_col_x  = center_x;
