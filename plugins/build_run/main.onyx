@@ -1,0 +1,842 @@
+// =============================================================================
+// Onyx Editor ("odit") — Build & Run WASM Plugin (Phase 3.1 Improved, OBV-inspired)
+// =============================================================================
+// Features:
+//   - Persistent project build configuration stored in `odit-build.json`
+//     (auto-saved on UI change, auto-reloaded when saved in the editor!)
+//   - Supports building AND running `odit` inside `odit` (`src/main.onyx` -> `build/odit.wasm`)
+//   - Modes: `build`, `build-exe`, `check`
+//   - Runtimes: `onyx`, `wasi`, `wasip2`, `js`, `custom`
+//   - OBV-style compiler flags drawer (`--debug`, `--stack-trace`, `--generate-name-section`,
+//     `--print-function-mappings`, `--multi-threaded`, `--wasm-mvp`, `--jit`,
+//     `--verbose`, `--show-all-errors`, `--doc`)
+//   - 2-stage Build -> Run pipeline with elapsed duration timer & clean exit pills
+//   - Clickable error lines (`file.onyx:line:col`) that jump the main editor!
+
+#load "../../abi/abi.onyx"
+#load "../../sdk/plugin_sdk.onyx"
+
+use core { memory, Array }
+use odit.abi
+use odit.sdk
+
+CONFIG_FILE :: "odit-build.json"
+
+LogKind :: enum {
+    Normal;
+    Command;
+    Info;
+    Success;
+    Warning;
+    Error;
+}
+
+LogLine :: struct {
+    kind:     LogKind;
+    text:     str;
+    err_path: str;
+    err_line: i32;
+    err_col:  i32;
+}
+
+BuildConfig :: struct {
+    mode_idx:       i32; // 0=build, 1=build-exe, 2=check
+    runtime_idx:    i32; // 0=onyx, 1=wasi, 2=wasip2, 3=js, 4=custom
+    entry_buf:      [128] u8;
+    entry_len:      u32;
+    out_buf:        [128] u8;
+    out_len:        u32;
+    args_buf:       [128] u8;
+    args_len:       u32;
+
+    // OBV-inspired compiler flags
+    debug:          bool;
+    stack_trace:    bool;
+    name_section:   bool;
+    func_mappings:  bool;
+    multi_threaded: bool;
+    wasm_mvp:       bool;
+    jit:            bool;
+    verbose:        bool;
+    show_all_errs:  bool;
+    doc:            bool;
+}
+
+g_cfg:          BuildConfig;
+g_show_flags:   bool = false;
+
+g_proc_handle:  u32 = 0;
+g_proc_state:   abi.ProcState = .Invalid;
+g_exit_code:    i32 = 0;
+g_run_after:    bool = false;
+g_is_running:   bool = false; // true during stage 2 (`onyx run`)
+g_elapsed:      f32 = 0.0f;
+g_last_dur:     f32 = 0.0f;
+
+g_logs:         [..] LogLine;
+g_partial_line: [..] u8;
+g_scroll_y:     f32 = 0.0f;
+g_auto_scroll:  bool = true;
+
+MANIFEST_JSON :: """{"id":"odit.build_run","title":"Build & Run","version":"0.2.0","default_slot":0,"default_width":420,"default_height":380,"event_mask":99,"allow_multiple":false}"""
+
+MODE_ITEMS    :: "build\nbuild-exe\ncheck"
+RUNTIME_ITEMS :: "onyx\nwasi\nwasip2\njs\ncustom"
+
+#export "odit_plugin_manifest" plugin_manifest
+plugin_manifest :: (out_ptr: u32, out_cap: u32) -> i32 {
+    return sdk.write_out_str(MANIFEST_JSON, out_ptr, out_cap);
+}
+
+#local
+set_buf :: (dst: [] u8, len: &u32, s: str) {
+    n := s.count;
+    if n > dst.count - 1 do n = dst.count - 1;
+    if n > 0 do memory.copy(dst.data, s.data, n);
+    *len = cast(u32) n;
+}
+
+#local
+cfg_defaults :: () {
+    g_cfg.mode_idx       = 0; // build
+    g_cfg.runtime_idx    = 0; // onyx
+    set_buf(g_cfg.entry_buf, &g_cfg.entry_len, "src/main.onyx");
+    set_buf(g_cfg.out_buf,   &g_cfg.out_len,   "build/odit.wasm");
+    set_buf(g_cfg.args_buf,  &g_cfg.args_len,  "");
+    g_cfg.debug          = false;
+    g_cfg.stack_trace    = true;
+    g_cfg.name_section   = false;
+    g_cfg.func_mappings  = false;
+    g_cfg.multi_threaded = false;
+    g_cfg.wasm_mvp       = false;
+    g_cfg.jit            = false;
+    g_cfg.verbose        = false;
+    g_cfg.show_all_errs  = false;
+    g_cfg.doc            = false;
+}
+
+#local
+mode_to_str :: (idx: i32) -> str {
+    return switch idx {
+        case 1 => "build-exe";
+        case 2 => "check";
+        case _ => "build";
+    };
+}
+
+#local
+runtime_to_str :: (idx: i32) -> str {
+    return switch idx {
+        case 1 => "wasi";
+        case 2 => "wasip2";
+        case 3 => "js";
+        case 4 => "custom";
+        case _ => "onyx";
+    };
+}
+
+#local
+cfg_load :: () -> bool {
+    cfg_defaults();
+    js := sdk.workspace_read_file(CONFIG_FILE, context.temp_allocator);
+    if js.count == 0 do return false;
+
+    m := sdk.json_get_str(js, "mode", context.temp_allocator);
+    if str.equal(m, "build-exe") do g_cfg.mode_idx = 1;
+    elseif str.equal(m, "check") do g_cfg.mode_idx = 2;
+    else                         do g_cfg.mode_idx = 0;
+
+    r := sdk.json_get_str(js, "runtime", context.temp_allocator);
+    if str.equal(r, "wasi")        do g_cfg.runtime_idx = 1;
+    elseif str.equal(r, "wasip2")  do g_cfg.runtime_idx = 2;
+    elseif str.equal(r, "js")      do g_cfg.runtime_idx = 3;
+    elseif str.equal(r, "custom")  do g_cfg.runtime_idx = 4;
+    else                           do g_cfg.runtime_idx = 0;
+
+    ent := sdk.json_get_str(js, "entry", context.temp_allocator);
+    if ent.count > 0 do set_buf(g_cfg.entry_buf, &g_cfg.entry_len, ent);
+
+    out := sdk.json_get_str(js, "output", context.temp_allocator);
+    if out.count > 0 do set_buf(g_cfg.out_buf, &g_cfg.out_len, out);
+
+    ra := sdk.json_get_str(js, "run_args", context.temp_allocator);
+    set_buf(g_cfg.args_buf, &g_cfg.args_len, ra);
+
+    g_cfg.debug          = sdk.json_get_bool(js, "debug");
+    g_cfg.stack_trace    = sdk.json_get_bool(js, "stack_trace");
+    g_cfg.name_section   = sdk.json_get_bool(js, "name_section");
+    g_cfg.func_mappings  = sdk.json_get_bool(js, "func_mappings");
+    g_cfg.multi_threaded = sdk.json_get_bool(js, "multi_threaded");
+    g_cfg.wasm_mvp       = sdk.json_get_bool(js, "wasm_mvp");
+    g_cfg.jit            = sdk.json_get_bool(js, "jit");
+    g_cfg.verbose        = sdk.json_get_bool(js, "verbose");
+    g_cfg.show_all_errs  = sdk.json_get_bool(js, "show_all_errors");
+    g_cfg.doc            = sdk.json_get_bool(js, "doc");
+    return true;
+}
+
+#local
+cfg_save :: () {
+    out := make([..] u8, 512, context.temp_allocator);
+    ent := str.{ &g_cfg.entry_buf[0], cast(i32) g_cfg.entry_len };
+    of  := str.{ &g_cfg.out_buf[0],   cast(i32) g_cfg.out_len };
+    ra  := str.{ &g_cfg.args_buf[0],  cast(i32) g_cfg.args_len };
+
+    Array.concat(&out, "{\n");
+    Array.concat(&out, "    \"mode\": \"");      Array.concat(&out, mode_to_str(g_cfg.mode_idx));       Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"runtime\": \"");   Array.concat(&out, runtime_to_str(g_cfg.runtime_idx)); Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"entry\": \"");     Array.concat(&out, ent);                               Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"output\": \"");    Array.concat(&out, of);                                Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"run_args\": \"");  Array.concat(&out, ra);                                Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"debug\": ");           Array.concat(&out, "true,\n" if g_cfg.debug else "false,\n");
+    Array.concat(&out, "    \"stack_trace\": ");     Array.concat(&out, "true,\n" if g_cfg.stack_trace else "false,\n");
+    Array.concat(&out, "    \"name_section\": ");    Array.concat(&out, "true,\n" if g_cfg.name_section else "false,\n");
+    Array.concat(&out, "    \"func_mappings\": ");   Array.concat(&out, "true,\n" if g_cfg.func_mappings else "false,\n");
+    Array.concat(&out, "    \"multi_threaded\": ");  Array.concat(&out, "true,\n" if g_cfg.multi_threaded else "false,\n");
+    Array.concat(&out, "    \"wasm_mvp\": ");        Array.concat(&out, "true,\n" if g_cfg.wasm_mvp else "false,\n");
+    Array.concat(&out, "    \"jit\": ");             Array.concat(&out, "true,\n" if g_cfg.jit else "false,\n");
+    Array.concat(&out, "    \"verbose\": ");         Array.concat(&out, "true,\n" if g_cfg.verbose else "false,\n");
+    Array.concat(&out, "    \"show_all_errors\": "); Array.concat(&out, "true,\n" if g_cfg.show_all_errs else "false,\n");
+    Array.concat(&out, "    \"doc\": ");             Array.concat(&out, "true\n"  if g_cfg.doc else "false\n");
+    Array.concat(&out, "}\n");
+
+    sdk.workspace_write_file(CONFIG_FILE, str.{ out.data, out.count });
+}
+
+#export "odit_plugin_init" plugin_init
+plugin_init :: (window_id: u32) -> i32 {
+    g_logs         = make([..] LogLine);
+    g_partial_line = make([..] u8);
+
+    if !cfg_load() {
+        cfg_save();
+    }
+
+    sdk.register_command("build_run.build",       "Build & Run: Build Project", "");
+    sdk.register_command("build_run.build_run",   "Build & Run: Build & Run Project", "");
+    sdk.register_command("build_run.check",       "Build & Run: Type-Check Project", "");
+    sdk.register_command("build_run.stop",        "Build & Run: Stop Running Process", "");
+    sdk.register_command("build_run.edit_config", "Build & Run: Edit odit-build.json", "");
+
+    append_log(.Info, "Loaded build settings from odit-build.json");
+    return 0;
+}
+
+#export "odit_plugin_shutdown" plugin_shutdown
+plugin_shutdown :: (window_id: u32) -> void {
+    if g_proc_handle != 0 && g_proc_state == .Running {
+        sdk.proc_kill(g_proc_handle);
+        g_proc_handle = 0;
+    }
+}
+
+#export "odit_plugin_event" plugin_event
+plugin_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len: u32) -> void {
+    ev := cast(abi.EventType) event_type;
+    if ev == .BufferModified && payload_ptr != 0 && payload_len > 0 {
+        payload := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
+        if str_has(payload, CONFIG_FILE) && str_has(payload, "\"saved\":true") {
+            cfg_load();
+            append_log(.Info, "Reloaded odit-build.json");
+        }
+    } elseif ev == .CommandInvoked && payload_ptr != 0 && payload_len > 0 {
+        payload := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
+        if str_has(payload, "build_run.build_run") {
+            start_build_job(true, false);
+        } elseif str_has(payload, "build_run.build") {
+            start_build_job(false, false);
+        } elseif str_has(payload, "build_run.check") {
+            start_build_job(false, true);
+        } elseif str_has(payload, "build_run.stop") {
+            stop_job();
+        } elseif str_has(payload, "build_run.edit_config") {
+            sdk.editor_open(CONFIG_FILE, 1, 1);
+        }
+    }
+}
+
+#local
+classify_line :: (line: str) -> LogKind {
+    if str_has(line, "error:") || str_has(line, "Error") || str_has(line, "FAIL") do return .Error;
+    if str_has(line, "warning:") || str_has(line, "Warning") do return .Warning;
+    if str_has(line, "PASS") || str_has(line, "Finished") || str_has(line, "exit 0") do return .Success;
+    return .Normal;
+}
+
+/// Extracts clickable `path.onyx:line,col` or `path.onyx:line:col` from Onyx compiler diagnostics.
+#local
+parse_error_loc :: (line: str) -> (str, i32, i32) {
+    // Look for ".onyx:" inside the line
+    idx := -1;
+    needle := ".onyx:";
+    if line.count >= needle.count {
+        for i in 0 .. (line.count - needle.count + 1) {
+            ok := true;
+            for j in 0 .. needle.count {
+                if line[i + j] != needle[j] { ok = false; break; }
+            }
+            if ok { idx = i; break; }
+        }
+    }
+    if idx < 0 do return "", 0, 0;
+
+    // Walk backward to start of path token
+    ps := idx;
+    while ps > 0 && line[ps - 1] != ' ' && line[ps - 1] != '\t' do ps -= 1;
+    pe := idx + 5; // end of ".onyx"
+    raw_path := line[ps .. pe];
+
+    // Strip absolute workspace prefix if present (keep relative `src/...` or `plugins/...`)
+    rel := raw_path;
+    for marker in str.[ "/src/", "/plugins/", "/abi/", "/sdk/" ] {
+        for k in 0 .. (raw_path.count - marker.count + 1) {
+            ok := true;
+            for j in 0 .. marker.count {
+                if raw_path[k + j] != marker[j] { ok = false; break; }
+            }
+            if ok {
+                rel = raw_path[(k + 1) .. raw_path.count];
+                break;
+            }
+        }
+    }
+
+    // Parse line number & optional column after ":"
+    p := pe + 1;
+    ln: i32 = 0;
+    while p < line.count && line[p] >= '0' && line[p] <= '9' {
+        ln = ln * 10 + cast(i32) (line[p] - '0');
+        p += 1;
+    }
+    col: i32 = 1;
+    if p < line.count && (line[p] == ':' || line[p] == ',') {
+        p += 1;
+        c: i32 = 0;
+        while p < line.count && line[p] >= '0' && line[p] <= '9' {
+            c = c * 10 + cast(i32) (line[p] - '0');
+            p += 1;
+        }
+        if c > 0 do col = c;
+    }
+
+    return rel, ln, col;
+}
+
+#local
+append_log :: (kind: LogKind, line: str) {
+    if g_logs.count >= 600 {
+        str.free(g_logs[0].text);
+        if g_logs[0].err_path.count > 0 do str.free(g_logs[0].err_path);
+        Array.remove_at(&g_logs, 0);
+    }
+    ep, el, ec := parse_error_loc(line);
+    g_logs << .{
+        kind     = kind,
+        text     = str.copy(line),
+        err_path = str.copy(ep) if ep.count > 0 else "",
+        err_line = el,
+        err_col  = ec,
+    };
+    g_auto_scroll = true;
+}
+
+#local
+clear_logs :: () {
+    for &l in g_logs {
+        str.free(l.text);
+        if l.err_path.count > 0 do str.free(l.err_path);
+    }
+    Array.clear(&g_logs);
+    Array.clear(&g_partial_line);
+    g_scroll_y = 0.0f;
+}
+
+#local
+ingest_chunk :: (data: [] u8) {
+    for i in 0 .. data.count {
+        ch := data[i];
+        if ch == '\r' do continue;
+        if ch == '\n' {
+            line := str.{ g_partial_line.data, g_partial_line.count };
+            append_log(classify_line(line), line);
+            Array.clear(&g_partial_line);
+        } else {
+            g_partial_line << ch;
+        }
+    }
+}
+
+#local
+flush_partial :: () {
+    if g_partial_line.count > 0 {
+        line := str.{ g_partial_line.data, g_partial_line.count };
+        append_log(classify_line(line), line);
+        Array.clear(&g_partial_line);
+    }
+}
+
+#local
+start_build_job :: (run_after: bool, force_check: bool) {
+    if g_proc_handle != 0 && g_proc_state == .Running {
+        sdk.notify(.Warn, "A build/run process is already running");
+        return;
+    }
+
+    clear_logs();
+    g_elapsed    = 0.0f;
+    g_is_running = false;
+    g_run_after  = run_after && !force_check && g_cfg.mode_idx != 2;
+
+    entry := str.{ &g_cfg.entry_buf[0], cast(i32) g_cfg.entry_len };
+    if entry.count == 0 do entry = "src/main.onyx";
+    out_f := str.{ &g_cfg.out_buf[0], cast(i32) g_cfg.out_len };
+    if out_f.count == 0 do out_f = "build/odit.wasm";
+
+    mode := "check" if force_check else mode_to_str(g_cfg.mode_idx);
+    rt   := runtime_to_str(g_cfg.runtime_idx);
+
+    args := make([..] u8, 256, context.temp_allocator);
+    cmd_disp := make([..] u8, 256, context.temp_allocator);
+    Array.concat(&cmd_disp, "$ onyx ");
+
+    add_arg :: macro (a: str) {
+        Array.concat(&args, a);
+        Array.concat(&args, "\n");
+        Array.concat(&cmd_disp, a);
+        Array.concat(&cmd_disp, " ");
+    }
+
+    add_arg(mode);
+    add_arg("--no-colors");
+    if str.equal(mode, "build") {
+        add_arg("-r");
+        add_arg(rt);
+        add_arg("-o");
+        add_arg(out_f);
+    } elseif str.equal(mode, "build-exe") {
+        add_arg("-o");
+        add_arg(out_f);
+    }
+
+    if g_cfg.debug          do add_arg("--debug");
+    if g_cfg.stack_trace    do add_arg("--stack-trace");
+    if g_cfg.name_section   do add_arg("--generate-name-section");
+    if g_cfg.func_mappings  do add_arg("--print-function-mappings");
+    if g_cfg.multi_threaded do add_arg("--multi-threaded");
+    if g_cfg.wasm_mvp       do add_arg("--wasm-mvp");
+    if g_cfg.jit            do add_arg("--jit");
+    if g_cfg.verbose        do add_arg("--verbose");
+    if g_cfg.show_all_errs  do add_arg("--show-all-errors");
+    if g_cfg.doc            do add_arg("--doc");
+
+    add_arg(entry);
+
+    append_log(.Command, str.{ cmd_disp.data, cmd_disp.count });
+
+    h := sdk.proc_spawn("onyx", str.{ args.data, args.count });
+    if h == 0 {
+        g_proc_state = .Failed;
+        g_exit_code = -1;
+        append_log(.Error, "Failed to spawn onyx compiler.");
+        return;
+    }
+
+    g_proc_handle = h;
+    g_proc_state  = .Running;
+    g_exit_code   = 0;
+}
+
+#local
+start_run_stage :: () {
+    out_f := str.{ &g_cfg.out_buf[0], cast(i32) g_cfg.out_len };
+    if out_f.count == 0 do out_f = "build/odit.wasm";
+    extra := str.{ &g_cfg.args_buf[0], cast(i32) g_cfg.args_len };
+
+    g_is_running = true;
+    g_run_after  = false;
+    g_elapsed    = 0.0f;
+
+    args := make([..] u8, 256, context.temp_allocator);
+    cmd_disp := make([..] u8, 256, context.temp_allocator);
+
+    if g_cfg.mode_idx == 1 {
+        // Native executable built with build-exe
+        Array.concat(&cmd_disp, "$ ./");
+        Array.concat(&cmd_disp, out_f);
+        append_space_split_args(&args, &cmd_disp, extra);
+        append_log(.Command, str.{ cmd_disp.data, cmd_disp.count });
+        exe := make([..] u8, out_f.count + 4, context.temp_allocator);
+        Array.concat(&exe, "./");
+        Array.concat(&exe, out_f);
+        g_proc_handle = sdk.proc_spawn(str.{ exe.data, exe.count }, str.{ args.data, args.count });
+    } else {
+        // Run compiled .wasm directly via `onyx run <out.wasm>` (builds & runs editor inside editor!)
+        Array.concat(&cmd_disp, "$ onyx run ");
+        Array.concat(&args, "run\n");
+        if g_cfg.jit {
+            Array.concat(&args, "--jit\n");
+            Array.concat(&cmd_disp, "--jit ");
+        }
+        Array.concat(&args, out_f);
+        Array.concat(&args, "\n");
+        Array.concat(&cmd_disp, out_f);
+        if extra.count > 0 {
+            Array.concat(&args, "--\n");
+            Array.concat(&cmd_disp, " --");
+            append_space_split_args(&args, &cmd_disp, extra);
+        }
+        append_log(.Command, str.{ cmd_disp.data, cmd_disp.count });
+        g_proc_handle = sdk.proc_spawn("onyx", str.{ args.data, args.count });
+    }
+
+    if g_proc_handle == 0 {
+        g_proc_state = .Failed;
+        g_exit_code = -1;
+        append_log(.Error, "Failed to launch target executable.");
+        return;
+    }
+    g_proc_state = .Running;
+    sdk.notify(.Info, "Launched target process");
+}
+
+#local
+append_space_split_args :: (args: &[..] u8, disp: &[..] u8, extra: str) {
+    i := 0;
+    while i < extra.count {
+        while i < extra.count && extra[i] == ' ' do i += 1;
+        start := i;
+        while i < extra.count && extra[i] != ' ' do i += 1;
+        if i > start {
+            tok := extra[start .. i];
+            Array.concat(args, tok);
+            Array.concat(args, "\n");
+            Array.concat(disp, " ");
+            Array.concat(disp, tok);
+        }
+    }
+}
+
+#local
+stop_job :: () {
+    if g_proc_handle != 0 && g_proc_state == .Running {
+        sdk.proc_kill(g_proc_handle);
+        g_proc_handle = 0;
+        g_proc_state  = .Killed;
+        g_run_after   = false;
+        g_exit_code   = -1;
+        flush_partial();
+        append_log(.Warning, "Process stopped by user.");
+        sdk.notify(.Warn, "Process stopped");
+    }
+}
+
+#local
+poll_active_process :: (dt: f32) {
+    if g_proc_handle == 0 do return;
+    if g_proc_state == .Running do g_elapsed += dt;
+
+    buf: [4096] u8;
+    for _ in 0 .. 8 {
+        n := sdk.proc_read(g_proc_handle, abi.StreamMask.Stdout | .Stderr, buf);
+        if n > 0 do ingest_chunk(buf[0 .. n]);
+        else do break;
+    }
+
+    if g_proc_state == .Running {
+        code: i32 = 0;
+        st := sdk.proc_poll(g_proc_handle, &code);
+        if st != .Running {
+            for _ in 0 .. 8 {
+                n := sdk.proc_read(g_proc_handle, abi.StreamMask.Stdout | .Stderr, buf);
+                if n > 0 do ingest_chunk(buf[0 .. n]);
+                else do break;
+            }
+            flush_partial();
+            g_last_dur   = g_elapsed;
+            g_proc_state = st;
+            g_exit_code  = code;
+            sdk.proc_kill(g_proc_handle);
+            g_proc_handle = 0;
+
+            if st == .Exited && code == 0 {
+                dur_buf: [64] u8;
+                append_log(.Success, format_done_line(&dur_buf, g_is_running, g_last_dur));
+                if g_run_after && !g_is_running {
+                    start_run_stage();
+                } else {
+                    sdk.notify(.Info, "Build/Run finished (exit 0)");
+                }
+            } else {
+                g_run_after = false;
+                msg_buf: [64] u8;
+                append_log(.Error, format_exit_line(&msg_buf, code));
+                sdk.notify(.Error, "Build/Run failed");
+            }
+        }
+    }
+}
+
+#local
+count_active_flags :: () -> i32 {
+    n := 0;
+    if g_cfg.debug          do n += 1;
+    if g_cfg.stack_trace    do n += 1;
+    if g_cfg.name_section   do n += 1;
+    if g_cfg.func_mappings  do n += 1;
+    if g_cfg.multi_threaded do n += 1;
+    if g_cfg.wasm_mvp       do n += 1;
+    if g_cfg.jit            do n += 1;
+    if g_cfg.verbose        do n += 1;
+    if g_cfg.show_all_errs  do n += 1;
+    if g_cfg.doc            do n += 1;
+    return n;
+}
+
+#export "odit_plugin_render" plugin_render
+plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
+    sdk.begin_frame();
+
+    ctx := cast(&abi.FrameContext) ctx_ptr;
+    poll_active_process(ctx.delta_time);
+
+    pad: f32 = 10.0f;
+    w := ctx.width - pad * 2.0f;
+    if w < 140.0f do w = 140.0f;
+    y := pad;
+    cfg_changed := false;
+
+    // Row 1: Action Toolbar (Build / Build & Run / Check / Stop / Config)
+    running := g_proc_state == .Running;
+    bw := (w - 24.0f) / 5.0f;
+    if sdk.button(1, pad, y, bw, 28.0f, "Build", .Disabled if running else .Primary) & .Clicked {
+        start_build_job(false, false);
+    }
+    if sdk.button(2, pad + (bw + 6.0f), y, bw, 28.0f, "Run", .Disabled if running else .Active) & .Clicked {
+        start_build_job(true, false);
+    }
+    if sdk.button(3, pad + (bw + 6.0f) * 2.0f, y, bw, 28.0f, "Check", .Disabled if running else .Ghost) & .Clicked {
+        start_build_job(false, true);
+    }
+    if sdk.button(4, pad + (bw + 6.0f) * 3.0f, y, bw, 28.0f, "Stop", .Danger if running else .Disabled) & .Clicked {
+        stop_job();
+    }
+    if sdk.button(5, pad + (bw + 6.0f) * 4.0f, y, bw, 28.0f, "Config", .Ghost) & .Clicked {
+        sdk.editor_open(CONFIG_FILE, 1, 1);
+    }
+    y += 34.0f;
+
+    // Row 2: Mode dropdown + Runtime dropdown + Status pill
+    mw := w * 0.28f;
+    rw := w * 0.28f;
+    new_m := sdk.dropdown(10, pad, y, mw, 26.0f, MODE_ITEMS, g_cfg.mode_idx);
+    if new_m != g_cfg.mode_idx { g_cfg.mode_idx = new_m; cfg_changed = true; }
+
+    new_r := sdk.dropdown(11, pad + mw + 6.0f, y, rw, 26.0f, RUNTIME_ITEMS, g_cfg.runtime_idx);
+    if new_r != g_cfg.runtime_idx { g_cfg.runtime_idx = new_r; cfg_changed = true; }
+
+    st_x := pad + mw + rw + 14.0f;
+    if g_proc_state == .Running {
+        lbl := "RUNNING..." if g_is_running else "BUILDING...";
+        sdk.pill(st_x, y + 3.0f, lbl, sdk.theme_color(.Warning), 0x11111BFF);
+    } elseif g_proc_state == .Exited && g_exit_code == 0 {
+        sdk.pill(st_x, y + 3.0f, "OK (0)", sdk.theme_color(.Success), 0x11111BFF);
+    } elseif g_proc_state == .Exited || g_proc_state == .Failed {
+        eb: [24] u8;
+        sdk.pill(st_x, y + 3.0f, format_exit_pill(&eb, g_exit_code), sdk.theme_color(.Error), 0x11111BFF);
+    } elseif g_proc_state == .Killed {
+        sdk.pill(st_x, y + 3.0f, "STOPPED", sdk.theme_color(.Warning), 0x11111BFF);
+    } else {
+        sdk.pill(st_x, y + 3.0f, "IDLE", sdk.theme_color(.BgSurface), sdk.theme_color(.TextSecondary));
+    }
+    y += 32.0f;
+
+    // Row 3: Entry file + Output file + `Active` button
+    act_w: f32 = 64.0f;
+    half_w := (w - act_w - 12.0f) * 0.5f;
+    if sdk.input_text(12, pad, y, half_w, 26.0f, g_cfg.entry_buf, &g_cfg.entry_len, "Entry .onyx") & .Changed {
+        cfg_changed = true;
+    }
+    if sdk.input_text(13, pad + half_w + 6.0f, y, half_w, 26.0f, g_cfg.out_buf, &g_cfg.out_len, "Output path") & .Changed {
+        cfg_changed = true;
+    }
+    if sdk.button(14, pad + half_w * 2.0f + 12.0f, y, act_w, 26.0f, "Active", .Ghost) & .Clicked {
+        ap := sdk.editor_active_path(context.temp_allocator);
+        if ap.count > 0 {
+            set_buf(g_cfg.entry_buf, &g_cfg.entry_len, ap);
+            cfg_changed = true;
+        }
+    }
+    y += 32.0f;
+
+    // Row 4: Run Args + Flags drawer toggle + Clear
+    clr_w: f32 = 56.0f;
+    flg_w: f32 = 96.0f;
+    arg_w := w - clr_w - flg_w - 12.0f;
+    if sdk.input_text(15, pad, y, arg_w, 26.0f, g_cfg.args_buf, &g_cfg.args_len, "Run args (e.g. --self-test)") & .Changed {
+        cfg_changed = true;
+    }
+
+    fb: [24] u8;
+    flbl := format_flags_btn(&fb, count_active_flags(), g_show_flags);
+    if sdk.button(16, pad + arg_w + 6.0f, y, flg_w, 26.0f, flbl, .Active if g_show_flags else .Ghost) & .Clicked {
+        g_show_flags = !g_show_flags;
+    }
+    if sdk.button(17, pad + arg_w + flg_w + 12.0f, y, clr_w, 26.0f, "Clear", .Ghost) & .Clicked {
+        clear_logs();
+    }
+    y += 32.0f;
+
+    // Optional collapsible OBV-style compiler flags grid (2 rows x 5 flags)
+    if g_show_flags {
+        fw := (w - 16.0f) / 5.0f;
+        fh: f32 = 24.0f;
+        if sdk.button(30, pad,                    y, fw, fh, "debug",    .Active if g_cfg.debug else .Ghost) & .Clicked          { g_cfg.debug = !g_cfg.debug; cfg_changed = true; }
+        if sdk.button(31, pad + (fw + 4.0f),      y, fw, fh, "trace",    .Active if g_cfg.stack_trace else .Ghost) & .Clicked    { g_cfg.stack_trace = !g_cfg.stack_trace; cfg_changed = true; }
+        if sdk.button(32, pad + (fw + 4.0f) * 2,  y, fw, fh, "names",    .Active if g_cfg.name_section else .Ghost) & .Clicked   { g_cfg.name_section = !g_cfg.name_section; cfg_changed = true; }
+        if sdk.button(33, pad + (fw + 4.0f) * 3,  y, fw, fh, "fn-map",   .Active if g_cfg.func_mappings else .Ghost) & .Clicked  { g_cfg.func_mappings = !g_cfg.func_mappings; cfg_changed = true; }
+        if sdk.button(34, pad + (fw + 4.0f) * 4,  y, fw, fh, "threads",  .Active if g_cfg.multi_threaded else .Ghost) & .Clicked { g_cfg.multi_threaded = !g_cfg.multi_threaded; cfg_changed = true; }
+        y += fh + 4.0f;
+        if sdk.button(35, pad,                    y, fw, fh, "mvp",      .Active if g_cfg.wasm_mvp else .Ghost) & .Clicked       { g_cfg.wasm_mvp = !g_cfg.wasm_mvp; cfg_changed = true; }
+        if sdk.button(36, pad + (fw + 4.0f),      y, fw, fh, "jit",      .Active if g_cfg.jit else .Ghost) & .Clicked            { g_cfg.jit = !g_cfg.jit; cfg_changed = true; }
+        if sdk.button(37, pad + (fw + 4.0f) * 2,  y, fw, fh, "verbose",  .Active if g_cfg.verbose else .Ghost) & .Clicked        { g_cfg.verbose = !g_cfg.verbose; cfg_changed = true; }
+        if sdk.button(38, pad + (fw + 4.0f) * 3,  y, fw, fh, "all-err",  .Active if g_cfg.show_all_errs else .Ghost) & .Clicked  { g_cfg.show_all_errs = !g_cfg.show_all_errs; cfg_changed = true; }
+        if sdk.button(39, pad + (fw + 4.0f) * 4,  y, fw, fh, "doc",      .Active if g_cfg.doc else .Ghost) & .Clicked            { g_cfg.doc = !g_cfg.doc; cfg_changed = true; }
+        y += fh + 8.0f;
+    }
+
+    if cfg_changed do cfg_save();
+
+    // Output console box (clickable error locations!)
+    log_h := ctx.height - y - pad;
+    if log_h < 60.0f do log_h = 60.0f;
+    sdk.draw_rect(pad, y, w, log_h, sdk.theme_color(.BgBase), 5.0f, sdk.theme_color(.Border), 1.0f);
+
+    row_h: f32 = 20.0f;
+    content_h := cast(f32) g_logs.count * row_h + 12.0f;
+    if g_auto_scroll && content_h > log_h {
+        g_scroll_y = content_h - log_h;
+        g_auto_scroll = false;
+    }
+
+    sdk.scroll_begin(20, pad + 4.0f, y + 4.0f, w - 8.0f, log_h - 8.0f, content_h, &g_scroll_y);
+
+    mx := ctx.mouse_x;
+    my := ctx.mouse_y + g_scroll_y;
+    in_log := (ctx.flags & abi.FRAME_FLAG_HOVERED) != 0 &&
+              ctx.mouse_y >= y && ctx.mouse_y <= (y + log_h);
+    lclick := in_log && (ctx.mouse_pressed & cast(u32) abi.MouseButton.Left) != 0;
+
+    ly := y + 6.0f;
+    jump_path := "";
+    jump_line: i32 = 0;
+    jump_col:  i32 = 1;
+
+    for &line in g_logs {
+        has_loc := line.err_path.count > 0 && line.err_line > 0;
+        hov := has_loc && in_log && mx >= pad && mx <= (pad + w - 8.0f) && my >= ly && my < (ly + row_h);
+        if hov {
+            sdk.draw_rect(pad + 6.0f, ly, w - 16.0f, row_h - 1.0f, sdk.theme_color(.BgHover), 3.0f);
+            if lclick {
+                jump_path = str.temp_copy(line.err_path);
+                jump_line = line.err_line;
+                jump_col  = line.err_col;
+            }
+        }
+        col := switch line.kind {
+            case .Command => sdk.theme_color(.Accent);
+            case .Info    => sdk.theme_color(.Info);
+            case .Success => sdk.theme_color(.Success);
+            case .Warning => sdk.theme_color(.Warning);
+            case .Error   => sdk.theme_color(.Error);
+            case _        => sdk.theme_color(.TextPrimary);
+        };
+        sdk.draw_text(pad + 8.0f, ly + 2.0f, line.text, 12.0f, col, .Mono);
+        ly += row_h;
+    }
+
+    sdk.scroll_end();
+
+    if jump_path.count > 0 {
+        sdk.editor_open(jump_path, jump_line, jump_col);
+    }
+}
+
+#local
+str_has :: (haystack: str, needle: str) -> bool {
+    if needle.count == 0 do return true;
+    if haystack.count < needle.count do return false;
+    for i in 0 .. (haystack.count - needle.count + 1) {
+        ok := true;
+        for j in 0 .. needle.count {
+            if haystack[i + j] != needle[j] { ok = false; break; }
+        }
+        if ok do return true;
+    }
+    return false;
+}
+
+#local
+append_s :: (dst: [&] u8, pos: &i32, cap: i32, s: str) {
+    for i in 0 .. s.count {
+        if *pos >= cap do break;
+        dst[*pos] = s[i];
+        *pos += 1;
+    }
+}
+
+#local
+append_i32 :: (dst: [&] u8, pos: &i32, cap: i32, v: i32) {
+    val := v;
+    if val < 0 { append_s(dst, pos, cap, "-"); val = -val; }
+    if val == 0 { append_s(dst, pos, cap, "0"); return; }
+    tmp: [16] u8;
+    n := 0;
+    while val > 0 && n < 16 {
+        tmp[n] = cast(u8) ('0' + (val % 10));
+        val /= 10;
+        n += 1;
+    }
+    while n > 0 {
+        n -= 1;
+        if *pos < cap { dst[*pos] = tmp[n]; *pos += 1; }
+    }
+}
+
+#local
+format_exit_pill :: (buf: &[24] u8, code: i32) -> str {
+    p := 0;
+    append_s(&(*buf)[0], &p, 24, "EXIT ");
+    append_i32(&(*buf)[0], &p, 24, code);
+    return str.{ &(*buf)[0], p };
+}
+
+#local
+format_exit_line :: (buf: &[64] u8, code: i32) -> str {
+    p := 0;
+    append_s(&(*buf)[0], &p, 64, "--- Failed (exit code ");
+    append_i32(&(*buf)[0], &p, 64, code);
+    append_s(&(*buf)[0], &p, 64, ") ---");
+    return str.{ &(*buf)[0], p };
+}
+
+#local
+format_done_line :: (buf: &[64] u8, was_run: bool, secs: f32) -> str {
+    p := 0;
+    append_s(&(*buf)[0], &p, 64, "--- Run finished in " if was_run else "--- Build succeeded in ");
+    tenths := cast(i32) (secs * 10.0f + 0.5f);
+    append_i32(&(*buf)[0], &p, 64, tenths / 10);
+    append_s(&(*buf)[0], &p, 64, ".");
+    append_i32(&(*buf)[0], &p, 64, tenths % 10);
+    append_s(&(*buf)[0], &p, 64, "s (exit 0) ---");
+    return str.{ &(*buf)[0], p };
+}
+
+#local
+format_flags_btn :: (buf: &[24] u8, count: i32, open: bool) -> str {
+    p := 0;
+    append_s(&(*buf)[0], &p, 24, "Flags (");
+    append_i32(&(*buf)[0], &p, 24, count);
+    append_s(&(*buf)[0], &p, 24, ") " );
+    append_s(&(*buf)[0], &p, 24, "^" if open else "v");
+    return str.{ &(*buf)[0], p };
+}

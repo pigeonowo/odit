@@ -1,0 +1,261 @@
+package odit.ui
+
+// =============================================================================
+// Onyx Editor ("odit") — Fuzzy File Finder Overlay (`Ctrl+O`)
+// =============================================================================
+// Indexes workspace files on open (skipping .git / build / bin / lib), scores
+// fuzzy matches (preferring filename & contiguous substring matches), and opens
+// the chosen file directly in the Core Code Editor.
+
+use core { package, Array }
+use raylib
+use odit.theme
+use odit.settings
+use odit.services
+
+FileMatch :: struct {
+    index: i32;
+    score: i32;
+}
+
+FileFinder :: struct {
+    open:      bool;
+    query_buf: [128] u8;
+    query_len: i32;
+    selected:  i32;
+    files:     [..] str;
+    matches:   [..] FileMatch;
+}
+
+finder_init :: (f: &FileFinder) {
+    f.open      = false;
+    f.query_len = 0;
+    f.selected  = 0;
+    f.files     = make([..] str);
+    f.matches   = make([..] FileMatch);
+}
+
+finder_open :: (f: &FileFinder, workspace_root: str) {
+    f.open      = true;
+    f.query_len = 0;
+    f.selected  = 0;
+    while raylib.GetCharPressed() > 0 {}
+
+    for s in f.files do str.free(s);
+    Array.clear(&f.files);
+
+    found := services.workspace_find_files(workspace_root, "", context.allocator);
+    for p in found do f.files << p;
+    delete(&found);
+
+    finder_refilter(f);
+}
+
+finder_close :: (f: &FileFinder) {
+    f.open = false;
+}
+
+#local
+low :: (c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' do return c + 32;
+    return c;
+}
+
+/// Returns positive score if `query` fuzzy-matches `path`, else -1.
+#local
+score_file_match :: (path: str, query: str) -> i32 {
+    if query.count == 0 do return 1;
+
+    // Find basename offset for bonus weighting
+    base := 0;
+    for i in 0 .. path.count {
+        if path[i] == '/' do base = i + 1;
+    }
+
+    qi := 0;
+    score := 0;
+    consec := 0;
+    for i in 0 .. path.count {
+        if qi < query.count && low(path[i]) == low(query[qi]) {
+            consec += 1;
+            score += 10 + consec * 6;
+            if i >= base do score += 12; // filename match bonus
+            if i == base || i == 0 || path[i - 1] == '/' || path[i - 1] == '_' || path[i - 1] == '.' {
+                score += 15; // word boundary bonus
+            }
+            qi += 1;
+        } else {
+            consec = 0;
+        }
+    }
+    if qi < query.count do return -1;
+    // Prefer shorter paths on ties
+    score -= path.count / 4;
+    if score < 1 do score = 1;
+    return score;
+}
+
+finder_refilter :: (f: &FileFinder) {
+    Array.clear(&f.matches);
+    q := str.{ &f.query_buf[0], f.query_len };
+    for i in 0 .. f.files.count {
+        sc := score_file_match(f.files[i], q);
+        if sc > 0 {
+            f.matches << .{ i, sc };
+        }
+    }
+
+    // Sort highest score first (insertion sort — fast for <=1024 files)
+    if q.count > 0 {
+        for i in 1 .. f.matches.count {
+            key := f.matches[i];
+            j := i - 1;
+            while j >= 0 && f.matches[j].score < key.score {
+                f.matches[j + 1] = f.matches[j];
+                j -= 1;
+            }
+            f.matches[j + 1] = key;
+        }
+    }
+
+    if f.selected >= f.matches.count do f.selected = f.matches.count - 1;
+    if f.selected < 0 do f.selected = 0;
+}
+
+#local
+file_ext_badge :: (path: str) -> (str, u32) {
+    if str.ends_with(path, ".onyx") do return "ONYX", theme.get_color(.Accent);
+    if str.ends_with(path, ".c") || str.ends_with(path, ".h") do return "C", theme.get_color(.Info);
+    if str.ends_with(path, ".md")   do return "MD",   theme.get_color(.Info);
+    if str.ends_with(path, ".json") do return "JSON", theme.get_color(.Warning);
+    if str.ends_with(path, ".kdl")  do return "KDL",  theme.get_color(.Warning);
+    if str.ends_with(path, ".nu") || str.ends_with(path, ".sh") do return "SH", theme.get_color(.Success);
+    return "FILE", theme.get_color(.TextSecondary);
+}
+
+/// Updates and draws the Fuzzy File Finder when open.
+/// Returns the selected workspace-relative file path when chosen, else empty `""`.
+finder_update_and_draw :: (f: &FileFinder, screen_w, screen_h: f32) -> str {
+    if !f.open do return "";
+
+    if raylib.IsKeyPressed(.ESCAPE) {
+        finder_close(f);
+        return "";
+    }
+
+    changed := false;
+    while true {
+        ch := raylib.GetCharPressed();
+        if ch <= 0 do break;
+        if ch >= 32 && ch < 127 && f.query_len < 127 {
+            f.query_buf[f.query_len] = cast(u8) ch;
+            f.query_len += 1;
+            changed = true;
+        }
+    }
+    if (raylib.IsKeyPressed(.BACKSPACE) || raylib.IsKeyPressedRepeat(.BACKSPACE)) && f.query_len > 0 {
+        f.query_len -= 1;
+        changed = true;
+    }
+    if changed {
+        f.selected = 0;
+        finder_refilter(f);
+    }
+
+    if raylib.IsKeyPressed(.DOWN) || raylib.IsKeyPressedRepeat(.DOWN) {
+        if f.matches.count > 0 do f.selected = (f.selected + 1) % f.matches.count;
+    }
+    if raylib.IsKeyPressed(.UP) || raylib.IsKeyPressedRepeat(.UP) {
+        if f.matches.count > 0 do f.selected = (f.selected - 1 + f.matches.count) % f.matches.count;
+    }
+
+    if (raylib.IsKeyPressed(.ENTER) || raylib.IsKeyPressed(.KP_ENTER)) && f.matches.count > 0 {
+        chosen := str.temp_copy(f.files[f.matches[f.selected].index]);
+        finder_close(f);
+        return chosen;
+    }
+
+    // Backdrop
+    raylib.DrawRectangle(0, 0, cast(i32) screen_w, cast(i32) screen_h, .{ 0, 0, 0, 120 });
+
+    s := settings.g_settings.ui_scale;
+    pw := 600.0f * s;
+    if pw > screen_w - 40.0f do pw = screen_w - 40.0f;
+    max_rows := 12;
+    vis_rows := f.matches.count if f.matches.count < max_rows else max_rows;
+    row_h := 28.0f * s;
+    input_h := 34.0f * s;
+    ph := input_h + 24.0f + cast(f32) vis_rows * row_h + 12.0f;
+    px := (screen_w - pw) * 0.5f;
+    py: f32 = 64.0f;
+
+    mpos := raylib.GetMousePosition();
+    if raylib.IsMouseButtonPressed(.LEFT) {
+        if mpos.x < px || mpos.x > (px + pw) || mpos.y < py || mpos.y > (py + ph) {
+            finder_close(f);
+            return "";
+        }
+    }
+
+    theme.draw_rect(px, py, pw, ph, theme.get_color(.BgPanel), 8.0f, theme.get_color(.BorderFocused), 1.5f);
+
+    fs_in  := 15.0f * s;
+    fs_row := 13.5f * s;
+    fs_tag := 10.5f * s;
+
+    // Input box
+    theme.draw_rect(px + 10.0f, py + 10.0f, pw - 20.0f, input_h, theme.get_color(.BgBase), 5.0f, theme.get_color(.Border), 1.0f);
+    theme.draw_text(px + 18.0f, py + 10.0f + (input_h - fs_in) * 0.5f, "Open:", fs_row, theme.get_color(.Accent));
+
+    q := str.{ &f.query_buf[0], f.query_len };
+    qx := px + 18.0f + theme.measure_text("Open: ", fs_row);
+    if q.count > 0 {
+        theme.draw_text(qx, py + 10.0f + (input_h - fs_in) * 0.5f, q, fs_in, theme.get_color(.TextPrimary));
+    } else {
+        theme.draw_text(qx, py + 10.0f + (input_h - fs_row) * 0.5f, "Fuzzy search workspace files...", fs_row, theme.get_color(.TextDisabled));
+    }
+
+    // Match count on right of input
+    cnt_lbl := core.tprintf("{} files", f.matches.count);
+    cw := theme.measure_text(cnt_lbl, fs_tag);
+    theme.draw_text(px + pw - cw - 18.0f, py + 10.0f + (input_h - fs_tag) * 0.5f, cnt_lbl, fs_tag, theme.get_color(.TextSecondary));
+
+    list_y := py + input_h + 18.0f;
+    if vis_rows == 0 {
+        theme.draw_text(px + 20.0f, list_y + 4.0f, "No matching files", fs_row, theme.get_color(.TextDisabled));
+    } else {
+        start_i := 0;
+        if f.selected >= vis_rows do start_i = f.selected - vis_rows + 1;
+
+        for r in 0 .. vis_rows {
+            mi := start_i + r;
+            if mi >= f.matches.count do break;
+            path := f.files[f.matches[mi].index];
+            ry := list_y + cast(f32) r * row_h;
+
+            hov := mpos.x >= (px + 8.0f) && mpos.x <= (px + pw - 8.0f) && mpos.y >= ry && mpos.y < (ry + row_h);
+            if hov do f.selected = mi;
+
+            if mi == f.selected {
+                theme.draw_rect(px + 8.0f, ry, pw - 16.0f, row_h - 2.0f, theme.get_color(.BgSelection), 4.0f);
+            }
+
+            badge_lbl, badge_col := file_ext_badge(path);
+            bw := 42.0f * s;
+            bh := 16.0f * s;
+            theme.draw_rect(px + 16.0f, ry + (row_h - bh) * 0.5f, bw, bh, badge_col, 3.0f);
+            btw := theme.measure_text(badge_lbl, fs_tag);
+            theme.draw_text(px + 16.0f + (bw - btw) * 0.5f, ry + (row_h - fs_tag) * 0.5f, badge_lbl, fs_tag, 0x11111BFF);
+
+            theme.draw_text(px + 24.0f + bw, ry + (row_h - fs_row) * 0.5f, path, fs_row, theme.get_color(.TextPrimary));
+
+            if hov && raylib.IsMouseButtonPressed(.LEFT) {
+                chosen := str.temp_copy(path);
+                finder_close(f);
+                return chosen;
+            }
+        }
+    }
+
+    return "";
+}

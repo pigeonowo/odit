@@ -1,0 +1,294 @@
+package odit.services
+
+// =============================================================================
+// Onyx Editor ("odit") — Onyx Core Library & Compiler Directives Docs Index
+// =============================================================================
+// Scans `$ONYX_PATH/core/**/*.onyx` once on first query and combines it with a
+// curated reference of Onyx compiler `#` directives (`#format`, `#load`,
+// `#export`, `#foreign`, `#match`, etc.) to serve instant `docs_search` queries.
+
+use core { package, os, Array }
+
+DocItem :: struct {
+    name:      str;
+    pkg:       str;
+    kind:      str; // "directive", "package", "proc", "struct", "enum", "macro"
+    signature: str;
+    summary:   str;
+    file:      str;
+    line:      u32;
+}
+
+g_docs_indexed: bool = false;
+g_docs_items:   [..] DocItem;
+
+#local
+add_directive :: (name, sig, summary: str) {
+    g_docs_items << .{
+        name      = name,
+        pkg       = "directive",
+        kind      = "directive",
+        signature = sig,
+        summary   = summary,
+        file      = "",
+        line      = 0,
+    };
+}
+
+#local
+seed_builtin_directives :: () {
+    add_directive("#load",               "#load \"path/to/file.onyx\"",            "Includes another Onyx source file into the compilation unit.");
+    add_directive("#load_all",           "#load_all \"./dir\"",                    "Includes all .onyx files in a directory.");
+    add_directive("#export",             "#export \"wasm_name\" proc_name",        "Exports a procedure or global from the compiled WebAssembly module.");
+    add_directive("#foreign",            "#foreign \"module\" { fn :: (...) -> T --- }", "Declares external host/C/JS functions imported by the module.");
+    add_directive("#library",            "#library \"lib_name\"",                  "Links a native Onyx C shared library (.so/.dll/.dylib) from #library_path.");
+    add_directive("#library_path",       "#library_path \"./bin\"",                "Adds a directory searched for native #library shared objects.");
+    add_directive("#if",                 "#if <compile_time_cond> { ... }",        "Compile-time conditional compilation block.");
+    add_directive("#match",              "#match #local { fn1, fn2 }",             "Declares an overloaded procedure dispatch group.");
+    add_directive("#overload",           "#overload target :: (...) { ... }",      "Adds an overload implementation to an existing #match procedure.");
+    add_directive("#operator",           "#operator + (a, b: T) -> T { ... }",     "Defines a custom operator overload for user types.");
+    add_directive("#local",              "#local helper :: (...) { ... }",         "Restricts symbol visibility to the current source file.");
+    add_directive("#package",            "#package internal :: (...) { ... }",     "Restricts symbol visibility to the current package.");
+    add_directive("#distinct",           "MyId :: #distinct u32",                  "Creates a nominally distinct type with the same layout as a base type.");
+    add_directive("#flags",              "MyFlags :: enum #flags (u32) { A; B; }", "Defines a bitfield enum with power-of-two flag values.");
+    add_directive("#persist",            "#persist state: T;",                     "Declares static persistent storage inside a procedure.");
+    add_directive("#file_contents",      "DATA :: #file_contents \"file.txt\"",    "Embeds the raw bytes of a file at compile time as a [] u8 slice.");
+    add_directive("#format",             "core.conv.format / @conv.Custom_Format", "Formats values using Onyx's {} format specifiers or custom formatters.");
+    add_directive("#type",               "#type (i32) -> bool",                    "Explicitly parses the following expression as a type expression.");
+    add_directive("#solidify",           "#solidify poly_fn { T = i32 }",          "Instantiates a polymorphic procedure with fixed type parameters.");
+    add_directive("#inject",             "#inject MyStruct { method :: ... }",     "Injects methods or symbols into an existing struct/package namespace.");
+    add_directive("#defined",            "#if #defined(symbol)",                   "Compile-time predicate checking whether a symbol exists.");
+    add_directive("#cstr",               "#cstr \"null-terminated\"",              "Produces a null-terminated C string literal (cstr).");
+    add_directive("#auto_dispose",       "#auto_dispose",                          "Marks a value for automatic cleanup via __dispose_used_local.");
+    add_directive("#allow_stale_code",   "#allow_stale_code",                      "Allows deprecated/stale standard library code in the current file.");
+    add_directive("#error",              "#error \"Compile-time error message\"",  "Emits a compile-time error if reached during semantic checking.");
+    add_directive("#package_parameters", "#package_parameters(Flag: bool = false)","Declares compile-time configurable parameters for a package.");
+}
+
+#local
+trim_left :: (s: str) -> str {
+    i := 0;
+    while i < s.count && (s[i] == ' ' || s[i] == '\t') do i += 1;
+    return s[i .. s.count];
+}
+
+#local
+trim_right :: (s: str) -> str {
+    e := s.count;
+    while e > 0 && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r') do e -= 1;
+    return s[0 .. e];
+}
+
+#local
+index_onyx_file :: (full_path: str, rel_label: str) {
+    src := os.get_contents(full_path);
+    if src.count == 0 do return;
+    defer delete(&src);
+
+    pkg := "core";
+    doc_buf := make(dyn_str, 128, context.temp_allocator);
+    line_num: u32 = 0;
+
+    pos := 0;
+    while pos < src.count && g_docs_items.count < 2500 {
+        ls := pos;
+        while pos < src.count && src[pos] != '\n' do pos += 1;
+        raw_line := src[ls .. pos];
+        if pos < src.count do pos += 1;
+        line_num += 1;
+
+        line := trim_right(raw_line);
+        trimmed := trim_left(line);
+
+        if str.starts_with(trimmed, "package ") {
+            pkg = str.copy(trim_left(trimmed[8 .. trimmed.count]));
+            g_docs_items << .{
+                name      = pkg,
+                pkg       = pkg,
+                kind      = "package",
+                signature = str.copy(trimmed),
+                summary   = str.copy(core.tprintf("Onyx core module ({})", rel_label)),
+                file      = str.copy(full_path),
+                line      = line_num,
+            };
+            Array.clear(&doc_buf);
+            continue;
+        }
+
+        if str.starts_with(trimmed, "///") {
+            comment := trim_left(trimmed[3 .. trimmed.count]);
+            if doc_buf.count > 0 && doc_buf.count < 180 do Array.concat(&doc_buf, " ");
+            if doc_buf.count < 180 do Array.concat(&doc_buf, comment);
+            continue;
+        }
+
+        if trimmed.count == 0 || str.starts_with(trimmed, "//") {
+            Array.clear(&doc_buf);
+            continue;
+        }
+
+        // Only index top-level (unindented) public declarations
+        if line.count > 0 && line[0] != ' ' && line[0] != '\t' &&
+           !str.starts_with(line, "#local") && !str.starts_with(line, "#package") &&
+           !str.starts_with(line, "__") {
+            // Find `::`
+            cc := -1;
+            for k in 0 .. (line.count - 1) {
+                if line[k] == ':' && line[k + 1] == ':' { cc = k; break; }
+            }
+            if cc > 0 {
+                decl_name := trim_right(line[0 .. cc]);
+                rhs := trim_left(line[(cc + 2) .. line.count]);
+                if decl_name.count > 0 && decl_name.count < 64 && !str.starts_with(decl_name, "#") {
+                    kind := "";
+                    if str.starts_with(rhs, "(") || str.starts_with(rhs, "#match") {
+                        kind = "proc";
+                    } elseif str.starts_with(rhs, "struct") {
+                        kind = "struct";
+                    } elseif str.starts_with(rhs, "enum") {
+                        kind = "enum";
+                    } elseif str.starts_with(rhs, "interface") {
+                        kind = "interface";
+                    } elseif str.starts_with(rhs, "macro") {
+                        kind = "macro";
+                    }
+
+                    if kind.count > 0 {
+                        full_name := core.tprintf("{}.{}", pkg, decl_name);
+                        sig_end := line.count;
+                        if sig_end > 96 do sig_end = 96;
+                        sig := trim_right(line[0 .. sig_end]);
+                        if str.ends_with(sig, "{") do sig = trim_right(sig[0 .. (sig.count - 1)]);
+
+                        summary := str.{ doc_buf.data, doc_buf.count };
+                        g_docs_items << .{
+                            name      = str.copy(full_name),
+                            pkg       = pkg,
+                            kind      = kind,
+                            signature = str.copy(sig),
+                            summary   = str.copy(summary),
+                            file      = str.copy(full_path),
+                            line      = line_num,
+                        };
+                    }
+                }
+            }
+        }
+        Array.clear(&doc_buf);
+    }
+}
+
+#local
+scan_core_dir :: (base_dir: str, rel: str, depth: i32) {
+    if depth > 4 || g_docs_items.count >= 2500 do return;
+    full := base_dir if rel.count == 0 else core.tprintf("{}/{}", base_dir, rel);
+    for entry in os.Directory.list(full) {
+        name := entry->name();
+        if str.equal(name, ".") || str.equal(name, "..") do continue;
+        child_rel := str.copy(name, context.temp_allocator) if rel.count == 0 else core.tprintf("{}/{}", rel, name);
+        child_full := core.tprintf("{}/{}", full, name);
+        if entry.type == .Directory {
+            scan_core_dir(base_dir, child_rel, depth + 1);
+        } elseif str.ends_with(name, ".onyx") {
+            index_onyx_file(child_full, child_rel);
+        }
+    }
+}
+
+docs_ensure_indexed :: () {
+    if g_docs_indexed do return;
+    g_docs_indexed = true;
+    g_docs_items = make([..] DocItem, 512);
+    seed_builtin_directives();
+
+    core_dir := "";
+    if op := os.env("ONYX_PATH"); op {
+        core_dir = core.tprintf("{}/core", op->unwrap());
+    } else {
+        if home := os.env("HOME"); home {
+            core_dir = core.tprintf("{}/.onyx/core", home->unwrap());
+        }
+    }
+
+    if core_dir.count > 0 && os.Directory.exists(core_dir) {
+        scan_core_dir(core_dir, "", 0);
+    }
+}
+
+#local
+low_ch :: (c: u8) -> u8 { return (c + 32) if (c >= 'A' && c <= 'Z') else c; }
+
+#local
+contains_ci :: (haystack: str, needle: str) -> bool {
+    if needle.count == 0 do return true;
+    if haystack.count < needle.count do return false;
+    for i in 0 .. (haystack.count - needle.count + 1) {
+        ok := true;
+        for j in 0 .. needle.count {
+            if low_ch(haystack[i + j]) != low_ch(needle[j]) { ok = false; break; }
+        }
+        if ok do return true;
+    }
+    return false;
+}
+
+#local
+score_doc :: (item: &DocItem, q: str) -> i32 {
+    if q.count == 0 {
+        // Default view: prioritize directives & packages first
+        if str.equal(item.kind, "directive") do return 20;
+        if str.equal(item.kind, "package")   do return 15;
+        return 5;
+    }
+    sc := 0;
+    if contains_ci(item.name, q)      do sc += 40;
+    if str.starts_with(item.name, q)  do sc += 30;
+    if contains_ci(item.pkg, q)       do sc += 15;
+    if contains_ci(item.signature, q) do sc += 10;
+    if contains_ci(item.summary, q)   do sc += 5;
+    return sc;
+}
+
+docs_search_as_json :: (query: str, allocator := context.temp_allocator) -> str {
+    docs_ensure_indexed();
+
+    Scored :: struct { idx: i32; score: i32; }
+    hits := make([..] Scored, 64, context.temp_allocator);
+
+    for i in 0 .. g_docs_items.count {
+        sc := score_doc(&g_docs_items[i], query);
+        if sc > 0 {
+            hits << .{ i, sc };
+        }
+    }
+
+    // Sort top 40 hits descending
+    limit := 40 if hits.count > 40 else hits.count;
+    for i in 0 .. limit {
+        best := i;
+        for j in (i + 1) .. hits.count {
+            if hits[j].score > hits[best].score do best = j;
+        }
+        if best != i {
+            tmp := hits[i];
+            hits[i] = hits[best];
+            hits[best] = tmp;
+        }
+    }
+
+    out := make(dyn_str, 2048, allocator);
+    Array.concat(&out, "[");
+    for i in 0 .. limit {
+        it := &g_docs_items[hits[i].idx];
+        if i > 0 do Array.concat(&out, ",");
+        Array.concat(&out, "{\"name\":\"");      Array.concat(&out, json_esc_wat(it.name));
+        Array.concat(&out, "\",\"pkg\":\"");     Array.concat(&out, json_esc_wat(it.pkg));
+        Array.concat(&out, "\",\"kind\":\"");    Array.concat(&out, json_esc_wat(it.kind));
+        Array.concat(&out, "\",\"signature\":\""); Array.concat(&out, json_esc_wat(it.signature));
+        Array.concat(&out, "\",\"summary\":\""); Array.concat(&out, json_esc_wat(it.summary));
+        Array.concat(&out, "\",\"file\":\"");    Array.concat(&out, json_esc_wat(it.file));
+        Array.concat(&out, core.tprintf("\",\"line\":{}}}", it.line));
+    }
+    Array.concat(&out, "]");
+    return out;
+}

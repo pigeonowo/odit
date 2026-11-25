@@ -1,0 +1,17 @@
+{
+    "mode": "build",
+    "runtime": "onyx",
+    "entry": "src/main.onyx",
+    "output": "build/odit.wasm",
+    "run_args": "",
+    "debug": false,
+    "stack_trace": true,
+    "name_section": false,
+    "func_mappings": false,
+    "multi_threaded": false,
+    "wasm_mvp": false,
+    "jit": false,
+    "verbose": false,
+    "show_all_errors": false,
+    "doc": false
+}

@@ -1,0 +1,315 @@
+package odit.editor
+
+// =============================================================================
+// Onyx Editor ("odit") — Line-Based Code Buffer, File I/O & Undo
+// =============================================================================
+
+use core { memory, os, Array }
+use odit.abi
+
+GutterMarker :: struct {
+    path: str;
+    line: u32; // 1-based
+    kind: u32; // abi.GutterMarkerKind
+    rgba: u32;
+}
+
+TextBuffer :: struct {
+    path:          str;
+    lines:         [..] [..] u8;
+    cursor_line:   i32; // 0-based
+    cursor_col:    i32; // 0-based byte/char column
+    version:       u32;
+    dirty:         bool;
+
+    // Simple undo snapshots (UTF-8 full-buffer text)
+    undo_stack:    [..] str;
+    gutter_markers:[..] GutterMarker;
+}
+
+buffer_init :: (b: &TextBuffer) {
+    b.path           = "";
+    b.lines          = make([..] [..] u8);
+    b.undo_stack     = make([..] str);
+    b.gutter_markers = make([..] GutterMarker);
+    b.cursor_line    = 0;
+    b.cursor_col     = 0;
+    b.version        = 1;
+    b.dirty          = false;
+
+    // Start with one empty line
+    first := make([..] u8);
+    b.lines << first;
+}
+
+buffer_clear_lines :: (b: &TextBuffer) {
+    for &ln in b.lines {
+        delete(ln);
+    }
+    Array.clear(&b.lines);
+}
+
+buffer_set_text :: (b: &TextBuffer, text: str) {
+    buffer_clear_lines(b);
+
+    start := 0;
+    for i in 0 .. text.count {
+        if text[i] == '\n' {
+            end := i;
+            if end > start && text[end - 1] == '\r' do end -= 1;
+            ln := make([..] u8, end - start + 8);
+            for k in start .. end do ln << text[k];
+            b.lines << ln;
+            start = i + 1;
+        }
+    }
+    // Last line
+    end := text.count;
+    if end > start && text[end - 1] == '\r' do end -= 1;
+    ln := make([..] u8, end - start + 8);
+    for k in start .. end do ln << text[k];
+    b.lines << ln;
+
+    if b.lines.count == 0 {
+        empty := make([..] u8);
+        b.lines << empty;
+    }
+
+    b.cursor_line = 0;
+    b.cursor_col  = 0;
+    b.version += 1;
+}
+
+buffer_to_string :: (b: &TextBuffer, allocator := context.allocator) -> str {
+    total := 0;
+    for &ln in b.lines {
+        total += ln.count + 1;
+    }
+    if total > 0 do total -= 1;
+
+    out := make([] u8, total, allocator);
+    pos := 0;
+    for i in 0 .. b.lines.count {
+        ln := &b.lines[i];
+        if ln.count > 0 {
+            memory.copy(&out[pos], ln.data, ln.count);
+            pos += ln.count;
+        }
+        if i + 1 < b.lines.count {
+            out[pos] = '\n';
+            pos += 1;
+        }
+    }
+    return out;
+}
+
+buffer_byte_len :: (b: &TextBuffer) -> i32 {
+    total := 0;
+    for &ln in b.lines {
+        total += ln.count + 1;
+    }
+    if total > 0 do total -= 1;
+    return total;
+}
+
+buffer_cursor_byte_offset :: (b: &TextBuffer) -> u32 {
+    off: u32 = 0;
+    for i in 0 .. b.cursor_line {
+        if i < b.lines.count {
+            off += cast(u32) b.lines[i].count + 1;
+        }
+    }
+    off += cast(u32) b.cursor_col;
+    return off;
+}
+
+buffer_get_abi_cursor :: (b: &TextBuffer) -> abi.EditorCursor {
+    off := buffer_cursor_byte_offset(b);
+    return .{
+        line           = cast(u32) (b.cursor_line + 1),
+        column         = cast(u32) (b.cursor_col + 1),
+        byte_offset    = off,
+        sel_start      = off,
+        sel_end        = off,
+        buffer_version = b.version,
+        is_dirty       = 1 if b.dirty else 0,
+    };
+}
+
+buffer_load_file :: (b: &TextBuffer, path: str) -> bool {
+    contents := os.get_contents(path);
+    if contents.data == null && !os.file_exists(path) {
+        return false;
+    }
+    defer delete(&contents);
+
+    b.path = str.copy(path);
+    Array.clear(&b.undo_stack);
+    buffer_set_text(b, contents);
+    b.dirty = false;
+    return true;
+}
+
+buffer_save_file :: (b: &TextBuffer) -> bool {
+    if b.path.count == 0 do return false;
+    text := buffer_to_string(b, context.temp_allocator);
+    if os.File.write_contents(b.path, text) {
+        b.dirty = false;
+        b.version += 1;
+        return true;
+    }
+    return false;
+}
+
+buffer_push_undo :: (b: &TextBuffer) {
+    if b.undo_stack.count >= 64 {
+        oldest := b.undo_stack[0];
+        str.free(oldest);
+        Array.remove_at(&b.undo_stack, 0);
+    }
+    b.undo_stack << buffer_to_string(b, context.allocator);
+}
+
+buffer_undo :: (b: &TextBuffer) -> bool {
+    if b.undo_stack.count == 0 do return false;
+    snap := b.undo_stack[b.undo_stack.count - 1];
+    Array.pop(&b.undo_stack);
+    saved_line := b.cursor_line;
+    saved_col  := b.cursor_col;
+    buffer_set_text(b, snap);
+    str.free(snap);
+    b.cursor_line = saved_line;
+    b.cursor_col  = saved_col;
+    buffer_clamp_cursor(b);
+    b.dirty = true;
+    return true;
+}
+
+buffer_clamp_cursor :: (b: &TextBuffer) {
+    if b.lines.count == 0 {
+        empty := make([..] u8);
+        b.lines << empty;
+    }
+    if b.cursor_line < 0 do b.cursor_line = 0;
+    if b.cursor_line >= b.lines.count do b.cursor_line = b.lines.count - 1;
+    max_col := b.lines[b.cursor_line].count;
+    if b.cursor_col < 0 do b.cursor_col = 0;
+    if b.cursor_col > max_col do b.cursor_col = max_col;
+}
+
+buffer_set_cursor_1based :: (b: &TextBuffer, line: i32, col: i32) {
+    b.cursor_line = line - 1;
+    b.cursor_col  = col - 1;
+    buffer_clamp_cursor(b);
+}
+
+buffer_insert_char :: (b: &TextBuffer, ch: u8) {
+    buffer_clamp_cursor(b);
+    ln := &b.lines[b.cursor_line];
+    Array.insert(ln, b.cursor_col, ch);
+    b.cursor_col += 1;
+    b.dirty = true;
+    b.version += 1;
+}
+
+buffer_insert_newline :: (b: &TextBuffer, auto_indent: bool = true) {
+    buffer_push_undo(b);
+    buffer_clamp_cursor(b);
+
+    cur := &b.lines[b.cursor_line];
+    // Preserve leading whitespace indentation when auto_indent is enabled
+    indent := 0;
+    if auto_indent {
+        while indent < cur.count && indent < b.cursor_col && (cur.data[indent] == ' ' || cur.data[indent] == '\t') {
+            indent += 1;
+        }
+    }
+
+    new_ln := make([..] u8, indent + (cur.count - b.cursor_col) + 8);
+    for i in 0 .. indent do new_ln << cur.data[i];
+    for i in b.cursor_col .. cur.count do new_ln << cur.data[i];
+
+    cur.count = b.cursor_col;
+    Array.insert(&b.lines, b.cursor_line + 1, new_ln);
+    b.cursor_line += 1;
+    b.cursor_col = indent;
+    b.dirty = true;
+    b.version += 1;
+}
+
+buffer_backspace :: (b: &TextBuffer) {
+    buffer_clamp_cursor(b);
+    if b.cursor_col > 0 {
+        ln := &b.lines[b.cursor_line];
+        Array.remove_at(ln, b.cursor_col - 1);
+        b.cursor_col -= 1;
+        b.dirty = true;
+        b.version += 1;
+    } elseif b.cursor_line > 0 {
+        buffer_push_undo(b);
+        prev := &b.lines[b.cursor_line - 1];
+        cur  := &b.lines[b.cursor_line];
+        join_col := prev.count;
+        for i in 0 .. cur.count do *prev << cur.data[i];
+        delete(cur);
+        Array.remove_at(&b.lines, b.cursor_line);
+        b.cursor_line -= 1;
+        b.cursor_col = join_col;
+        b.dirty = true;
+        b.version += 1;
+    }
+}
+
+buffer_delete_char :: (b: &TextBuffer) {
+    buffer_clamp_cursor(b);
+    ln := &b.lines[b.cursor_line];
+    if b.cursor_col < ln.count {
+        Array.remove_at(ln, b.cursor_col);
+        b.dirty = true;
+        b.version += 1;
+    } elseif b.cursor_line + 1 < b.lines.count {
+        buffer_push_undo(b);
+        next := &b.lines[b.cursor_line + 1];
+        for i in 0 .. next.count do *ln << next.data[i];
+        delete(next);
+        Array.remove_at(&b.lines, b.cursor_line + 1);
+        b.dirty = true;
+        b.version += 1;
+    }
+}
+
+buffer_delete_line :: (b: &TextBuffer) {
+    buffer_push_undo(b);
+    buffer_clamp_cursor(b);
+    if b.lines.count <= 1 {
+        b.lines[0].count = 0;
+        b.cursor_col = 0;
+    } else {
+        delete(&b.lines[b.cursor_line]);
+        Array.remove_at(&b.lines, b.cursor_line);
+        buffer_clamp_cursor(b);
+    }
+    b.dirty = true;
+    b.version += 1;
+}
+
+buffer_set_gutter_marker :: (b: &TextBuffer, path: str, line: u32, kind: u32, rgba: u32) {
+    for &m in b.gutter_markers {
+        if m.line == line && m.kind == kind && str.equal(m.path, path) {
+            m.rgba = rgba;
+            return;
+        }
+    }
+    b.gutter_markers << .{ str.copy(path), line, kind, rgba };
+}
+
+buffer_clear_gutter_markers :: (b: &TextBuffer, kind: u32) {
+    i := 0;
+    while i < b.gutter_markers.count {
+        if kind == 0 || b.gutter_markers[i].kind == kind {
+            Array.remove_at(&b.gutter_markers, i);
+        } else {
+            i += 1;
+        }
+    }
+}

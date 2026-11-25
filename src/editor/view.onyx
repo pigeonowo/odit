@@ -1,0 +1,632 @@
+package odit.editor
+
+// =============================================================================
+// Onyx Editor ("odit") — Code Editor View (Syntax Highlighting + Modal & Ctrl)
+// =============================================================================
+
+use core { package, math }
+use raylib
+use odit.theme
+use odit.settings
+use odit.abi
+use odit.wm
+use odit.lsp
+
+EditMode :: enum {
+    Normal;
+    Insert;
+}
+
+EditorView :: struct {
+    buf:            TextBuffer;
+    mode:           EditMode;
+    modal_enabled:  bool; // Toggleable via Ctrl+P ("Editor: Toggle Modal Mode")
+    scroll_y:       f32;
+    scroll_x:       f32;
+    font_size:      f32;
+    line_height:    f32;
+    char_width:     f32;
+    gutter_width:   f32;
+    blink_timer:    f32;
+    pending_d:      bool; // For `dd` in Normal mode
+    pending_g:      bool; // For `gg` / `gd` in Normal mode
+    last_version:   u32;
+    last_line:      i32;
+    last_col:       i32;
+}
+
+EditorUpdateEvents :: struct {
+    buffer_modified: bool;
+    buffer_saved:    bool;
+    cursor_moved:    bool;
+    req_hover:       bool;
+    req_definition:  bool;
+    req_completion:  bool;
+}
+
+editor_sync_settings :: (ed: &EditorView) {
+    ed.modal_enabled = settings.g_settings.modal_editing;
+    ed.font_size     = settings.g_settings.editor_font_size;
+    ed.line_height   = ed.font_size * settings.g_settings.line_height_factor;
+    ed.char_width    = theme.measure_text("M", ed.font_size);
+    if ed.char_width < 6.0f do ed.char_width = ed.font_size * 0.6f;
+    if settings.g_settings.show_line_numbers {
+        ed.gutter_width = 24.0f + ed.char_width * 4.2f;
+    } else {
+        ed.gutter_width = 22.0f;
+    }
+}
+
+editor_init :: (ed: &EditorView) {
+    buffer_init(&ed.buf);
+    ed.mode         = .Normal;
+    ed.scroll_y     = 0.0;
+    ed.scroll_x     = 0.0;
+    ed.blink_timer  = 0.0;
+    ed.pending_d    = false;
+    ed.last_version = ed.buf.version;
+    ed.last_line    = 0;
+    ed.last_col     = 0;
+    editor_sync_settings(ed);
+}
+
+editor_mode_label :: (ed: &EditorView) -> str {
+    if !ed.modal_enabled do return "INSERT";
+    return "INSERT" if ed.mode == .Insert else "NORMAL";
+}
+
+editor_ensure_cursor_visible :: (ed: &EditorView, view_h: f32) {
+    cy := cast(f32) ed.buf.cursor_line * ed.line_height;
+    margin := ed.line_height * 2.0;
+    if cy < ed.scroll_y + margin {
+        ed.scroll_y = cy - margin;
+    }
+    if cy + ed.line_height > ed.scroll_y + view_h - margin {
+        ed.scroll_y = cy + ed.line_height - view_h + margin;
+    }
+    if ed.scroll_y < 0.0 do ed.scroll_y = 0.0;
+}
+
+#local
+key_trig :: (k: raylib.KeyboardKey) -> bool {
+    return raylib.IsKeyPressed(k) || raylib.IsKeyPressedRepeat(k);
+}
+
+editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, block_input: bool, lsp_c: &lsp.LspClient = null) -> EditorUpdateEvents {
+    ev: EditorUpdateEvents;
+    ed.blink_timer += dt;
+    editor_sync_settings(ed);
+
+    if block_input do return ev;
+
+    mpos := raylib.GetMousePosition();
+    hovered := wm.hit_rect(mpos.x, mpos.y, rect);
+
+    // Mouse wheel scroll
+    if hovered {
+        wheel := raylib.GetMouseWheelMove();
+        if wheel != 0.0 {
+            ed.scroll_y -= wheel * ed.line_height * 3.0;
+            max_s := cast(f32) ed.buf.lines.count * ed.line_height - rect.h * 0.5;
+            if max_s < 0.0 do max_s = 0.0;
+            if ed.scroll_y < 0.0 do ed.scroll_y = 0.0;
+            if ed.scroll_y > max_s do ed.scroll_y = max_s;
+        }
+    }
+
+    // Mouse click to place cursor (dismiss hover/completion)
+    if hovered && raylib.IsMouseButtonPressed(.LEFT) {
+        if lsp_c != null {
+            lsp_c.hover_visible = false;
+            lsp_c.comp_open = false;
+        }
+        rel_y := (mpos.y - rect.y) + ed.scroll_y - 6.0;
+        rel_x := (mpos.x - (rect.x + ed.gutter_width + 8.0)) + ed.scroll_x;
+        clicked_line := cast(i32) (rel_y / ed.line_height);
+        clicked_col  := cast(i32) ((rel_x + ed.char_width * 0.5) / ed.char_width);
+        ed.buf.cursor_line = clicked_line;
+        ed.buf.cursor_col  = clicked_col;
+        buffer_clamp_cursor(&ed.buf);
+        ed.blink_timer = 0.0;
+    }
+
+    if !focused do return ev;
+
+    ctrl := raylib.IsKeyDown(.LEFT_CONTROL) || raylib.IsKeyDown(.RIGHT_CONTROL);
+
+    // Handle active LSP completion menu navigation first
+    if lsp_c != null && lsp_c.comp_open && lsp_c.completions.count > 0 {
+        if raylib.IsKeyPressed(.ESCAPE) {
+            lsp_c.comp_open = false;
+            return ev;
+        }
+        if key_trig(.DOWN) {
+            lsp_c.comp_selected = (lsp_c.comp_selected + 1) % lsp_c.completions.count;
+            return ev;
+        }
+        if key_trig(.UP) {
+            lsp_c.comp_selected = (lsp_c.comp_selected - 1 + lsp_c.completions.count) % lsp_c.completions.count;
+            return ev;
+        }
+        if raylib.IsKeyPressed(.ENTER) || raylib.IsKeyPressed(.TAB) {
+            item := &lsp_c.completions[lsp_c.comp_selected];
+            apply_completion_insert(&ed.buf, item.insert_text);
+            lsp_c.comp_open = false;
+            ev.buffer_modified = true;
+            ed.last_version = ed.buf.version;
+            return ev;
+        }
+    }
+
+    // Global editor shortcuts (work in BOTH Normal and Insert modes)
+    if ctrl && raylib.IsKeyPressed(.S) {
+        if buffer_save_file(&ed.buf) {
+            ev.buffer_saved = true;
+            ev.buffer_modified = true;
+        }
+        return ev;
+    }
+    if ctrl && raylib.IsKeyPressed(.Z) {
+        if buffer_undo(&ed.buf) {
+            ev.buffer_modified = true;
+            editor_ensure_cursor_visible(ed, rect.h);
+        }
+        return ev;
+    }
+    if raylib.IsKeyPressed(.F12) {
+        ev.req_definition = true;
+        return ev;
+    }
+    if ctrl && raylib.IsKeyPressed(.SPACE) {
+        ev.req_completion = true;
+        return ev;
+    }
+
+    // Navigation keys work in both modes
+    if key_trig(.UP) {
+        ed.buf.cursor_line -= 1;
+        buffer_clamp_cursor(&ed.buf);
+        editor_ensure_cursor_visible(ed, rect.h);
+        ed.blink_timer = 0.0;
+    }
+    if key_trig(.DOWN) {
+        ed.buf.cursor_line += 1;
+        buffer_clamp_cursor(&ed.buf);
+        editor_ensure_cursor_visible(ed, rect.h);
+        ed.blink_timer = 0.0;
+    }
+    if key_trig(.LEFT) {
+        if ed.buf.cursor_col > 0 {
+            ed.buf.cursor_col -= 1;
+        } elseif ed.buf.cursor_line > 0 {
+            ed.buf.cursor_line -= 1;
+            ed.buf.cursor_col = ed.buf.lines[ed.buf.cursor_line].count;
+        }
+        ed.blink_timer = 0.0;
+    }
+    if key_trig(.RIGHT) {
+        cur_len := ed.buf.lines[ed.buf.cursor_line].count;
+        if ed.buf.cursor_col < cur_len {
+            ed.buf.cursor_col += 1;
+        } elseif ed.buf.cursor_line + 1 < ed.buf.lines.count {
+            ed.buf.cursor_line += 1;
+            ed.buf.cursor_col = 0;
+        }
+        ed.blink_timer = 0.0;
+    }
+    if raylib.IsKeyPressed(.HOME) {
+        ed.buf.cursor_col = 0;
+        ed.blink_timer = 0.0;
+    }
+    if raylib.IsKeyPressed(.END) {
+        ed.buf.cursor_col = ed.buf.lines[ed.buf.cursor_line].count;
+        ed.blink_timer = 0.0;
+    }
+    if raylib.IsKeyPressed(.PAGE_UP) {
+        ed.buf.cursor_line -= cast(i32) (rect.h / ed.line_height);
+        buffer_clamp_cursor(&ed.buf);
+        editor_ensure_cursor_visible(ed, rect.h);
+    }
+    if raylib.IsKeyPressed(.PAGE_DOWN) {
+        ed.buf.cursor_line += cast(i32) (rect.h / ed.line_height);
+        buffer_clamp_cursor(&ed.buf);
+        editor_ensure_cursor_visible(ed, rect.h);
+    }
+
+    in_insert := (!ed.modal_enabled) || ed.mode == .Insert;
+
+    if in_insert {
+        if ed.modal_enabled && raylib.IsKeyPressed(.ESCAPE) {
+            ed.mode = .Normal;
+            ed.pending_d = false;
+            // Drain char queue so Esc doesn't leak
+            while raylib.GetCharPressed() > 0 {}
+        } else {
+            // Printable character input
+            while true {
+                ch := raylib.GetCharPressed();
+                if ch <= 0 do break;
+                if !ctrl && ch >= 32 && ch < 127 {
+                    buffer_insert_char(&ed.buf, cast(u8) ch);
+                    ed.blink_timer = 0.0;
+                    editor_ensure_cursor_visible(ed, rect.h);
+                }
+            }
+            if key_trig(.ENTER) || key_trig(.KP_ENTER) {
+                buffer_insert_newline(&ed.buf, settings.g_settings.auto_indent);
+                ed.blink_timer = 0.0;
+                editor_ensure_cursor_visible(ed, rect.h);
+            }
+            if key_trig(.TAB) {
+                spaces := settings.g_settings.tab_size;
+                if spaces < 1 do spaces = 2;
+                for _ in 0 .. spaces do buffer_insert_char(&ed.buf, ' ');
+                ed.blink_timer = 0.0;
+            }
+            if key_trig(.BACKSPACE) {
+                buffer_backspace(&ed.buf);
+                ed.blink_timer = 0.0;
+                editor_ensure_cursor_visible(ed, rect.h);
+            }
+            if key_trig(.DELETE) {
+                buffer_delete_char(&ed.buf);
+                ed.blink_timer = 0.0;
+            }
+        }
+    } else {
+        // MODAL NORMAL MODE
+        if raylib.IsKeyPressed(.ESCAPE) && lsp_c != null {
+            lsp_c.hover_visible = false;
+            lsp_c.comp_open = false;
+        }
+        while true {
+            ch := raylib.GetCharPressed();
+            if ch <= 0 do break;
+            if ctrl do continue;
+
+            if ed.pending_d {
+                ed.pending_d = false;
+                if ch == 'd' {
+                    buffer_delete_line(&ed.buf);
+                    editor_ensure_cursor_visible(ed, rect.h);
+                }
+                continue;
+            }
+            if ed.pending_g {
+                ed.pending_g = false;
+                if ch == 'g' {
+                    ed.buf.cursor_line = 0;
+                    ed.buf.cursor_col  = 0;
+                    editor_ensure_cursor_visible(ed, rect.h);
+                } elseif ch == 'd' {
+                    ev.req_definition = true;
+                }
+                continue;
+            }
+
+            switch ch {
+                case 'K' {
+                    ev.req_hover = true;
+                }
+                case 'h' {
+                    ed.buf.cursor_col -= 1;
+                    buffer_clamp_cursor(&ed.buf);
+                }
+                case 'j' {
+                    ed.buf.cursor_line += 1;
+                    buffer_clamp_cursor(&ed.buf);
+                    editor_ensure_cursor_visible(ed, rect.h);
+                }
+                case 'k' {
+                    ed.buf.cursor_line -= 1;
+                    buffer_clamp_cursor(&ed.buf);
+                    editor_ensure_cursor_visible(ed, rect.h);
+                }
+                case 'l' {
+                    ed.buf.cursor_col += 1;
+                    buffer_clamp_cursor(&ed.buf);
+                }
+                case '0' {
+                    ed.buf.cursor_col = 0;
+                }
+                case '$' {
+                    ed.buf.cursor_col = ed.buf.lines[ed.buf.cursor_line].count;
+                }
+                case 'g' {
+                    ed.pending_g = true;
+                }
+                case 'G' {
+                    ed.buf.cursor_line = ed.buf.lines.count - 1;
+                    ed.buf.cursor_col  = 0;
+                    editor_ensure_cursor_visible(ed, rect.h);
+                }
+                case 'i' {
+                    buffer_push_undo(&ed.buf);
+                    ed.mode = .Insert;
+                }
+                case 'a' {
+                    buffer_push_undo(&ed.buf);
+                    if ed.buf.cursor_col < ed.buf.lines[ed.buf.cursor_line].count {
+                        ed.buf.cursor_col += 1;
+                    }
+                    ed.mode = .Insert;
+                }
+                case 'o' {
+                    ed.buf.cursor_col = ed.buf.lines[ed.buf.cursor_line].count;
+                    buffer_insert_newline(&ed.buf);
+                    ed.mode = .Insert;
+                    editor_ensure_cursor_visible(ed, rect.h);
+                }
+                case 'O' {
+                    ed.buf.cursor_col = 0;
+                    buffer_insert_newline(&ed.buf);
+                    ed.buf.cursor_line -= 1;
+                    ed.buf.cursor_col = 0;
+                    ed.mode = .Insert;
+                    editor_ensure_cursor_visible(ed, rect.h);
+                }
+                case 'x' {
+                    buffer_push_undo(&ed.buf);
+                    buffer_delete_char(&ed.buf);
+                }
+                case 'd' {
+                    ed.pending_d = true;
+                }
+                case 'u' {
+                    buffer_undo(&ed.buf);
+                    editor_ensure_cursor_visible(ed, rect.h);
+                }
+                case 'w' {
+                    ln := &ed.buf.lines[ed.buf.cursor_line];
+                    c := ed.buf.cursor_col;
+                    while c < ln.count && ln.data[c] != ' ' do c += 1;
+                    while c < ln.count && ln.data[c] == ' ' do c += 1;
+                    ed.buf.cursor_col = c;
+                }
+                case 'b' {
+                    ln := &ed.buf.lines[ed.buf.cursor_line];
+                    c := ed.buf.cursor_col;
+                    if c > 0 do c -= 1;
+                    while c > 0 && ln.data[c] == ' ' do c -= 1;
+                    while c > 0 && ln.data[c - 1] != ' ' do c -= 1;
+                    ed.buf.cursor_col = c;
+                }
+                case _ {}
+            }
+            ed.blink_timer = 0.0;
+        }
+    }
+
+    if ed.buf.version != ed.last_version {
+        ed.last_version = ed.buf.version;
+        ev.buffer_modified = true;
+    }
+    if ed.buf.cursor_line != ed.last_line || ed.buf.cursor_col != ed.last_col {
+        ed.last_line = ed.buf.cursor_line;
+        ed.last_col  = ed.buf.cursor_col;
+        ev.cursor_moved = true;
+    }
+
+    return ev;
+}
+
+#local
+apply_completion_insert :: (b: &TextBuffer, text: str) {
+    buffer_push_undo(b);
+    buffer_clamp_cursor(b);
+    ln := &b.lines[b.cursor_line];
+    // Backtrack over partial identifier before cursor so completion replaces prefix cleanly
+    start := b.cursor_col;
+    while start > 0 {
+        ch := ln.data[start - 1];
+        is_id := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_';
+        if !is_id do break;
+        start -= 1;
+    }
+    while b.cursor_col > start {
+        buffer_backspace(b);
+    }
+    for i in 0 .. text.count {
+        buffer_insert_char(b, text[i]);
+    }
+}
+
+editor_draw :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, lsp_c: &lsp.LspClient = null) {
+    raylib.BeginScissorMode(cast(i32) rect.x, cast(i32) rect.y, cast(i32) rect.w, cast(i32) rect.h);
+    defer raylib.EndScissorMode();
+
+    // Background & gutter strip
+    theme.draw_rect(rect.x, rect.y, rect.w, rect.h, theme.get_color(.BgBase));
+    theme.draw_rect(rect.x, rect.y, ed.gutter_width, rect.h, theme.get_color(.BgPanel));
+    raylib.DrawLine(
+        cast(i32) (rect.x + ed.gutter_width), cast(i32) rect.y,
+        cast(i32) (rect.x + ed.gutter_width), cast(i32) (rect.y + rect.h),
+        theme.get_rl(.Border)
+    );
+
+    first_vis := cast(i32) (ed.scroll_y / ed.line_height);
+    if first_vis < 0 do first_vis = 0;
+    vis_count := cast(i32) (rect.h / ed.line_height) + 3;
+    last_vis  := first_vis + vis_count;
+    if last_vis > ed.buf.lines.count do last_vis = ed.buf.lines.count;
+
+    code_x := rect.x + ed.gutter_width + 8.0f - ed.scroll_x;
+    spans: [128] TokenSpan;
+
+    cur_screen_x := code_x;
+    cur_screen_y := rect.y + 6.0f;
+
+    for li in first_vis .. last_vis {
+        ly := rect.y + 6.0f + cast(f32) li * ed.line_height - ed.scroll_y;
+
+        // Highlight active line
+        if settings.g_settings.highlight_current_line && li == ed.buf.cursor_line {
+            theme.draw_rect(rect.x + ed.gutter_width + 1.0f, ly - 1.0f, rect.w - ed.gutter_width - 1.0f, ed.line_height, theme.get_color(.BgHeader));
+        }
+
+        // Draw gutter markers (breakpoints / diagnostics / debug current)
+        line_1 := cast(u32) (li + 1);
+        for &m in ed.buf.gutter_markers {
+            if m.line == line_1 && (m.path.count == 0 || str.equal(m.path, ed.buf.path)) {
+                raylib.DrawCircle(cast(i32) (rect.x + 11.0f), cast(i32) (ly + ed.line_height * 0.45f), 4.5f, theme.rgba_to_rl(m.rgba));
+            }
+        }
+
+        // Line number
+        if settings.g_settings.show_line_numbers {
+            lnum := core.tprintf("{}", line_1);
+            ln_fs := ed.font_size * 0.85f;
+            ln_w := theme.measure_text(lnum, ln_fs);
+            ln_col := theme.get_color(.TextPrimary) if li == ed.buf.cursor_line else theme.get_color(.TextDisabled);
+            theme.draw_text(rect.x + ed.gutter_width - ln_w - 8.0f, ly + (ed.line_height - ln_fs) * 0.45f, lnum, ln_fs, ln_col);
+        }
+
+        // Syntax-highlighted source line
+        line_bytes := &ed.buf.lines[li];
+        line_str := str.{ line_bytes.data, line_bytes.count };
+        line_end_x := code_x;
+        if line_str.count > 0 {
+            n_spans := lex_onyx_line(line_str, spans);
+            cx := code_x;
+            for si in 0 .. n_spans {
+                sp := spans[si];
+                chunk := line_str[sp.start .. sp.end];
+                theme.draw_text(cx, ly + 1.0f, chunk, ed.font_size, token_color(sp.kind));
+                cx += theme.measure_text(chunk, ed.font_size);
+            }
+            line_end_x = cx;
+        }
+
+        // Diagnostic underlines & inline message from Onyx LSP
+        if lsp_c != null {
+            for &d in lsp_c.diagnostics {
+                if d.line == line_1 && str.equal(d.path, ed.buf.path) {
+                    d_col := theme.get_color(.Error) if d.severity == 1 else theme.get_color(.Warning);
+                    c0 := cast(i32) d.column - 1;
+                    if c0 < 0 do c0 = 0;
+                    if c0 > line_str.count do c0 = line_str.count;
+                    ux := code_x + theme.measure_text(line_str[0 .. c0], ed.font_size);
+                    uw := cast(f32) (d.length if d.length > 0 else 1) * ed.char_width;
+                    if uw < ed.char_width do uw = ed.char_width;
+                    raylib.DrawLineEx(.{ ux, ly + ed.line_height - 2.0f }, .{ ux + uw, ly + ed.line_height - 2.0f }, 2.0f, theme.rgba_to_rl(d_col));
+
+                    // Show compact inline message at end of line
+                    msg_fs := ed.font_size * 0.8f;
+                    msg_x := line_end_x + 18.0f;
+                    if msg_x < rect.x + rect.w - 40.0f {
+                        theme.draw_text(msg_x, ly + (ed.line_height - msg_fs) * 0.5f, core.tprintf("<< {}", d.message), msg_fs, d_col);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Cursor rendering
+        if li == ed.buf.cursor_line {
+            prefix := line_str[0 .. ed.buf.cursor_col] if ed.buf.cursor_col <= line_str.count else line_str;
+            cur_x := code_x + theme.measure_text(prefix, ed.font_size);
+            cur_screen_x = cur_x;
+            cur_screen_y = ly;
+            if focused && (cast(i32) (ed.blink_timer * 2.0f) % 2) == 0 {
+                in_insert := (!ed.modal_enabled) || ed.mode == .Insert;
+                if in_insert {
+                    theme.draw_rect(cur_x, ly, 2.0f, ed.line_height - 2.0f, theme.get_color(.Success));
+                } else {
+                    theme.draw_rect(cur_x, ly, ed.char_width, ed.line_height - 2.0f, 0xB4BEFEAA);
+                }
+            }
+        }
+    }
+
+    // Floating LSP Hover Tooltip (`K`)
+    if lsp_c != null && lsp_c.hover_visible && lsp_c.hover_text.count > 0 {
+        draw_hover_popup(rect, cur_screen_x, cur_screen_y, ed.line_height, lsp_c.hover_text);
+    }
+
+    // Floating LSP Completion Popup (`Ctrl+Space`)
+    if lsp_c != null && lsp_c.comp_open && lsp_c.completions.count > 0 {
+        draw_completion_popup(rect, cur_screen_x, cur_screen_y, ed.line_height, lsp_c);
+    }
+}
+
+#local
+draw_hover_popup :: (rect: wm.PaneRect, cx, cy, line_h: f32, text: str) {
+    s := settings.g_settings.ui_scale;
+    fs := 13.0f * s;
+    lh := fs * 1.35f;
+
+    // Split into up to 8 lines & measure box width
+    lines: [8] str;
+    n_lines := 0;
+    max_w: f32 = 160.0f;
+    start := 0;
+    for i in 0 .. (text.count + 1) {
+        if i == text.count || text[i] == '\n' {
+            if n_lines < 8 {
+                ln := text[start .. i];
+                lines[n_lines] = ln;
+                n_lines += 1;
+                w := theme.measure_text(ln, fs);
+                if w > max_w do max_w = w;
+            }
+            start = i + 1;
+        }
+    }
+    if n_lines == 0 do return;
+
+    box_w := max_w + 22.0f;
+    if box_w > rect.w - 20.0f do box_w = rect.w - 20.0f;
+    box_h := cast(f32) n_lines * lh + 16.0f;
+
+    bx := cx;
+    if bx + box_w > rect.x + rect.w - 8.0f do bx = rect.x + rect.w - box_w - 8.0f;
+    if bx < rect.x + 8.0f do bx = rect.x + 8.0f;
+
+    by := cy - box_h - 6.0f;
+    if by < rect.y + 6.0f do by = cy + line_h + 4.0f;
+
+    theme.draw_rect(bx, by, box_w, box_h, theme.get_color(.BgSurface), 6.0f, theme.get_color(.BorderFocused), 1.5f);
+    for i in 0 .. n_lines {
+        theme.draw_text(bx + 10.0f, by + 8.0f + cast(f32) i * lh, lines[i], fs, theme.get_color(.TextPrimary));
+    }
+}
+
+#local
+draw_completion_popup :: (rect: wm.PaneRect, cx, cy, line_h: f32, lsp_c: &lsp.LspClient) {
+    s := settings.g_settings.ui_scale;
+    fs := 13.0f * s;
+    row_h := 24.0f * s;
+    vis := lsp_c.completions.count if lsp_c.completions.count < 8 else 8;
+    box_w := 320.0f * s;
+    if box_w > rect.w - 20.0f do box_w = rect.w - 20.0f;
+    box_h := cast(f32) vis * row_h + 8.0f;
+
+    bx := cx;
+    if bx + box_w > rect.x + rect.w - 8.0f do bx = rect.x + rect.w - box_w - 8.0f;
+    by := cy + line_h + 2.0f;
+    if by + box_h > rect.y + rect.h - 6.0f do by = cy - box_h - 4.0f;
+
+    theme.draw_rect(bx, by, box_w, box_h, theme.get_color(.BgPanel), 6.0f, theme.get_color(.BorderFocused), 1.5f);
+
+    start_i := 0;
+    if lsp_c.comp_selected >= vis {
+        start_i = lsp_c.comp_selected - vis + 1;
+    }
+
+    for r in 0 .. vis {
+        idx := start_i + r;
+        if idx >= lsp_c.completions.count do break;
+        item := &lsp_c.completions[idx];
+        ry := by + 4.0f + cast(f32) r * row_h;
+        if idx == lsp_c.comp_selected {
+            theme.draw_rect(bx + 4.0f, ry, box_w - 8.0f, row_h - 1.0f, theme.get_color(.BgSelection), 4.0f);
+        }
+        theme.draw_text(bx + 10.0f, ry + (row_h - fs) * 0.5f, item.label, fs, theme.get_color(.TextPrimary));
+        if item.detail.count > 0 {
+            dw := theme.measure_text(item.detail, fs * 0.85f);
+            if bx + box_w - dw - 10.0f > bx + 120.0f {
+                theme.draw_text(bx + box_w - dw - 10.0f, ry + (row_h - fs * 0.85f) * 0.5f, item.detail, fs * 0.85f, theme.get_color(.TextSecondary));
+            }
+        }
+    }
+}

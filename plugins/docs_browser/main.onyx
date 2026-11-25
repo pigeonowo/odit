@@ -1,0 +1,225 @@
+// =============================================================================
+// Onyx Editor ("odit") — Onyx Docs / Core Browser WASM Plugin (Phase 3.2)
+// =============================================================================
+// Searchable reference panel for Onyx core standard library packages, procs,
+// structs/enums, and compiler `#` directives (e.g. `core.conv.format`, `#format`,
+// `#load`, `os.File`, `Array`).
+
+#load "../../abi/abi.onyx"
+#load "../../sdk/plugin_sdk.onyx"
+
+use core { memory, Array }
+use odit.abi
+use odit.sdk
+
+DocRow :: struct {
+    name:      str;
+    pkg:       str;
+    kind:      str;
+    signature: str;
+    summary:   str;
+}
+
+g_query_buf:    [96] u8;
+g_query_len:    u32 = 0;
+g_cat_filter:   i32 = 0; // 0=All, 1=Directives, 2=Packages, 3=Procs, 4=Types
+g_rows:         [..] DocRow;
+g_selected:     i32 = 0;
+g_scroll_y:     f32 = 0.0f;
+g_needs_query:  bool = true;
+
+MANIFEST_JSON :: """{"id":"odit.docs_browser","title":"Onyx Docs & Core","version":"0.1.0","default_slot":0,"default_width":420,"default_height":400,"event_mask":64,"allow_multiple":false}"""
+
+#export "odit_plugin_manifest" plugin_manifest
+plugin_manifest :: (out_ptr: u32, out_cap: u32) -> i32 {
+    return sdk.write_out_str(MANIFEST_JSON, out_ptr, out_cap);
+}
+
+#export "odit_plugin_init" plugin_init
+plugin_init :: (window_id: u32) -> i32 {
+    g_rows = make([..] DocRow);
+    sdk.register_command("docs.directives", "Onyx Docs: Browse # Directives", "");
+    sdk.register_command("docs.format",     "Onyx Docs: Search format", "");
+    g_needs_query = true;
+    return 0;
+}
+
+#export "odit_plugin_shutdown" plugin_shutdown
+plugin_shutdown :: (window_id: u32) -> void {}
+
+#export "odit_plugin_event" plugin_event
+plugin_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len: u32) -> void {
+    ev := cast(abi.EventType) event_type;
+    if ev == .CommandInvoked && payload_ptr != 0 && payload_len > 0 {
+        payload := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
+        if str_has(payload, "docs.directives") {
+            set_query("#");
+            g_cat_filter = 1;
+        } elseif str_has(payload, "docs.format") {
+            set_query("format");
+            g_cat_filter = 0;
+        }
+    }
+}
+
+#local
+set_query :: (q: str) {
+    n := q.count if q.count < 95 else 95;
+    if n > 0 do memory.copy(&g_query_buf[0], q.data, n);
+    g_query_len = cast(u32) n;
+    g_needs_query = true;
+}
+
+#local
+run_search :: () {
+    for &r in g_rows {
+        str.free(r.name);
+        str.free(r.pkg);
+        str.free(r.kind);
+        str.free(r.signature);
+        str.free(r.summary);
+    }
+    Array.clear(&g_rows);
+    g_selected = 0;
+    g_scroll_y = 0.0f;
+
+    q := str.{ &g_query_buf[0], cast(i32) g_query_len };
+    js := sdk.docs_search_json(q, context.allocator);
+    defer str.free(js);
+
+    pos := 0;
+    obj: str;
+    while sdk.json_next_object(js, &pos, &obj) {
+        kind := sdk.json_get_str(obj, "kind", context.temp_allocator);
+        if !matches_category(kind) do continue;
+
+        g_rows << .{
+            name      = str.copy(sdk.json_get_str(obj, "name",      context.temp_allocator)),
+            pkg       = str.copy(sdk.json_get_str(obj, "pkg",       context.temp_allocator)),
+            kind      = str.copy(kind),
+            signature = str.copy(sdk.json_get_str(obj, "signature", context.temp_allocator)),
+            summary   = str.copy(sdk.json_get_str(obj, "summary",   context.temp_allocator)),
+        };
+    }
+    g_needs_query = false;
+}
+
+#local
+matches_category :: (kind: str) -> bool {
+    return switch g_cat_filter {
+        case 1 => str.equal(kind, "directive");
+        case 2 => str.equal(kind, "package");
+        case 3 => str.equal(kind, "proc") || str.equal(kind, "macro");
+        case 4 => str.equal(kind, "struct") || str.equal(kind, "enum") || str.equal(kind, "interface");
+        case _ => true;
+    };
+}
+
+#local
+kind_badge :: (kind: str) -> (str, u32) {
+    if str.equal(kind, "directive") do return "DIR",  sdk.theme_color(.Warning);
+    if str.equal(kind, "package")   do return "PKG",  sdk.theme_color(.Info);
+    if str.equal(kind, "proc") || str.equal(kind, "macro") do return "FN", sdk.theme_color(.Accent);
+    return "TYPE", sdk.theme_color(.Success);
+}
+
+#export "odit_plugin_render" plugin_render
+plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
+    sdk.begin_frame();
+
+    ctx := cast(&abi.FrameContext) ctx_ptr;
+    if g_needs_query do run_search();
+
+    pad: f32 = 10.0f;
+    w := ctx.width - pad * 2.0f;
+    if w < 140.0f do w = 140.0f;
+    y := pad;
+
+    // Row 1: Search input
+    if sdk.input_text(1, pad, y, w, 28.0f, g_query_buf, &g_query_len, "Search Onyx core or #directives (e.g. format, #load, Array)...") & .Changed {
+        g_needs_query = true;
+    }
+    y += 34.0f;
+
+    // Row 2: Category filter buttons
+    cw := (w - 16.0f) / 5.0f;
+    cats := str.[ "All", "#Dir", "Pkg", "Procs", "Types" ];
+    for ci in 0 .. 5 {
+        if sdk.button(cast(u32) (10 + ci), pad + cast(f32) ci * (cw + 4.0f), y, cw, 24.0f, cats[ci],
+                      .Active if g_cat_filter == ci else .Ghost) & .Clicked {
+            g_cat_filter = ci;
+            g_needs_query = true;
+        }
+    }
+    y += 30.0f;
+
+    // Detail card height reserved at bottom
+    detail_h: f32 = 104.0f;
+    list_h := ctx.height - y - detail_h - pad - 8.0f;
+    if list_h < 60.0f do list_h = 60.0f;
+
+    // Results list
+    sdk.draw_rect(pad, y, w, list_h, sdk.theme_color(.BgBase), 5.0f, sdk.theme_color(.Border), 1.0f);
+
+    row_h: f32 = 26.0f;
+    content_h := cast(f32) g_rows.count * row_h + 8.0f;
+    sdk.scroll_begin(20, pad + 2.0f, y + 2.0f, w - 4.0f, list_h - 4.0f, content_h, &g_scroll_y);
+
+    mx := ctx.mouse_x;
+    my := ctx.mouse_y + g_scroll_y;
+    in_list := (ctx.flags & abi.FRAME_FLAG_HOVERED) != 0 && ctx.mouse_y >= y && ctx.mouse_y <= (y + list_h);
+    lclick := in_list && (ctx.mouse_pressed & cast(u32) abi.MouseButton.Left) != 0;
+
+    ry := y + 4.0f;
+    if g_rows.count == 0 {
+        sdk.draw_text(pad + 10.0f, ry + 4.0f, "No matching Onyx docs found.", 13.0f, sdk.theme_color(.TextDisabled));
+    } else {
+        for i in 0 .. g_rows.count {
+            r := &g_rows[i];
+            hov := in_list && mx >= pad && mx <= (pad + w - 8.0f) && my >= ry && my < (ry + row_h);
+            if i == g_selected {
+                sdk.draw_rect(pad + 4.0f, ry, w - 12.0f, row_h - 1.0f, sdk.theme_color(.BgSelection), 3.0f);
+            } elseif hov {
+                sdk.draw_rect(pad + 4.0f, ry, w - 12.0f, row_h - 1.0f, sdk.theme_color(.BgHover), 3.0f);
+            }
+
+            blbl, bcol := kind_badge(r.kind);
+            sdk.draw_rect(pad + 8.0f, ry + 4.0f, 38.0f, 18.0f, bcol, 3.0f);
+            sdk.draw_text(pad + 12.0f, ry + 6.0f, blbl, 10.5f, 0x11111BFF, .Bold);
+            sdk.draw_text(pad + 52.0f, ry + 5.0f, r.name, 13.0f, sdk.theme_color(.TextPrimary), .Mono);
+
+            if hov && lclick do g_selected = i;
+            ry += row_h;
+        }
+    }
+    sdk.scroll_end();
+
+    // Detail preview card at bottom
+    dy := y + list_h + 8.0f;
+    sdk.draw_rect(pad, dy, w, detail_h, sdk.theme_color(.BgSurface), 6.0f, sdk.theme_color(.Border), 1.0f);
+    if g_selected >= 0 && g_selected < g_rows.count {
+        sel := &g_rows[g_selected];
+        blbl, bcol := kind_badge(sel.kind);
+        pw := sdk.pill(pad + 10.0f, dy + 8.0f, blbl, bcol, 0x11111BFF);
+        sdk.draw_text(pad + 18.0f + pw, dy + 10.0f, sel.name, 13.5f, sdk.theme_color(.TextPrimary), .Bold);
+        sdk.draw_text(pad + 10.0f, dy + 36.0f, sel.signature, 12.0f, sdk.theme_color(.Info), .Mono);
+        sum := sel.summary if sel.summary.count > 0 else "Core standard library symbol.";
+        sdk.draw_text(pad + 10.0f, dy + 60.0f, sum, 12.0f, sdk.theme_color(.TextSecondary));
+    } else {
+        sdk.draw_text(pad + 10.0f, dy + 12.0f, "Select an item above to inspect its signature and docs.", 12.5f, sdk.theme_color(.TextDisabled));
+    }
+}
+
+#local
+str_has :: (haystack: str, needle: str) -> bool {
+    if needle.count == 0 do return true;
+    if haystack.count < needle.count do return false;
+    for i in 0 .. (haystack.count - needle.count + 1) {
+        ok := true;
+        for j in 0 .. needle.count {
+            if haystack[i + j] != needle[j] { ok = false; break; }
+        }
+        if ok do return true;
+    }
+    return false;
+}

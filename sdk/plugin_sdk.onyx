@@ -1,0 +1,397 @@
+package odit.sdk
+
+// =============================================================================
+// Onyx Editor ("odit") — Guest Plugin SDK
+// =============================================================================
+// Load this file + `abi/abi.onyx` + `sdk/platform.onyx` in any WASM plugin.
+// Automatically exports the mandatory ABI boilerplate (`odit_abi_version`,
+// `odit_alloc`, `odit_free`) and provides ergonomic Onyx wrappers over every
+// raw scalar `#foreign "odit_host"` call.
+
+use core { memory, raw_alloc, raw_free, alloc }
+use runtime
+use odit.abi
+
+/// Call at the top of `odit_plugin_render` to reclaim temporary allocations
+/// made during the previous frame (prevents temp_allocator exhaustion!).
+begin_frame :: () {
+    alloc.clear_temp_allocator();
+}
+
+// -----------------------------------------------------------------------------
+// Mandatory Guest ABI Exports
+// -----------------------------------------------------------------------------
+
+#export "_initialize" __odit_runtime_init
+__odit_runtime_init :: () {
+    runtime.__runtime_initialize();
+    context.thread_id = 0;
+}
+
+#export "odit_abi_version" __odit_abi_version
+__odit_abi_version :: () -> u32 {
+    return abi.ABI_VERSION;
+}
+
+#export "odit_alloc" __odit_alloc
+__odit_alloc :: (size: u32) -> u32 {
+    if size == 0 do return 0;
+    ptr := raw_alloc(context.allocator, cast(i32) size);
+    return cast(u32) ptr;
+}
+
+#export "odit_free" __odit_free
+__odit_free :: (ptr: u32) -> void {
+    if ptr == 0 do return;
+    raw_free(context.allocator, cast(rawptr) ptr);
+}
+
+/// Helper for implementing `odit_plugin_manifest` with a static JSON string.
+write_out_str :: (s: str, out_ptr: u32, out_cap: u32) -> i32 {
+    if out_ptr == 0 || out_cap == 0 {
+        return cast(i32) s.count;
+    }
+    if cast(u32) s.count > out_cap {
+        return cast(i32) abi.AbiError.BufferTooSmall;
+    }
+    if s.count > 0 {
+        memory.copy(cast(rawptr) out_ptr, s.data, s.count);
+    }
+    return cast(i32) s.count;
+}
+
+// -----------------------------------------------------------------------------
+// A. Host Core & Command Palette Wrappers
+// -----------------------------------------------------------------------------
+
+log_info  :: (msg: str) => abi.host_log(cast(u32) abi.LogLevel.Info,  cast(u32) msg.data, cast(u32) msg.count);
+log_warn  :: (msg: str) => abi.host_log(cast(u32) abi.LogLevel.Warn,  cast(u32) msg.data, cast(u32) msg.count);
+log_error :: (msg: str) => abi.host_log(cast(u32) abi.LogLevel.Error, cast(u32) msg.data, cast(u32) msg.count);
+
+set_title :: (title: str) => abi.host_set_window_title(cast(u32) title.data, cast(u32) title.count);
+notify    :: (severity: abi.LogLevel, msg: str) => abi.host_notify(cast(u32) severity, cast(u32) msg.data, cast(u32) msg.count);
+
+register_command :: (id: str, label: str, shortcut: str = "") -> u32 {
+    return abi.host_register_command(
+        cast(u32) id.data, cast(u32) id.count,
+        cast(u32) label.data, cast(u32) label.count,
+        cast(u32) shortcut.data, cast(u32) shortcut.count,
+    );
+}
+
+execute_command :: (id: str, arg: str = "") -> i32 {
+    return abi.host_execute_command(
+        cast(u32) id.data, cast(u32) id.count,
+        cast(u32) arg.data, cast(u32) arg.count,
+    );
+}
+
+spawn_plugin :: (plugin_id: str) -> u32 {
+    return abi.host_spawn_plugin(cast(u32) plugin_id.data, cast(u32) plugin_id.count);
+}
+
+// -----------------------------------------------------------------------------
+// B. UI Primitives & Immediate Widget Wrappers
+// -----------------------------------------------------------------------------
+
+theme_color :: (role: abi.ThemeColor) -> u32 {
+    return abi.ui_get_theme_color(cast(u32) role);
+}
+
+push_clip :: (x, y, w, h: f32) => abi.ui_push_clip(x, y, w, h);
+pop_clip  :: ()                => abi.ui_pop_clip();
+
+measure_text :: (text: str, font_size: f32 = 14.0, flags: abi.TextFlags = .{}) -> f32 {
+    return abi.ui_measure_text(cast(u32) text.data, cast(u32) text.count, font_size, cast(u32) flags);
+}
+
+draw_rect :: (x, y, w, h: f32, fill: u32, radius: f32 = 0.0, border: u32 = 0, border_w: f32 = 0.0) {
+    abi.ui_draw_rect(x, y, w, h, radius, fill, border, border_w);
+}
+
+draw_line :: (x1, y1, x2, y2: f32, thickness: f32, color: u32) {
+    abi.ui_draw_line(x1, y1, x2, y2, thickness, color);
+}
+
+draw_arrow :: (x1, y1, x2, y2: f32, thickness: f32, head_size: f32, color: u32) {
+    abi.ui_draw_arrow(x1, y1, x2, y2, thickness, head_size, color);
+}
+
+draw_circle :: (cx, cy, radius: f32, fill: u32, border: u32 = 0, border_w: f32 = 0.0) {
+    abi.ui_draw_circle(cx, cy, radius, fill, border, border_w);
+}
+
+draw_text :: (x, y: f32, text: str, font_size: f32 = 14.0, color: u32 = 0xCDD6F4FF, flags: abi.TextFlags = .{}) {
+    if text.count == 0 do return;
+    abi.ui_draw_text(x, y, cast(u32) text.data, cast(u32) text.count, font_size, color, cast(u32) flags);
+}
+
+pill :: (x, y: f32, text: str, bg: u32, fg: u32) -> f32 {
+    return abi.ui_pill(x, y, cast(u32) text.data, cast(u32) text.count, bg, fg);
+}
+
+button :: (id: u32, x, y, w, h: f32, label: str, style: abi.ButtonFlags = .{}) -> abi.WidgetState {
+    res := abi.ui_button(id, x, y, w, h, cast(u32) label.data, cast(u32) label.count, cast(u32) style);
+    return cast(abi.WidgetState) res;
+}
+
+input_text :: (id: u32, x, y, w, h: f32, buf: [] u8, len: &u32, placeholder: str = "") -> abi.WidgetState {
+    res := abi.ui_input(
+        id, x, y, w, h,
+        cast(u32) buf.data, *len, cast(u32) buf.count,
+        cast(u32) placeholder.data, cast(u32) placeholder.count,
+        cast(u32) len,
+    );
+    return cast(abi.WidgetState) res;
+}
+
+dropdown :: (id: u32, x, y, w, h: f32, items_newline_sep: str, selected: i32) -> i32 {
+    return abi.ui_dropdown(id, x, y, w, h, cast(u32) items_newline_sep.data, cast(u32) items_newline_sep.count, selected);
+}
+
+scroll_begin :: (id: u32, x, y, w, h, content_h: f32, scroll_y: &f32) {
+    abi.ui_scroll_area_begin(id, x, y, w, h, content_h, cast(u32) scroll_y);
+}
+
+scroll_end :: () => abi.ui_scroll_area_end();
+
+// -----------------------------------------------------------------------------
+// D. Process & Compiler Helpers
+// -----------------------------------------------------------------------------
+
+compiler_build :: (entry: str, target: abi.BuildTarget, flags: abi.BuildFlags) -> u32 {
+    return abi.compiler_build(cast(u32) entry.data, cast(u32) entry.count, cast(u32) target, cast(u32) flags);
+}
+
+proc_poll :: (handle: u32, exit_code: &i32) -> abi.ProcState {
+    return cast(abi.ProcState) abi.proc_poll_status(handle, cast(u32) exit_code);
+}
+
+proc_read :: (handle: u32, stream_mask: abi.StreamMask, buf: [] u8) -> i32 {
+    return abi.proc_read_output(handle, cast(u32) stream_mask, cast(u32) buf.data, cast(u32) buf.count);
+}
+
+proc_kill :: (handle: u32) -> i32 {
+    return abi.proc_kill(handle);
+}
+
+// -----------------------------------------------------------------------------
+// C. Editor & Workspace Query Helpers
+// -----------------------------------------------------------------------------
+
+editor_active_path :: (allocator := context.temp_allocator) -> str {
+    needed := abi.editor_get_active_path(0, 0);
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.editor_get_active_path(cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 do return "";
+    return buf[0 .. got];
+}
+
+editor_buffer :: (allocator := context.temp_allocator) -> str {
+    needed := abi.editor_get_buffer_len();
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.editor_get_buffer(cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 do return "";
+    return buf[0 .. got];
+}
+
+editor_cursor :: () -> abi.EditorCursor {
+    c: abi.EditorCursor;
+    abi.editor_get_cursor(cast(u32) &c);
+    return c;
+}
+
+editor_open :: (path: str, line: i32 = 1, col: i32 = 1) -> i32 {
+    return abi.editor_open_file(cast(u32) path.data, cast(u32) path.count, line, col);
+}
+
+workspace_read_file :: (rel_path: str, allocator := context.temp_allocator) -> str {
+    needed := abi.workspace_read_file(cast(u32) rel_path.data, cast(u32) rel_path.count, 0, 0);
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.workspace_read_file(cast(u32) rel_path.data, cast(u32) rel_path.count, cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 do return "";
+    return buf[0 .. got];
+}
+
+workspace_write_file :: (rel_path: str, data: str) -> bool {
+    return abi.workspace_write_file(
+        cast(u32) rel_path.data, cast(u32) rel_path.count,
+        cast(u32) data.data, cast(u32) data.count
+    ) >= 0;
+}
+
+workspace_list_dir_json :: (rel_path: str, allocator := context.temp_allocator) -> str {
+    needed := abi.workspace_list_dir(cast(u32) rel_path.data, cast(u32) rel_path.count, 0, 0);
+    if needed <= 0 do return "[]";
+    buf := make([] u8, needed, allocator);
+    got := abi.workspace_list_dir(cast(u32) rel_path.data, cast(u32) rel_path.count, cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 do return "[]";
+    return buf[0 .. got];
+}
+
+proc_spawn :: (cmd: str, args_newline_sep: str, cwd: str = "") -> u32 {
+    return abi.proc_spawn(
+        cast(u32) cmd.data, cast(u32) cmd.count,
+        cast(u32) args_newline_sep.data, cast(u32) args_newline_sep.count,
+        cast(u32) cwd.data, cast(u32) cwd.count
+    );
+}
+
+ast_symbols_json :: (rel_path: str = "", allocator := context.temp_allocator) -> str {
+    needed := abi.ast_get_symbols(cast(u32) rel_path.data, cast(u32) rel_path.count, 0, 0);
+    if needed <= 0 do return "[]";
+    buf := make([] u8, needed, allocator);
+    got := abi.ast_get_symbols(cast(u32) rel_path.data, cast(u32) rel_path.count, cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 do return "[]";
+    return buf[0 .. got];
+}
+
+compiler_function_wat_json :: (file: str, func: str, allocator := context.temp_allocator) -> str {
+    needed := abi.compiler_get_function_wat(
+        cast(u32) file.data, cast(u32) file.count,
+        cast(u32) func.data, cast(u32) func.count,
+        0, 0
+    );
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.compiler_get_function_wat(
+        cast(u32) file.data, cast(u32) file.count,
+        cast(u32) func.data, cast(u32) func.count,
+        cast(u32) buf.data, cast(u32) buf.count
+    );
+    if got <= 0 do return "";
+    return buf[0 .. got];
+}
+
+docs_search_json :: (query: str, allocator := context.temp_allocator) -> str {
+    needed := abi.docs_search(cast(u32) query.data, cast(u32) query.count, 0, 0);
+    if needed <= 0 do return "[]";
+    buf := make([] u8, needed, allocator);
+    got := abi.docs_search(cast(u32) query.data, cast(u32) query.count, cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 do return "[]";
+    return buf[0 .. got];
+}
+
+// -----------------------------------------------------------------------------
+// E. Lightweight Zero-Dependency JSON Helpers for `-r custom` WASM Plugins
+// -----------------------------------------------------------------------------
+
+/// Finds the next `{...}` object slice inside a JSON array starting at `*pos`.
+/// Returns false when no more objects remain.
+json_next_object :: (js: str, pos: &i32, out_obj: &str) -> bool {
+    i := *pos;
+    n := js.count;
+    while i < n && js[i] != '{' do i += 1;
+    if i >= n { *pos = n; return false; }
+
+    start := i;
+    depth := 0;
+    in_str := false;
+    while i < n {
+        c := js[i];
+        if in_str {
+            if c == '\\' && i + 1 < n { i += 2; continue; }
+            if c == '"' do in_str = false;
+        } else {
+            if c == '"' do in_str = true;
+            elseif c == '{' do depth += 1;
+            elseif c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    *out_obj = js[start .. (i + 1)];
+                    *pos = i + 1;
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    *pos = n;
+    return false;
+}
+
+#local
+json_find_field_value :: (obj: str, key: str) -> i32 {
+    n := obj.count;
+    i := 0;
+    while i < n {
+        if obj[i] == '"' {
+            ks := i + 1;
+            i += 1;
+            while i < n {
+                if obj[i] == '\\' && i + 1 < n { i += 2; continue; }
+                if obj[i] == '"' do break;
+                i += 1;
+            }
+            ke := i;
+            if i < n do i += 1;
+            while i < n && (obj[i] == ' ' || obj[i] == '\t' || obj[i] == '\n' || obj[i] == '\r') do i += 1;
+            if i < n && obj[i] == ':' {
+                i += 1;
+                while i < n && (obj[i] == ' ' || obj[i] == '\t' || obj[i] == '\n' || obj[i] == '\r') do i += 1;
+                if ke - ks == key.count {
+                    match := true;
+                    for k in 0 .. key.count {
+                        if obj[ks + k] != key[k] { match = false; break; }
+                    }
+                    if match do return i;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    return -1;
+}
+
+/// Extracts a string field value from a flat JSON object (unescaping `\"`, `\\`, `\n`, `\t`).
+json_get_str :: (obj: str, key: str, allocator := context.temp_allocator) -> str {
+    idx := json_find_field_value(obj, key);
+    if idx < 0 || idx >= obj.count || obj[idx] != '"' do return "";
+    i := idx + 1;
+    out := make([..] u8, 32, allocator);
+    while i < obj.count {
+        c := obj[i];
+        if c == '\\' && i + 1 < obj.count {
+            nxt := obj[i + 1];
+            switch nxt {
+                case 'n'  do out << '\n';
+                case 'r'  do out << '\r';
+                case 't'  do out << '\t';
+                case '"'  do out << '"';
+                case '\\' do out << '\\';
+                case _    do out << nxt;
+            }
+            i += 2;
+            continue;
+        }
+        if c == '"' do break;
+        out << c;
+        i += 1;
+    }
+    return str.{ out.data, out.count };
+}
+
+/// Extracts a boolean field value from a flat JSON object.
+json_get_bool :: (obj: str, key: str) -> bool {
+    idx := json_find_field_value(obj, key);
+    if idx < 0 || idx + 4 > obj.count do return false;
+    return obj[idx] == 't' && obj[idx + 1] == 'r' && obj[idx + 2] == 'u' && obj[idx + 3] == 'e';
+}
+
+/// Extracts a signed integer field value from a flat JSON object.
+json_get_i32 :: (obj: str, key: str) -> i32 {
+    idx := json_find_field_value(obj, key);
+    if idx < 0 || idx >= obj.count do return 0;
+    neg := false;
+    if obj[idx] == '-' { neg = true; idx += 1; }
+    val: i32 = 0;
+    while idx < obj.count && obj[idx] >= '0' && obj[idx] <= '9' {
+        val = val * 10 + cast(i32) (obj[idx] - '0');
+        idx += 1;
+    }
+    return -val if neg else val;
+}

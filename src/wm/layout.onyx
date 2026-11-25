@@ -1,0 +1,380 @@
+package odit.wm
+
+// =============================================================================
+// Onyx Editor ("odit") — Dockable / Tiled Window Manager
+// =============================================================================
+// Manages the multi-pane workspace:
+//   - Top IDE bar (`28px`) and bottom status bar (`24px`)
+//   - Main vertical splitter dividing the Core Code Editor (left) from the
+//     tiled grid of active WASM Plugin Windows (right)
+//   - Draggable splitter resize, click-to-focus, close button, and dynamic
+//     spawning/closing of plugin windows
+
+use core { package, math }
+use raylib
+use odit.theme
+use odit.settings
+
+PaneRect :: struct {
+    x, y, w, h: f32;
+}
+
+PluginPane :: struct {
+    window_id:     u32;
+    plugin_handle: u32;
+    plugin_id:     str;
+    title:         str;
+    event_mask:    u32;
+    rect:          PaneRect;
+    content_rect:  PaneRect;
+    alive:         bool;
+}
+
+WindowManager :: struct {
+    split_ratio:       f32;  // Left editor ratio [0.25 .. 0.85], default 0.58
+    dragging_splitter: bool;
+
+    focused_window_id: u32;  // 0 = main code editor, >0 = plugin window_id
+    next_window_id:    u32;
+
+    editor_rect:       PaneRect;
+    editor_content:    PaneRect;
+    panes:             [..] PluginPane;
+
+    // Status toast notification
+    toast_text:        str;
+    toast_timer:       f32;
+    toast_severity:    u32;
+}
+
+ChromeActions :: struct {
+    open_palette:  bool;
+    open_finder:   bool;
+    open_settings: bool;
+}
+
+top_bar_h    :: () -> f32 { return 30.0f * settings.g_settings.ui_scale; }
+status_bar_h :: () -> f32 { return 26.0f * settings.g_settings.ui_scale; }
+header_h     :: () -> f32 { return 28.0f * settings.g_settings.ui_scale; }
+SPLITTER_W   :: 5.0f
+PANE_GAP     :: 4.0f
+
+wm_init :: (wm: &WindowManager) {
+    wm.split_ratio       = settings.g_settings.split_ratio;
+    wm.dragging_splitter = false;
+    wm.focused_window_id = 0;
+    wm.next_window_id    = 1;
+    wm.panes             = make([..] PluginPane);
+    wm.toast_text        = "";
+    wm.toast_timer       = 0.0;
+}
+
+wm_notify :: (wm: &WindowManager, severity: u32, msg: str) {
+    if wm.toast_text.count > 0 {
+        // Free previous owned copy if needed; kept simple with heap copy
+    }
+    wm.toast_text     = str.copy(msg);
+    wm.toast_severity = severity;
+    wm.toast_timer    = 3.5;
+}
+
+wm_add_pane :: (wm: &WindowManager, plugin_handle: u32, plugin_id: str, title: str, event_mask: u32) -> u32 {
+    wid := wm.next_window_id;
+    wm.next_window_id += 1;
+
+    wm.panes << .{
+        window_id     = wid,
+        plugin_handle = plugin_handle,
+        plugin_id     = str.copy(plugin_id),
+        title         = str.copy(title),
+        event_mask    = event_mask,
+        alive         = true,
+    };
+    return wid;
+}
+
+wm_find_pane :: (wm: &WindowManager, window_id: u32) -> &PluginPane {
+    for &p in wm.panes {
+        if p.alive && p.window_id == window_id do return p;
+    }
+    return null;
+}
+
+wm_find_pane_by_handle :: (wm: &WindowManager, handle: u32) -> &PluginPane {
+    for &p in wm.panes {
+        if p.alive && p.plugin_handle == handle do return p;
+    }
+    return null;
+}
+
+wm_cycle_focus :: (wm: &WindowManager) {
+    if wm.panes.count == 0 {
+        wm.focused_window_id = 0;
+        return;
+    }
+    if wm.focused_window_id == 0 {
+        wm.focused_window_id = wm.panes[0].window_id;
+        return;
+    }
+    for i in 0 .. wm.panes.count {
+        if wm.panes[i].window_id == wm.focused_window_id {
+            if i + 1 < wm.panes.count {
+                wm.focused_window_id = wm.panes[i + 1].window_id;
+            } else {
+                wm.focused_window_id = 0;
+            }
+            return;
+        }
+    }
+    wm.focused_window_id = 0;
+}
+
+/// Computes layout rects, handles splitter dragging and click-to-focus.
+/// Returns `closed_window_id` (>0) if user clicked a pane's close button.
+wm_update_layout :: (wm: &WindowManager, screen_w, screen_h, dt: f32, block_mouse: bool) -> u32 {
+    if wm.toast_timer > 0.0 {
+        wm.toast_timer -= dt;
+        if wm.toast_timer < 0.0 do wm.toast_timer = 0.0;
+    }
+
+    tb_h := top_bar_h();
+    sb_h := status_bar_h();
+    hd_h := header_h();
+
+    work_x: f32 = PANE_GAP;
+    work_y: f32 = tb_h + PANE_GAP;
+    work_w: f32 = screen_w - PANE_GAP * 2.0f;
+    work_h: f32 = screen_h - tb_h - sb_h - PANE_GAP * 2.0f;
+    if work_w < 200.0f do work_w = 200.0f;
+    if work_h < 120.0f do work_h = 120.0f;
+
+    has_plugins := wm.panes.count > 0;
+    mpos := raylib.GetMousePosition();
+    pressed := !block_mouse && raylib.IsMouseButtonPressed(.LEFT);
+    down    := !block_mouse && raylib.IsMouseButtonDown(.LEFT);
+
+    if has_plugins {
+        split_x := work_x + work_w * wm.split_ratio;
+        on_splitter := mpos.x >= (split_x - 4.0f) && mpos.x <= (split_x + SPLITTER_W + 4.0f) &&
+                       mpos.y >= work_y && mpos.y <= (work_y + work_h);
+
+        if on_splitter && pressed {
+            wm.dragging_splitter = true;
+        }
+        if !down && wm.dragging_splitter {
+            wm.dragging_splitter = false;
+            settings.g_settings.split_ratio = wm.split_ratio;
+            settings.settings_save();
+        }
+        if wm.dragging_splitter {
+            wm.split_ratio = (mpos.x - work_x) / work_w;
+            if wm.split_ratio < 0.25f do wm.split_ratio = 0.25f;
+            if wm.split_ratio > 0.85f do wm.split_ratio = 0.85f;
+            split_x = work_x + work_w * wm.split_ratio;
+        }
+
+        ed_w := split_x - work_x;
+        wm.editor_rect    = .{ work_x, work_y, ed_w, work_h };
+        wm.editor_content = .{ work_x + 1.0f, work_y + hd_h, ed_w - 2.0f, work_h - hd_h - 1.0f };
+
+        // Tile active plugin windows on the right side
+        right_x := split_x + SPLITTER_W;
+        right_w := (work_x + work_w) - right_x;
+        n := wm.panes.count;
+        cols: i32 = 1 if n <= 2 else 2;
+        rows: i32 = (n + cols - 1) / cols;
+
+        cell_w := (right_w - PANE_GAP * cast(f32) (cols - 1)) / cast(f32) cols;
+        cell_h := (work_h  - PANE_GAP * cast(f32) (rows - 1)) / cast(f32) rows;
+
+        for idx in 0 .. n {
+            c := idx % cols;
+            r := idx / cols;
+            px := right_x + cast(f32) c * (cell_w + PANE_GAP);
+            py := work_y  + cast(f32) r * (cell_h + PANE_GAP);
+
+            // If odd pane count in last row of 2-col grid, stretch full width
+            pw := cell_w;
+            if cols == 2 && idx == n - 1 && (n % 2) == 1 {
+                pw = right_w;
+            }
+
+            wm.panes[idx].rect = .{ px, py, pw, cell_h };
+            wm.panes[idx].content_rect = .{ px + 1.0f, py + hd_h, pw - 2.0f, cell_h - hd_h - 1.0f };
+        }
+    } else {
+        wm.dragging_splitter = false;
+        wm.editor_rect    = .{ work_x, work_y, work_w, work_h };
+        wm.editor_content = .{ work_x + 1.0f, work_y + hd_h, work_w - 2.0f, work_h - hd_h - 1.0f };
+    }
+
+    closed_wid: u32 = 0;
+
+    // Handle click-to-focus & close button hits
+    if pressed && !wm.dragging_splitter {
+        if hit_rect(mpos.x, mpos.y, wm.editor_rect) {
+            wm.focused_window_id = 0;
+        } else {
+            for &p in wm.panes {
+                if hit_rect(mpos.x, mpos.y, p.rect) {
+                    // Check top-right close button (`x`)
+                    close_x := p.rect.x + p.rect.w - 24.0;
+                    close_y := p.rect.y + 3.0;
+                    if mpos.x >= close_x && mpos.x <= (close_x + 20.0) &&
+                       mpos.y >= close_y && mpos.y <= (close_y + 20.0) {
+                        closed_wid = p.window_id;
+                    } else {
+                        wm.focused_window_id = p.window_id;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    return closed_wid;
+}
+
+wm_draw_chrome :: (
+    wm: &WindowManager, screen_w, screen_h: f32,
+    active_file: str, mode_label: str, line, col: u32, dirty: bool,
+    block_clicks: bool = false,
+    lsp_label: str = "LSP: Off", lsp_ready: bool = false,
+    diag_errs: i32 = 0, diag_warns: i32 = 0
+) -> ChromeActions {
+    actions: ChromeActions;
+    s := settings.g_settings.ui_scale;
+    tb_h := top_bar_h();
+    sb_h := status_bar_h();
+    fs_sm := 12.5f * s;
+    fs_md := 13.5f * s;
+
+    // Top IDE Header Bar
+    theme.draw_rect(0, 0, screen_w, tb_h, theme.get_color(.BgHeader));
+    raylib.DrawLine(0, cast(i32) tb_h - 1, cast(i32) screen_w, cast(i32) tb_h - 1, theme.get_rl(.Border));
+
+    badge_w := 50.0f * s;
+    badge_h := tb_h - 8.0f;
+    theme.draw_rect(8.0f, 4.0f, badge_w, badge_h, theme.get_color(.Accent), 4.0f);
+    theme.draw_text(8.0f + 7.0f * s, (tb_h - fs_md) * 0.5f, "ODIT", fs_md, 0x11111BFF);
+    theme.draw_text(16.0f + badge_w, (tb_h - fs_md) * 0.5f, "Onyx Modular WASM IDE", fs_md, theme.get_color(.TextSecondary));
+
+    // Clickable Quick Open (Ctrl+O) & Command Palette (Ctrl+P) buttons in top bar
+    find_w := 142.0f * s;
+    pal_w  := 226.0f * s;
+    tot_w  := find_w + 8.0f + pal_w;
+    find_x := (screen_w - tot_w) * 0.5f;
+    pal_x  := find_x + find_w + 8.0f;
+
+    mpos := raylib.GetMousePosition();
+    find_hover := !block_clicks && mpos.x >= find_x && mpos.x <= (find_x + find_w) && mpos.y >= 4.0f && mpos.y <= (tb_h - 4.0f);
+    theme.draw_rect(find_x, 4.0f, find_w, tb_h - 8.0f,
+        theme.get_color(.BgHover) if find_hover else theme.get_color(.BgSurface),
+        4.0f, theme.get_color(.Border), 1.0f);
+    theme.draw_text(find_x + 10.0f * s, (tb_h - fs_sm) * 0.5f, "Open File Ctrl+O", fs_sm, theme.get_color(.TextPrimary));
+    actions.open_finder = find_hover && raylib.IsMouseButtonPressed(.LEFT);
+
+    pal_hover := !block_clicks && mpos.x >= pal_x && mpos.x <= (pal_x + pal_w) && mpos.y >= 4.0f && mpos.y <= (tb_h - 4.0f);
+    theme.draw_rect(pal_x, 4.0f, pal_w, tb_h - 8.0f,
+        theme.get_color(.BgHover) if pal_hover else theme.get_color(.BgSurface),
+        4.0f, theme.get_color(.Border), 1.0f);
+    theme.draw_text(pal_x + 10.0f * s, (tb_h - fs_sm) * 0.5f, "Command Palette  Ctrl+P", fs_sm, theme.get_color(.TextSecondary));
+    actions.open_palette = pal_hover && raylib.IsMouseButtonPressed(.LEFT);
+
+    // Clickable Settings button on top-right
+    set_w := 124.0f * s;
+    set_x := screen_w - set_w - 8.0f;
+    set_hover := !block_clicks && mpos.x >= set_x && mpos.x <= (set_x + set_w) && mpos.y >= 4.0f && mpos.y <= (tb_h - 4.0f);
+    theme.draw_rect(set_x, 4.0f, set_w, tb_h - 8.0f,
+        theme.get_color(.BgHover) if set_hover else theme.get_color(.BgSurface),
+        4.0f, theme.get_color(.Border), 1.0f);
+    theme.draw_text(set_x + 10.0f * s, (tb_h - fs_sm) * 0.5f, "Settings Ctrl+,", fs_sm, theme.get_color(.TextPrimary));
+    actions.open_settings = set_hover && raylib.IsMouseButtonPressed(.LEFT);
+
+    // Splitter line visual
+    if wm.panes.count > 0 {
+        sx := wm.editor_rect.x + wm.editor_rect.w + 2.0f;
+        col_s := theme.get_color(.BorderFocused) if wm.dragging_splitter else theme.get_color(.Border);
+        raylib.DrawLineEx(.{ sx, wm.editor_rect.y }, .{ sx, wm.editor_rect.y + wm.editor_rect.h }, 2.0f, theme.rgba_to_rl(col_s));
+    }
+
+    // Bottom Status Bar
+    sy := screen_h - sb_h;
+    theme.draw_rect(0, sy, screen_w, sb_h, theme.get_color(.BgHeader));
+    raylib.DrawLine(0, cast(i32) sy, cast(i32) screen_w, cast(i32) sy, theme.get_rl(.Border));
+
+    // Mode pill (NORMAL / INSERT)
+    mode_w := 68.0f * s;
+    mode_bg := theme.get_color(.Success) if str.equal(mode_label, "INSERT") else theme.get_color(.Accent);
+    theme.draw_rect(6.0f, sy + 3.0f, mode_w, sb_h - 6.0f, mode_bg, 3.0f);
+    theme.draw_text(13.0f * s, sy + (sb_h - fs_sm) * 0.5f, mode_label, fs_sm, 0x11111BFF);
+
+    // Active file path + dirty star
+    file_disp := active_file if active_file.count > 0 else "(untitled)";
+    fx := 14.0f + mode_w;
+    theme.draw_text(fx, sy + (sb_h - fs_sm) * 0.5f, file_disp, fs_sm, theme.get_color(.TextPrimary));
+    if dirty {
+        fw := theme.measure_text(file_disp, fs_sm);
+        theme.draw_text(fx + 4.0f + fw, sy + (sb_h - fs_sm) * 0.5f, "*", fs_md, theme.get_color(.Warning));
+    }
+
+    // Cursor coordinates, LSP status, font size & plugin count on far right
+    status_r := core.tprintf("E:{} W:{}  |  {}  |  Ln {}, Col {}  |  {}px  |  Plugins: {}",
+        diag_errs, diag_warns, lsp_label, line, col, cast(i32) settings.g_settings.editor_font_size, wm.panes.count);
+    rw := theme.measure_text(status_r, fs_sm);
+    rx := screen_w - rw - 10.0f;
+    r_col := theme.get_color(.Error) if diag_errs > 0 else (
+        theme.get_color(.Warning) if diag_warns > 0 else (
+            theme.get_color(.Success) if lsp_ready else theme.get_color(.TextSecondary)
+        )
+    );
+    theme.draw_text(rx, sy + (sb_h - fs_sm) * 0.5f, status_r, fs_sm, r_col);
+
+    // Toast notification left of status text
+    if wm.toast_timer > 0.0f && wm.toast_text.count > 0 {
+        tc := theme.get_color(.Info);
+        if wm.toast_severity == 2 do tc = theme.get_color(.Warning);
+        if wm.toast_severity == 3 do tc = theme.get_color(.Error);
+        tw := theme.measure_text(wm.toast_text, fs_sm);
+        theme.draw_text(screen_w - rw - tw - 28.0f, sy + (sb_h - fs_sm) * 0.5f, wm.toast_text, fs_sm, tc);
+    }
+
+    return actions;
+}
+
+wm_draw_pane_frame :: (rect: PaneRect, title: str, focused: bool, closable: bool) {
+    s := settings.g_settings.ui_scale;
+    hd_h := header_h();
+    fs := 13.5f * s;
+
+    border := theme.get_color(.BorderFocused) if focused else theme.get_color(.Border);
+    theme.draw_rect(rect.x, rect.y, rect.w, rect.h, theme.get_color(.BgPanel), 4.0f, border, 1.5f if focused else 1.0f);
+    theme.draw_rect(rect.x + 1.0f, rect.y + 1.0f, rect.w - 2.0f, hd_h - 1.0f, theme.get_color(.BgHeader));
+    raylib.DrawLine(
+        cast(i32) (rect.x + 1.0f), cast(i32) (rect.y + hd_h),
+        cast(i32) (rect.x + rect.w - 1.0f), cast(i32) (rect.y + hd_h),
+        theme.get_rl(.Border)
+    );
+
+    dot_col := theme.get_color(.BorderFocused) if focused else theme.get_color(.TextDisabled);
+    raylib.DrawCircle(cast(i32) (rect.x + 13.0f), cast(i32) (rect.y + hd_h * 0.5f), 3.5f * s, theme.rgba_to_rl(dot_col));
+    theme.draw_text(rect.x + 24.0f * s, rect.y + (hd_h - fs) * 0.5f, title, fs,
+        theme.get_color(.TextPrimary) if focused else theme.get_color(.TextSecondary));
+
+    if closable {
+        btn_s := 20.0f * s;
+        cx := rect.x + rect.w - btn_s - 4.0f;
+        cy := rect.y + (hd_h - btn_s) * 0.5f;
+        mpos := raylib.GetMousePosition();
+        hov := mpos.x >= cx && mpos.x <= (cx + btn_s) && mpos.y >= cy && mpos.y <= (cy + btn_s);
+        if hov {
+            theme.draw_rect(cx, cy, btn_s, btn_s, theme.get_color(.BgHover), 3.0f);
+        }
+        theme.draw_text(cx + btn_s * 0.28f, cy + (btn_s - fs) * 0.5f, "x", fs,
+            theme.get_color(.Error) if hov else theme.get_color(.TextSecondary));
+    }
+}
+
+hit_rect :: (px, py: f32, r: PaneRect) -> bool {
+    return px >= r.x && px <= (r.x + r.w) && py >= r.y && py <= (r.y + r.h);
+}

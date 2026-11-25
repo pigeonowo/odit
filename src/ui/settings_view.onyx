@@ -1,0 +1,241 @@
+package odit.ui
+
+// =============================================================================
+// Onyx Editor ("odit") — Interactive Settings Overlay (`Ctrl+,`)
+// =============================================================================
+// Lets users adjust typography (font size, UI scale, line height), themes
+// (Mocha, Tokyo Night, Gruvbox, Light), and editor behavior live with instant
+// preview and automatic persistence to `odit.json`.
+
+use core { package }
+use raylib
+use odit.theme
+use odit.settings
+
+SettingsView :: struct {
+    open: bool;
+}
+
+SettingsAction :: enum {
+    None;
+    Changed;
+    Reset;
+    OpenJsonFile;
+}
+
+#local
+btn_rect :: (x, y, w, h: f32, label: str, fs: f32, active: bool = false, primary: bool = false) -> bool {
+    mpos := raylib.GetMousePosition();
+    hov := mpos.x >= x && mpos.x <= (x + w) && mpos.y >= y && mpos.y <= (y + h);
+
+    bg := theme.get_color(.BgSurface);
+    fg := theme.get_color(.TextPrimary);
+    border := theme.get_color(.Border);
+
+    if primary {
+        bg = theme.get_color(.BorderFocused);
+        fg = 0x11111BFF;
+        border = 0;
+    } elseif active {
+        bg = theme.get_color(.Accent);
+        fg = 0x11111BFF;
+        border = 0;
+    } elseif hov {
+        bg = theme.get_color(.BgHover);
+        border = theme.get_color(.BorderFocused);
+    }
+
+    theme.draw_rect(x, y, w, h, bg, 5.0f, border, 1.0f if border != 0 else 0.0f);
+    tw := theme.measure_text(label, fs);
+    theme.draw_text(x + (w - tw) * 0.5f, y + (h - fs) * 0.5f, label, fs, fg);
+    return hov && raylib.IsMouseButtonPressed(.LEFT);
+}
+
+#local
+draw_stepper_row :: (x, y, w, row_h, fs: f32, label: str, value_str: str) -> i32 {
+    theme.draw_text(x, y + (row_h - fs) * 0.5f, label, fs, theme.get_color(.TextPrimary));
+
+    btn_w := row_h * 1.15f;
+    val_w := 84.0f * settings.g_settings.ui_scale;
+    rx := x + w;
+
+    delta: i32 = 0;
+    if btn_rect(rx - btn_w, y + 2.0f, btn_w, row_h - 4.0f, "+", fs) do delta = 1;
+
+    vx := rx - btn_w - val_w - 6.0f;
+    theme.draw_rect(vx, y + 2.0f, val_w, row_h - 4.0f, theme.get_color(.BgBase), 4.0f, theme.get_color(.Border), 1.0f);
+    vw := theme.measure_text(value_str, fs);
+    theme.draw_text(vx + (val_w - vw) * 0.5f, y + (row_h - fs) * 0.5f, value_str, fs, theme.get_color(.Info));
+
+    if btn_rect(vx - btn_w - 6.0f, y + 2.0f, btn_w, row_h - 4.0f, "-", fs) do delta = -1;
+    return delta;
+}
+
+#local
+draw_toggle_row :: (x, y, w, row_h, fs: f32, label: str, on: bool) -> bool {
+    theme.draw_text(x, y + (row_h - fs) * 0.5f, label, fs, theme.get_color(.TextPrimary));
+    tw := 78.0f * settings.g_settings.ui_scale;
+    return btn_rect(x + w - tw, y + 2.0f, tw, row_h - 4.0f, "ON" if on else "OFF", fs, active = on);
+}
+
+settings_view_update_and_draw :: (sv: &SettingsView, screen_w, screen_h: f32) -> SettingsAction {
+    if !sv.open do return .None;
+
+    if raylib.IsKeyPressed(.ESCAPE) {
+        sv.open = false;
+        return .None;
+    }
+
+    // Dimmed backdrop
+    raylib.DrawRectangle(0, 0, cast(i32) screen_w, cast(i32) screen_h, .{ 0, 0, 0, 130 });
+
+    s := settings.g_settings.ui_scale;
+    pw := 560.0f * s;
+    if pw > screen_w - 40.0f do pw = screen_w - 40.0f;
+
+    row_h := 32.0f * s;
+    pad := 18.0f * s;
+    fs := 13.5f * s;
+    fs_title := 16.0f * s;
+    fs_sec := 12.0f * s;
+
+    ph := pad * 2.0f + 36.0f * s + row_h * 11.2f + 44.0f * s;
+    if ph > screen_h - 40.0f do ph = screen_h - 40.0f;
+
+    px := (screen_w - pw) * 0.5f;
+    py := (screen_h - ph) * 0.5f;
+
+    // Click outside closes modal
+    mpos := raylib.GetMousePosition();
+    if raylib.IsMouseButtonPressed(.LEFT) {
+        if mpos.x < px || mpos.x > (px + pw) || mpos.y < py || mpos.y > (py + ph) {
+            sv.open = false;
+            return .None;
+        }
+    }
+
+    theme.draw_rect(px, py, pw, ph, theme.get_color(.BgPanel), 10.0f, theme.get_color(.BorderFocused), 1.5f);
+
+    // Header
+    ix := px + pad;
+    iw := pw - pad * 2.0f;
+    cy := py + pad;
+
+    theme.draw_text(ix, cy, "Settings (odit.json)", fs_title, theme.get_color(.TextPrimary));
+    if btn_rect(ix + iw - 72.0f * s, cy - 2.0f, 72.0f * s, 26.0f * s, "Close", fs_sec) {
+        sv.open = false;
+        return .None;
+    }
+    cy += 34.0f * s;
+    raylib.DrawLine(cast(i32) ix, cast(i32) cy, cast(i32) (ix + iw), cast(i32) cy, theme.get_rl(.Border));
+    cy += 10.0f * s;
+
+    action := SettingsAction.None;
+    cfg := &settings.g_settings;
+
+    // --- Typography Section ---
+    theme.draw_text(ix, cy, "TYPOGRAPHY & SCALING", fs_sec, theme.get_color(.Accent));
+    cy += 20.0f * s;
+
+    if d := draw_stepper_row(ix, cy, iw, row_h, fs, "Editor Font Size (Ctrl + / -)", core.tprintf("{} px", cast(i32) cfg.editor_font_size)); d != 0 {
+        cfg.editor_font_size += cast(f32) d * 2.0f;
+        action = .Changed;
+    }
+    cy += row_h + 4.0f;
+
+    scale_pct := cast(i32) (cfg.ui_scale * 100.0f + 0.5f);
+    if d := draw_stepper_row(ix, cy, iw, row_h, fs, "UI & Plugin Scale", core.tprintf("{}%", scale_pct)); d != 0 {
+        cfg.ui_scale += cast(f32) d * 0.1f;
+        action = .Changed;
+    }
+    cy += row_h + 4.0f;
+
+    lh_tenths := cast(i32) (cfg.line_height_factor * 10.0f + 0.5f);
+    if d := draw_stepper_row(ix, cy, iw, row_h, fs, "Line Height Factor", core.tprintf("{}.{}x", lh_tenths / 10, lh_tenths % 10)); d != 0 {
+        cfg.line_height_factor += cast(f32) d * 0.1f;
+        action = .Changed;
+    }
+    cy += row_h + 12.0f;
+
+    // --- Theme Section ---
+    theme.draw_text(ix, cy, "COLOR THEME", fs_sec, theme.get_color(.Accent));
+    cy += 20.0f * s;
+
+    ThemePreset :: struct { id: str; label: str; }
+    presets := ThemePreset.[
+        .{ "mocha",       "Mocha" },
+        .{ "tokyo_night", "Tokyo" },
+        .{ "gruvbox",     "Gruvbox" },
+        .{ "light",       "Light" },
+    ];
+    gap := 8.0f;
+    pill_w := (iw - gap * 3.0f) * 0.25f;
+    for p, idx in presets {
+        bx := ix + cast(f32) idx * (pill_w + gap);
+        is_cur := str.equal(cfg.theme, p.id);
+        if btn_rect(bx, cy, pill_w, row_h - 2.0f, p.label, fs, active = is_cur) {
+            cfg.theme = str.copy(p.id);
+            theme.theme_apply_preset(cfg.theme);
+            action = .Changed;
+        }
+    }
+    cy += row_h + 12.0f;
+
+    // --- Editor Behavior Section ---
+    theme.draw_text(ix, cy, "EDITOR BEHAVIOR", fs_sec, theme.get_color(.Accent));
+    cy += 20.0f * s;
+
+    if d := draw_stepper_row(ix, cy, iw, row_h, fs, "Tab Size (Spaces)", core.tprintf("{}", cfg.tab_size)); d != 0 {
+        cfg.tab_size += d;
+        action = .Changed;
+    }
+    cy += row_h + 4.0f;
+
+    if draw_toggle_row(ix, cy, iw, row_h, fs, "Modal Editing (Normal / Insert)", cfg.modal_editing) {
+        cfg.modal_editing = !cfg.modal_editing;
+        action = .Changed;
+    }
+    cy += row_h + 4.0f;
+
+    if draw_toggle_row(ix, cy, iw, row_h, fs, "Show Line Numbers", cfg.show_line_numbers) {
+        cfg.show_line_numbers = !cfg.show_line_numbers;
+        action = .Changed;
+    }
+    cy += row_h + 4.0f;
+
+    if draw_toggle_row(ix, cy, iw, row_h, fs, "Highlight Current Line", cfg.highlight_current_line) {
+        cfg.highlight_current_line = !cfg.highlight_current_line;
+        action = .Changed;
+    }
+    cy += row_h + 4.0f;
+
+    if draw_toggle_row(ix, cy, iw, row_h, fs, "Auto-Indent on Enter", cfg.auto_indent) {
+        cfg.auto_indent = !cfg.auto_indent;
+        action = .Changed;
+    }
+    cy += row_h + 14.0f;
+
+    // Footer buttons
+    btn_h := 30.0f * s;
+    bw := (iw - gap * 2.0f) / 3.0f;
+    if btn_rect(ix, cy, bw, btn_h, "Edit odit.json", fs) {
+        sv.open = false;
+        action = .OpenJsonFile;
+    }
+    if btn_rect(ix + bw + gap, cy, bw, btn_h, "Reset Defaults", fs) {
+        action = .Reset;
+    }
+    if btn_rect(ix + (bw + gap) * 2.0f, cy, bw, btn_h, "Done", fs, primary = true) {
+        sv.open = false;
+    }
+
+    if action == .Changed {
+        settings.settings_clamp(cfg);
+        settings.settings_save();
+    } elseif action == .Reset {
+        settings.settings_reset();
+        theme.theme_apply_preset(cfg.theme);
+    }
+
+    return action;
+}

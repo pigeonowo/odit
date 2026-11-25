@@ -1,0 +1,147 @@
+package odit.settings
+
+// =============================================================================
+// Onyx Editor ("odit") — Persistent User Settings (`odit.json`)
+// =============================================================================
+
+use core { package, os, printf }
+use core.encoding.json
+
+Settings :: struct {
+    // Typography & Scaling
+    editor_font_size:       f32;  // px (default 18.0, range 10..36)
+    ui_scale:               f32;  // multiplier for chrome/plugins (default 1.15, range 0.8..2.0)
+    line_height_factor:     f32;  // line height = font_size * factor (default 1.4, range 1.1..2.0)
+    font_path:              str;  // optional custom .ttf path (empty = auto-detect)
+
+    // Appearance
+    theme:                  str;  // "mocha" | "tokyo_night" | "gruvbox" | "light"
+
+    // Editor Behavior
+    tab_size:               i32;  // spaces per Tab (2, 4, or 8; default 4)
+    modal_editing:          bool; // Vim-style Normal/Insert vs Always-Insert (default true)
+    show_line_numbers:      bool; // Show gutter line numbers (default true)
+    highlight_current_line: bool; // Subtle highlight on active line (default true)
+    auto_indent:            bool; // Preserve leading indent on Enter (default true)
+
+    // Layout & Performance
+    split_ratio:            f32;  // Editor vs Plugin pane ratio (default 0.58)
+    target_fps:             i32;  // Raylib FPS cap (default 60)
+}
+
+SETTINGS_FILE :: "odit.json"
+
+g_settings: Settings;
+
+settings_defaults :: () -> Settings {
+    return .{
+        editor_font_size       = 18.0f,
+        ui_scale               = 1.15f,
+        line_height_factor     = 1.4f,
+        font_path              = "",
+        theme                  = "mocha",
+        tab_size               = 4,
+        modal_editing          = true,
+        show_line_numbers      = true,
+        highlight_current_line = true,
+        auto_indent            = true,
+        split_ratio            = 0.58f,
+        target_fps             = 60,
+    };
+}
+
+settings_clamp :: (s: &Settings) {
+    if s.editor_font_size < 10.0f do s.editor_font_size = 10.0f;
+    if s.editor_font_size > 36.0f do s.editor_font_size = 36.0f;
+
+    if s.ui_scale < 0.8f do s.ui_scale = 0.8f;
+    if s.ui_scale > 2.0f do s.ui_scale = 2.0f;
+
+    if s.line_height_factor < 1.1f do s.line_height_factor = 1.1f;
+    if s.line_height_factor > 2.0f do s.line_height_factor = 2.0f;
+
+    if s.tab_size < 1 do s.tab_size = 2;
+    if s.tab_size > 8 do s.tab_size = 8;
+
+    if s.split_ratio < 0.25f do s.split_ratio = 0.25f;
+    if s.split_ratio > 0.85f do s.split_ratio = 0.85f;
+
+    if s.target_fps < 30 do s.target_fps = 30;
+    if s.target_fps > 240 do s.target_fps = 240;
+
+    if s.theme.count == 0 do s.theme = "mocha";
+}
+
+settings_load :: (path: str = SETTINGS_FILE) -> bool {
+    g_settings = settings_defaults();
+
+    if !os.file_exists(path) {
+        return false;
+    }
+
+    contents := os.get_contents(path);
+    if contents.count == 0 do return false;
+    defer delete(&contents);
+
+    switch json.decode_as(contents, Settings) {
+        case .Ok as loaded {
+            g_settings = loaded;
+            g_settings.theme     = str.copy(loaded.theme if loaded.theme.count > 0 else "mocha");
+            g_settings.font_path = str.copy(loaded.font_path);
+            settings_clamp(&g_settings);
+            return true;
+        }
+        case .Err {
+            printf("[odit] Warning: could not parse {}, using defaults\n", path);
+            return false;
+        }
+    }
+}
+
+settings_save :: (path: str = SETTINGS_FILE) -> bool {
+    settings_clamp(&g_settings);
+    body := core.tprintf("""{{
+    "editor_font_size": {},
+    "ui_scale": {},
+    "line_height_factor": {},
+    "font_path": "{}",
+    "theme": "{}",
+    "tab_size": {},
+    "modal_editing": {},
+    "show_line_numbers": {},
+    "highlight_current_line": {},
+    "auto_indent": {},
+    "split_ratio": {},
+    "target_fps": {}
+}}
+""",
+        g_settings.editor_font_size,
+        g_settings.ui_scale,
+        g_settings.line_height_factor,
+        g_settings.font_path,
+        g_settings.theme,
+        g_settings.tab_size,
+        "true" if g_settings.modal_editing else "false",
+        "true" if g_settings.show_line_numbers else "false",
+        "true" if g_settings.highlight_current_line else "false",
+        "true" if g_settings.auto_indent else "false",
+        g_settings.split_ratio,
+        g_settings.target_fps,
+    );
+    return os.File.write_contents(path, body);
+}
+
+settings_reset :: () {
+    g_settings = settings_defaults();
+    settings_save();
+}
+
+settings_cycle_theme :: () -> str {
+    next := "mocha";
+    if str.equal(g_settings.theme, "mocha")            do next = "tokyo_night";
+    elseif str.equal(g_settings.theme, "tokyo_night")  do next = "gruvbox";
+    elseif str.equal(g_settings.theme, "gruvbox")      do next = "light";
+    else                                               do next = "mocha";
+    g_settings.theme = str.copy(next);
+    return g_settings.theme;
+}

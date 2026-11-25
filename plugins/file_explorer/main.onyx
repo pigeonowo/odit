@@ -1,0 +1,276 @@
+// =============================================================================
+// Onyx Editor ("odit") — File Explorer WASM Plugin (Phase 3.1 Improved)
+// =============================================================================
+// Sandboxed `.wasm` mini-app communicating exclusively through `odit_host`:
+//   - Expandable directory tree covering ALL workspace folders (only skips `.git`)
+//   - Instant filename/path filter input + `Refresh` + `Collapse` controls
+//   - Single-click any folder row to expand/collapse; single-click any file row
+//     to immediately open & focus it in the Core Code Editor
+//   - Tracks `ActiveFileChanged` to highlight the open file
+//   - Clears guest `temp_allocator` every frame (`sdk.begin_frame()`) so nested
+//     folder expansion never exhausts scratch memory!
+
+#load "../../abi/abi.onyx"
+#load "../../sdk/plugin_sdk.onyx"
+
+use core { memory, Array }
+use odit.abi
+use odit.sdk
+
+TreeNode :: struct {
+    name:   str;
+    path:   str;
+    is_dir: bool;
+    depth:  i32;
+}
+
+g_nodes:         [..] TreeNode;
+g_expanded:      [..] str;
+g_active_path:   str = "";
+g_scroll_y:      f32 = 0.0;
+g_filter_buf:    [96] u8;
+g_filter_len:    u32 = 0;
+g_needs_refresh: bool = true;
+
+MANIFEST_JSON :: """{"id":"odit.file_explorer","title":"File Explorer","version":"0.2.0","default_slot":0,"default_width":320,"default_height":440,"event_mask":577,"allow_multiple":false}"""
+
+#export "odit_plugin_manifest" plugin_manifest
+plugin_manifest :: (out_ptr: u32, out_cap: u32) -> i32 {
+    return sdk.write_out_str(MANIFEST_JSON, out_ptr, out_cap);
+}
+
+#export "odit_plugin_init" plugin_init
+plugin_init :: (window_id: u32) -> i32 {
+    g_nodes    = make([..] TreeNode);
+    g_expanded = make([..] str);
+    g_expanded << str.copy("src");
+    g_expanded << str.copy("plugins");
+
+    sdk.register_command("file_explorer.refresh",  "File Explorer: Refresh Tree", "");
+    sdk.register_command("file_explorer.collapse", "File Explorer: Collapse All Folders", "");
+
+    g_active_path = str.copy(sdk.editor_active_path(context.temp_allocator));
+    g_needs_refresh = true;
+    return 0;
+}
+
+#export "odit_plugin_shutdown" plugin_shutdown
+plugin_shutdown :: (window_id: u32) -> void {}
+
+#export "odit_plugin_event" plugin_event
+plugin_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len: u32) -> void {
+    ev := cast(abi.EventType) event_type;
+    if ev == .ActiveFileChanged && payload_ptr != 0 && payload_len > 0 {
+        p := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
+        g_active_path = str.copy(p);
+    } elseif ev == .WorkspaceChanged {
+        g_needs_refresh = true;
+    } elseif ev == .CommandInvoked && payload_ptr != 0 && payload_len > 0 {
+        payload := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
+        if str_contains_ci(payload, "file_explorer.refresh") {
+            g_needs_refresh = true;
+            sdk.notify(.Info, "Refreshed File Explorer");
+        } elseif str_contains_ci(payload, "file_explorer.collapse") {
+            for &s in g_expanded do str.free(*s);
+            Array.clear(&g_expanded);
+            g_needs_refresh = true;
+        }
+    }
+}
+
+#local
+is_expanded :: (dir_path: str) -> bool {
+    for &p in g_expanded {
+        if str.equal(*p, dir_path) do return true;
+    }
+    return false;
+}
+
+#local
+toggle_expanded :: (dir_path: str) {
+    for i in 0 .. g_expanded.count {
+        if str.equal(g_expanded[i], dir_path) {
+            str.free(g_expanded[i]);
+            Array.remove_at(&g_expanded, i);
+            g_needs_refresh = true;
+            return;
+        }
+    }
+    g_expanded << str.copy(dir_path);
+    g_needs_refresh = true;
+}
+
+#local
+populate_dir :: (rel_dir: str, depth: i32) {
+    if depth > 8 || g_nodes.count >= 600 do return;
+
+    // Copy JSON to heap for recursion safety (nested calls won't clobber parent slices)
+    js := sdk.workspace_list_dir_json(rel_dir, context.allocator);
+    defer str.free(js);
+
+    pos := 0;
+    obj: str;
+    while sdk.json_next_object(js, &pos, &obj) {
+        name   := sdk.json_get_str(obj, "name", context.temp_allocator);
+        path   := sdk.json_get_str(obj, "path", context.temp_allocator);
+        is_dir := sdk.json_get_bool(obj, "is_dir");
+
+        if name.count == 0 do continue;
+
+        owned_path := str.copy(path);
+        g_nodes << .{
+            name   = str.copy(name),
+            path   = owned_path,
+            is_dir = is_dir,
+            depth  = depth,
+        };
+
+        if is_dir && is_expanded(owned_path) {
+            populate_dir(owned_path, depth + 1);
+        }
+    }
+}
+
+#local
+rebuild_tree :: () {
+    for &n in g_nodes {
+        str.free(n.name);
+        str.free(n.path);
+    }
+    Array.clear(&g_nodes);
+    populate_dir("", 0);
+    g_needs_refresh = false;
+}
+
+#local
+ext_color :: (name: str) -> u32 {
+    if str.ends_with(name, ".onyx") do return sdk.theme_color(.Accent);
+    if str.ends_with(name, ".c") || str.ends_with(name, ".h") do return sdk.theme_color(.Info);
+    if str.ends_with(name, ".md")   do return sdk.theme_color(.Info);
+    if str.ends_with(name, ".json") || str.ends_with(name, ".kdl") do return sdk.theme_color(.Warning);
+    if str.ends_with(name, ".nu") || str.ends_with(name, ".sh") do return sdk.theme_color(.Success);
+    return sdk.theme_color(.TextPrimary);
+}
+
+#export "odit_plugin_render" plugin_render
+plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
+    sdk.begin_frame();
+
+    ctx := cast(&abi.FrameContext) ctx_ptr;
+    if g_needs_refresh do rebuild_tree();
+
+    pad: f32 = 8.0f;
+    w := ctx.width - pad * 2.0f;
+    if w < 100.0f do w = 100.0f;
+
+    // Top bar: Filter input + Collapse + Refresh buttons
+    btn_w: f32 = 64.0f;
+    inp_w := w - btn_w * 2.0f - 10.0f;
+    if inp_w < 50.0f do inp_w = 50.0f;
+
+    sdk.input_text(1, pad, pad, inp_w, 26.0f, g_filter_buf, &g_filter_len, "Filter...");
+    if sdk.button(2, pad + inp_w + 5.0f, pad, btn_w, 26.0f, "Fold", .Ghost) & .Clicked {
+        for &s in g_expanded do str.free(*s);
+        Array.clear(&g_expanded);
+        rebuild_tree();
+    }
+    if sdk.button(3, pad + inp_w + btn_w + 10.0f, pad, btn_w, 26.0f, "Refresh", .Ghost) & .Clicked {
+        rebuild_tree();
+    }
+
+    filter := str.{ &g_filter_buf[0], cast(i32) g_filter_len };
+    list_y := pad + 34.0f;
+    list_h := ctx.height - list_y - pad;
+    if list_h < 40.0f do list_h = 40.0f;
+
+    vis_count := 0;
+    for &n in g_nodes {
+        if filter.count == 0 || str_contains_ci(n.path, filter) do vis_count += 1;
+    }
+
+    row_h: f32 = 26.0f;
+    content_h := cast(f32) vis_count * row_h + 10.0f;
+
+    sdk.scroll_begin(10, pad, list_y, w, list_h, content_h, &g_scroll_y);
+
+    bg_sel  := sdk.theme_color(.BgSelection);
+    bg_hov  := sdk.theme_color(.BgHover);
+    txt_dir := sdk.theme_color(.Warning);
+    txt_sec := sdk.theme_color(.TextSecondary);
+    accent  := sdk.theme_color(.Accent);
+
+    ry := list_y;
+    clicked_dir := "";
+    clicked_file := "";
+
+    mx := ctx.mouse_x;
+    my := ctx.mouse_y + g_scroll_y;
+    in_list := (ctx.flags & abi.FRAME_FLAG_HOVERED) != 0 &&
+               ctx.mouse_y >= list_y && ctx.mouse_y <= (list_y + list_h);
+    lclick := in_list && (ctx.mouse_pressed & cast(u32) abi.MouseButton.Left) != 0;
+
+    for &n in g_nodes {
+        if filter.count > 0 && !str_contains_ci(n.path, filter) do continue;
+
+        hov := in_list && mx >= pad && mx <= (pad + w - 6.0f) && my >= ry && my < (ry + row_h);
+        is_active := !n.is_dir && g_active_path.count > 0 && str.equal(n.path, g_active_path);
+
+        if is_active {
+            sdk.draw_rect(pad, ry, w - 6.0f, row_h - 1.0f, bg_sel, 3.0f);
+            sdk.draw_rect(pad, ry + 2.0f, 3.0f, row_h - 5.0f, accent, 1.0f);
+        } elseif hov {
+            sdk.draw_rect(pad, ry, w - 6.0f, row_h - 1.0f, bg_hov, 3.0f);
+        }
+
+        indent := pad + 8.0f + cast(f32) n.depth * 14.0f;
+        if n.is_dir {
+            exp := is_expanded(n.path);
+            sdk.draw_text(indent, ry + 5.0f, "v" if exp else ">", 12.0f, txt_sec);
+            sdk.draw_text(indent + 15.0f, ry + 5.0f, n.name, 13.0f, txt_dir, .Bold);
+            if hov && lclick do clicked_dir = str.temp_copy(n.path);
+        } else {
+            dot_col := ext_color(n.name);
+            sdk.draw_circle(indent + 4.0f, ry + row_h * 0.5f, 3.2f, dot_col);
+            sdk.draw_text(indent + 15.0f, ry + 5.0f, n.name, 13.0f, dot_col if is_active else sdk.theme_color(.TextPrimary));
+            if hov && lclick do clicked_file = str.temp_copy(n.path);
+        }
+
+        ry += row_h;
+    }
+
+    sdk.scroll_end();
+
+    if clicked_dir.count > 0 {
+        toggle_expanded(clicked_dir);
+        rebuild_tree();
+    } elseif clicked_file.count > 0 {
+        if sdk.editor_open(clicked_file, 1, 1) == 0 {
+            g_active_path = str.copy(clicked_file);
+        } else {
+            sdk.notify(.Error, "Could not open file");
+        }
+    }
+}
+
+#local
+to_low :: (c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' do return c + 32;
+    return c;
+}
+
+#local
+str_contains_ci :: (haystack: str, needle: str) -> bool {
+    if needle.count == 0 do return true;
+    if haystack.count < needle.count do return false;
+    for i in 0 .. (haystack.count - needle.count + 1) {
+        ok := true;
+        for j in 0 .. needle.count {
+            if to_low(haystack[i + j]) != to_low(needle[j]) {
+                ok = false;
+                break;
+            }
+        }
+        if ok do return true;
+    }
+    return false;
+}

@@ -1,0 +1,77 @@
+package odit.services
+
+// =============================================================================
+// Onyx Editor ("odit") — Workspace File Indexer & Toolchain Helpers
+// =============================================================================
+
+use core { package, os, Array }
+
+#local
+should_skip_dir :: (name: str) -> bool {
+    return str.equal(name, ".") ||
+           str.equal(name, "..") ||
+           str.equal(name, ".git") ||
+           str.equal(name, "build") ||
+           str.equal(name, "bin") ||
+           str.equal(name, "lib") ||
+           str.equal(name, "node_modules");
+}
+
+#local
+collect_recursive :: (base_root: str, rel_dir: str, ext_filter: str, out: &[..] str, depth: i32, allocator: Allocator) {
+    if depth > 10 || out.count >= 1024 do return;
+
+    full_dir := base_root if rel_dir.count == 0 else core.tprintf("{}/{}", base_root, rel_dir);
+    for entry in os.Directory.list(full_dir) {
+        name := entry->name();
+        if should_skip_dir(name) do continue;
+
+        rel_path := str.copy(name, context.temp_allocator) if rel_dir.count == 0 else core.tprintf("{}/{}", rel_dir, name);
+        if entry.type == .Directory {
+            collect_recursive(base_root, rel_path, ext_filter, out, depth + 1, allocator);
+        } else {
+            if ext_filter.count == 0 || str.ends_with(name, ext_filter) {
+                *out << str.copy(rel_path, allocator);
+            }
+        }
+    }
+}
+
+/// Recursively collects workspace-relative file paths (sorted alphabetically),
+/// optionally filtered by suffix (e.g. `".onyx"`).
+workspace_find_files :: (root: str, ext_filter: str = "", allocator := context.temp_allocator) -> [..] str {
+    out := make([..] str, 64, allocator);
+    collect_recursive(root, "", ext_filter, &out, 0, allocator);
+
+    // Simple in-place insertion sort for deterministic ordering
+    for i in 1 .. out.count {
+        key := out[i];
+        j := i - 1;
+        while j >= 0 && str_less(key, out[j]) {
+            out[j + 1] = out[j];
+            j -= 1;
+        }
+        out[j + 1] = key;
+    }
+    return out;
+}
+
+str_less :: (a, b: str) -> bool {
+    n := a.count if a.count < b.count else b.count;
+    for i in 0 .. n {
+        if a[i] != b[i] do return a[i] < b[i];
+    }
+    return a.count < b.count;
+}
+
+resolve_onyx_executable :: () -> str {
+    if onyx_path := os.env("ONYX_PATH"); onyx_path {
+        cand := core.tprintf("{}/bin/onyx", onyx_path->unwrap());
+        if os.file_exists(cand) do return str.copy(cand, context.temp_allocator);
+    }
+    if home := os.env("HOME"); home {
+        cand := core.tprintf("{}/.onyx/bin/onyx", home->unwrap());
+        if os.file_exists(cand) do return str.copy(cand, context.temp_allocator);
+    }
+    return "onyx";
+}

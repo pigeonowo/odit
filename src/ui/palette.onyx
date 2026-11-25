@@ -1,0 +1,236 @@
+package odit.ui
+
+// =============================================================================
+// Onyx Editor ("odit") — Command-First `Ctrl+P` Command Palette
+// =============================================================================
+
+use core { Array }
+use raylib
+use odit.theme
+use odit.settings
+
+CommandEntry :: struct {
+    id:        str;
+    label:     str;
+    shortcut:  str;
+    window_id: u32; // 0 = built-in host command, >0 = WASM plugin window_id
+}
+
+CommandPalette :: struct {
+    open:        bool;
+    query_buf:   [128] u8;
+    query_len:   i32;
+    selected:    i32;
+    commands:    [..] CommandEntry;
+    filtered:    [..] i32; // indices into `commands`
+}
+
+palette_init :: (p: &CommandPalette) {
+    p.open      = false;
+    p.query_len = 0;
+    p.selected  = 0;
+    p.commands  = make([..] CommandEntry);
+    p.filtered  = make([..] i32);
+}
+
+palette_register :: (p: &CommandPalette, id, label, shortcut: str, window_id: u32 = 0) -> u32 {
+    // Update in place if same id + window_id already exists
+    for i in 0 .. p.commands.count {
+        if p.commands[i].window_id == window_id && str.equal(p.commands[i].id, id) {
+            p.commands[i].label = str.copy(label);
+            p.commands[i].shortcut = str.copy(shortcut);
+            return cast(u32) (i + 1);
+        }
+    }
+    p.commands << .{
+        id        = str.copy(id),
+        label     = str.copy(label),
+        shortcut  = str.copy(shortcut),
+        window_id = window_id,
+    };
+    return cast(u32) p.commands.count;
+}
+
+palette_unregister_window :: (p: &CommandPalette, window_id: u32) {
+    i := 0;
+    while i < p.commands.count {
+        if p.commands[i].window_id == window_id {
+            Array.remove_at(&p.commands, i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+palette_open :: (p: &CommandPalette) {
+    p.open      = true;
+    p.query_len = 0;
+    p.selected  = 0;
+    // Drain stray keypress chars (e.g. 'p' from Ctrl+P)
+    while raylib.GetCharPressed() > 0 {}
+    palette_refilter(p);
+}
+
+palette_close :: (p: &CommandPalette) {
+    p.open = false;
+}
+
+#local
+to_lower :: (c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' do return c + 32;
+    return c;
+}
+
+#local
+fuzzy_match :: (text: str, query: str) -> bool {
+    if query.count == 0 do return true;
+    qi := 0;
+    for i in 0 .. text.count {
+        if to_lower(text[i]) == to_lower(query[qi]) {
+            qi += 1;
+            if qi == query.count do return true;
+        }
+    }
+    return false;
+}
+
+palette_refilter :: (p: &CommandPalette) {
+    Array.clear(&p.filtered);
+    q := str.{ &p.query_buf[0], p.query_len };
+    for i in 0 .. p.commands.count {
+        if fuzzy_match(p.commands[i].label, q) || fuzzy_match(p.commands[i].id, q) {
+            p.filtered << i;
+        }
+    }
+    if p.selected >= p.filtered.count do p.selected = p.filtered.count - 1;
+    if p.selected < 0 do p.selected = 0;
+}
+
+/// Updates and draws the palette overlay when open.
+/// Returns the chosen `&CommandEntry` if executed on this frame, else `null`.
+palette_update_and_draw :: (p: &CommandPalette, screen_w, screen_h: f32) -> &CommandEntry {
+    if !p.open do return null;
+
+    if raylib.IsKeyPressed(.ESCAPE) {
+        palette_close(p);
+        return null;
+    }
+
+    // Query typing
+    changed := false;
+    while true {
+        ch := raylib.GetCharPressed();
+        if ch <= 0 do break;
+        if ch >= 32 && ch < 127 && p.query_len < 127 {
+            p.query_buf[p.query_len] = cast(u8) ch;
+            p.query_len += 1;
+            changed = true;
+        }
+    }
+    if (raylib.IsKeyPressed(.BACKSPACE) || raylib.IsKeyPressedRepeat(.BACKSPACE)) && p.query_len > 0 {
+        p.query_len -= 1;
+        changed = true;
+    }
+    if changed {
+        p.selected = 0;
+        palette_refilter(p);
+    }
+
+    if raylib.IsKeyPressed(.DOWN) || raylib.IsKeyPressedRepeat(.DOWN) {
+        if p.filtered.count > 0 do p.selected = (p.selected + 1) % p.filtered.count;
+    }
+    if raylib.IsKeyPressed(.UP) || raylib.IsKeyPressedRepeat(.UP) {
+        if p.filtered.count > 0 do p.selected = (p.selected - 1 + p.filtered.count) % p.filtered.count;
+    }
+
+    var_exec: &CommandEntry = null;
+    if (raylib.IsKeyPressed(.ENTER) || raylib.IsKeyPressed(.KP_ENTER)) && p.filtered.count > 0 {
+        idx := p.filtered[p.selected];
+        var_exec = &p.commands[idx];
+        palette_close(p);
+        return var_exec;
+    }
+
+    // Dimmed backdrop
+    raylib.DrawRectangle(0, 0, cast(i32) screen_w, cast(i32) screen_h, .{ 0, 0, 0, 120 });
+
+    s := settings.g_settings.ui_scale;
+    pw: f32 = 580.0f * s;
+    if pw > screen_w - 40.0f do pw = screen_w - 40.0f;
+    max_rows := 10;
+    vis_rows := p.filtered.count if p.filtered.count < max_rows else max_rows;
+    row_h: f32 = 30.0f * s;
+    input_h: f32 = 34.0f * s;
+    ph: f32 = input_h + 22.0f + cast(f32) vis_rows * row_h + 10.0f;
+    px := (screen_w - pw) * 0.5f;
+    py: f32 = 64.0f;
+
+    mpos := raylib.GetMousePosition();
+    if raylib.IsMouseButtonPressed(.LEFT) {
+        if mpos.x < px || mpos.x > (px + pw) || mpos.y < py || mpos.y > (py + ph) {
+            palette_close(p);
+            return null;
+        }
+    }
+
+    theme.draw_rect(px, py, pw, ph, theme.get_color(.BgPanel), 8.0f, theme.get_color(.BorderFocused), 1.5f);
+
+    // Search input box
+    fs_in := 15.0f * s;
+    fs_row := 14.0f * s;
+    fs_sc := 12.0f * s;
+    theme.draw_rect(px + 10.0f, py + 10.0f, pw - 20.0f, input_h, theme.get_color(.BgBase), 5.0f, theme.get_color(.Border), 1.0f);
+    theme.draw_text(px + 20.0f, py + 10.0f + (input_h - fs_in) * 0.5f, ">", fs_in, theme.get_color(.Accent));
+
+    q := str.{ &p.query_buf[0], p.query_len };
+    if q.count > 0 {
+        theme.draw_text(px + 36.0f * s, py + 10.0f + (input_h - fs_in) * 0.5f, q, fs_in, theme.get_color(.TextPrimary));
+    } else {
+        theme.draw_text(px + 36.0f * s, py + 10.0f + (input_h - fs_row) * 0.5f, "Type a command or plugin name...", fs_row, theme.get_color(.TextDisabled));
+    }
+
+    // Results list
+    list_y := py + input_h + 18.0f;
+    if vis_rows == 0 {
+        theme.draw_text(px + 20.0f, list_y + 4.0f, "No matching commands", fs_row, theme.get_color(.TextDisabled));
+    } else {
+        for r in 0 .. vis_rows {
+            cmd_idx := p.filtered[r];
+            cmd := &p.commands[cmd_idx];
+            ry := list_y + cast(f32) r * row_h;
+
+            hov := mpos.x >= (px + 8.0f) && mpos.x <= (px + pw - 8.0f) && mpos.y >= ry && mpos.y < (ry + row_h);
+            if hov do p.selected = r;
+
+            is_sel := r == p.selected;
+            if is_sel {
+                theme.draw_rect(px + 8.0f, ry, pw - 16.0f, row_h - 2.0f, theme.get_color(.BgSelection), 4.0f);
+            }
+
+            // Badge for plugin commands
+            lx := px + 18.0f;
+            if cmd.window_id > 0 {
+                bw := 44.0f * s;
+                bh := 16.0f * s;
+                theme.draw_rect(lx, ry + (row_h - bh) * 0.5f, bw, bh, theme.get_color(.Accent), 4.0f);
+                theme.draw_text(lx + 5.0f * s, ry + (row_h - 11.0f * s) * 0.5f, "WASM", 11.0f * s, 0x11111BFF);
+                lx += bw + 8.0f;
+            }
+
+            theme.draw_text(lx, ry + (row_h - fs_row) * 0.5f, cmd.label, fs_row, theme.get_color(.TextPrimary));
+
+            if cmd.shortcut.count > 0 {
+                sw := theme.measure_text(cmd.shortcut, fs_sc);
+                theme.draw_text(px + pw - sw - 18.0f, ry + (row_h - fs_sc) * 0.5f, cmd.shortcut, fs_sc, theme.get_color(.TextSecondary));
+            }
+
+            if hov && raylib.IsMouseButtonPressed(.LEFT) {
+                var_exec = cmd;
+                palette_close(p);
+                return var_exec;
+            }
+        }
+    }
+
+    return null;
+}

@@ -1,0 +1,240 @@
+package odit.services
+
+// =============================================================================
+// Onyx Editor ("odit") — Live Compiler + `wasm2wat` Disassembly Service
+// =============================================================================
+// Compiles the active Onyx target with `--generate-name-section` and runs
+// `wasm2wat` to extract exact `(func ...)` WebAssembly Text Format (WAT)
+// instructions for any selected Onyx function. Caches the disassembled module
+// in memory keyed by `(entry, cache_version)` so switching functions is instant.
+
+use core { package, os, io, Array }
+
+WatCache :: struct {
+    valid:       bool;
+    entry:       str;
+    version:     u32;
+    wat_full:    str;
+    last_error:  str;
+}
+
+g_wat_cache: WatCache;
+
+#local
+resolve_wasm2wat :: () -> str {
+    if home := os.env("HOME"); home {
+        c1 := core.tprintf("{}/Downloads/wabt-1.0.42/bin/wasm2wat", home->unwrap());
+        if os.file_exists(c1) do return str.copy(c1, context.temp_allocator);
+    }
+    for cand in str.[ "/usr/bin/wasm2wat", "/usr/local/bin/wasm2wat", "/home/linuxbrew/.linuxbrew/bin/wasm2wat" ] {
+        if os.file_exists(cand) do return cand;
+    }
+    return "wasm2wat";
+}
+
+#package
+json_esc_wat :: (s: str, allocator := context.temp_allocator) -> str {
+    out := make(dyn_str, s.count + 32, allocator);
+    for i in 0 .. s.count {
+        ch := s[i];
+        switch ch {
+            case '"'  do Array.concat(&out, "\\\"");
+            case '\\' do Array.concat(&out, "\\\\");
+            case '\n' do Array.concat(&out, "\\n");
+            case '\r' {}
+            case '\t' do Array.concat(&out, "  ");
+            case _ {
+                if ch >= 32 do out << ch;
+            }
+        }
+    }
+    return out;
+}
+
+#local
+run_cmd_capture :: (exe: str, args: [] str) -> (bool, str) {
+    cmd := os.command()->path(exe)->args(args);
+    switch cmd->output() {
+        case .Ok as out  do return true, out;
+        case .Err as err do return false, err.output;
+    }
+}
+
+/// Ensures `g_wat_cache.wat_full` is compiled & disassembled for `entry`.
+wat_ensure_compiled :: (file_path: str, buf_version: u32) -> bool {
+    // Choose compilation entry: project files under `src/` compile via `src/main.onyx`
+    entry := file_path;
+    if entry.count == 0 || str.starts_with(entry, "src/") || str.starts_with(entry, "abi/") {
+        if os.file_exists("src/main.onyx") do entry = "src/main.onyx";
+    }
+
+    if g_wat_cache.valid && str.equal(g_wat_cache.entry, entry) && g_wat_cache.version == buf_version {
+        return true;
+    }
+
+    os.Directory.create("build");
+    wasm_out := "build/.odit_inspect.wasm";
+    wat_out  := "build/.odit_inspect.wat";
+
+    onyx_exe := resolve_onyx_executable();
+    is_plugin := str.starts_with(entry, "plugins/");
+
+    ok := false;
+    err_txt := "";
+    if is_plugin {
+        ok, err_txt = run_cmd_capture(onyx_exe, .[
+            "build", "-r", "custom", "-DComponent_Build", "--wasm-mvp",
+            "--generate-name-section", "--no-colors", "-o", wasm_out, entry
+        ]);
+    } else {
+        ok, err_txt = run_cmd_capture(onyx_exe, .[
+            "build", "--generate-name-section", "--no-colors", "-o", wasm_out, entry
+        ]);
+    }
+
+    if !ok || !os.file_exists(wasm_out) {
+        g_wat_cache.valid = false;
+        g_wat_cache.last_error = str.copy(err_txt if err_txt.count > 0 else "onyx build failed");
+        return false;
+    }
+
+    w2w := resolve_wasm2wat();
+    ok2, err2 := run_cmd_capture(w2w, .["--enable-all", "--no-check", wasm_out, "-o", wat_out]);
+    if !ok2 || !os.file_exists(wat_out) {
+        g_wat_cache.valid = false;
+        g_wat_cache.last_error = str.copy(err2 if err2.count > 0 else "wasm2wat failed");
+        return false;
+    }
+
+    wat_contents := os.get_contents(wat_out);
+    if wat_contents.count == 0 {
+        g_wat_cache.valid = false;
+        g_wat_cache.last_error = str.copy("Empty .wat output");
+        return false;
+    }
+
+    if g_wat_cache.wat_full.count > 0 do str.free(g_wat_cache.wat_full);
+    g_wat_cache.wat_full   = wat_contents;
+    g_wat_cache.entry      = str.copy(entry);
+    g_wat_cache.version    = buf_version;
+    g_wat_cache.valid      = true;
+    g_wat_cache.last_error = "";
+    return true;
+}
+
+#local
+name_matches_wat_header :: (header_line: str, func_name: str) -> i32 {
+    // Look for `(func $...` in `header_line`
+    if func_name.count == 0 do return 1;
+    // Check exact `$func_name ` or `.func_name ` or `::func_name ` or substring
+    if header_line.count < func_name.count do return 0;
+    best := 0;
+    for i in 0 .. (header_line.count - func_name.count + 1) {
+        ok := true;
+        for j in 0 .. func_name.count {
+            if header_line[i + j] != func_name[j] { ok = false; break; }
+        }
+        if ok {
+            before_ok := i > 0 && (header_line[i - 1] == '$' || header_line[i - 1] == '.' || header_line[i - 1] == ':');
+            after_pos := i + func_name.count;
+            after_ok  := after_pos >= header_line.count || header_line[after_pos] == ' ' || header_line[after_pos] == '(' || header_line[after_pos] == ')';
+            if before_ok && after_ok do return 3;
+            if after_ok do best = 2;
+            elseif best < 1 do best = 1;
+        }
+    }
+    return best;
+}
+
+#local
+extract_wat_function :: (wat: str, func_name: str) -> (str, i32) {
+    n := wat.count;
+    i := 0;
+    func_idx: i32 = 0;
+
+    best_score := 0;
+    best_start := -1;
+    best_end   := -1;
+    best_idx: i32 = -1;
+
+    while i < n {
+        // Find next line starting with `  (func `
+        line_start := i;
+        while i < n && wat[i] != '\n' do i += 1;
+        line_end := i;
+        if i < n do i += 1;
+
+        line := wat[line_start .. line_end];
+        if str.starts_with(line, "  (func ") {
+            sc := name_matches_wat_header(line, func_name);
+            if sc > best_score {
+                // Capture balanced parens for this `(func ...)` block
+                p := line_start;
+                depth := 0;
+                in_str := false;
+                while p < n {
+                    c := wat[p];
+                    if in_str {
+                        if c == '\\' && p + 1 < n { p += 2; continue; }
+                        if c == '"' do in_str = false;
+                    } else {
+                        if c == '"' do in_str = true;
+                        elseif c == '(' do depth += 1;
+                        elseif c == ')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                p += 1;
+                                break;
+                            }
+                        }
+                    }
+                    p += 1;
+                }
+                best_score = sc;
+                best_start = line_start;
+                best_end   = p;
+                best_idx   = func_idx;
+                if sc == 3 do break; // Exact match found!
+            }
+            func_idx += 1;
+        }
+    }
+
+    if best_start >= 0 && best_end > best_start {
+        // Cap individual WAT preview at 32KB so giant functions stay snappy
+        end_c := best_end;
+        if end_c - best_start > 32768 do end_c = best_start + 32768;
+        return wat[best_start .. end_c], best_idx;
+    }
+    return "", -1;
+}
+
+/// Compiles (with caching) and returns `FunctionWatInfo` JSON for `(file_path, func_name)`.
+wat_get_function_json :: (file_path: str, func_name: str, buf_version: u32, allocator := context.temp_allocator) -> str {
+    if !wat_ensure_compiled(file_path, buf_version) {
+        err_msg := core.tprintf(";; Compilation/WAT error:\n;; {}", g_wat_cache.last_error);
+        return core.tprintf(
+            "{{\"func_name\":\"{}\",\"wasm_func_idx\":-1,\"source_path\":\"{}\",\"start_line\":0,\"end_line\":0,\"wat_text\":\"{}\",\"line_map\":[]}}",
+            json_esc_wat(func_name), json_esc_wat(file_path), json_esc_wat(err_msg)
+        );
+    }
+
+    wat_slice, fidx := extract_wat_function(g_wat_cache.wat_full, func_name);
+    if wat_slice.count == 0 {
+        not_found := core.tprintf(";; Function '{}' not found in compiled WASM (may be inlined, generic, or unused).", func_name);
+        return core.tprintf(
+            "{{\"func_name\":\"{}\",\"wasm_func_idx\":-1,\"source_path\":\"{}\",\"start_line\":0,\"end_line\":0,\"wat_text\":\"{}\",\"line_map\":[]}}",
+            json_esc_wat(func_name), json_esc_wat(file_path), json_esc_wat(not_found)
+        );
+    }
+
+    out := make(dyn_str, wat_slice.count + 256, allocator);
+    Array.concat(&out, "{\"func_name\":\"");
+    Array.concat(&out, json_esc_wat(func_name));
+    Array.concat(&out, core.tprintf("\",\"wasm_func_idx\":{},\"source_path\":\"", fidx));
+    Array.concat(&out, json_esc_wat(file_path));
+    Array.concat(&out, "\",\"start_line\":0,\"end_line\":0,\"wat_text\":\"");
+    Array.concat(&out, json_esc_wat(wat_slice));
+    Array.concat(&out, "\",\"line_map\":[]}");
+    return out;
+}

@@ -1,0 +1,208 @@
+package odit.editor
+
+// =============================================================================
+// Onyx Editor ("odit") — Lightweight Per-Line Onyx Syntax Highlighting Lexer
+// =============================================================================
+
+use odit.theme
+
+TokenKind :: enum {
+    Default;
+    Keyword;
+    Directive;
+    Type;
+    String;
+    Number;
+    Comment;
+    Operator;
+    Func;
+    Tag;
+}
+
+TokenSpan :: struct {
+    start: i32;
+    end:   i32;
+    kind:  TokenKind;
+}
+
+token_color :: (kind: TokenKind) -> u32 {
+    return switch kind {
+        case .Keyword   => theme.g_theme.syn_keyword;
+        case .Directive => theme.g_theme.syn_directive;
+        case .Type      => theme.g_theme.syn_type;
+        case .String    => theme.g_theme.syn_string;
+        case .Number    => theme.g_theme.syn_number;
+        case .Comment   => theme.g_theme.syn_comment;
+        case .Operator  => theme.g_theme.syn_operator;
+        case .Func      => theme.g_theme.syn_func;
+        case .Tag       => theme.g_theme.syn_tag;
+        case _          => theme.g_theme.syn_default;
+    };
+}
+
+#local
+is_alpha :: (c: u8) -> bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+#local
+is_digit :: (c: u8) -> bool {
+    return c >= '0' && c <= '9';
+}
+
+#local
+is_alnum :: (c: u8) -> bool {
+    return is_alpha(c) || is_digit(c);
+}
+
+#local
+is_keyword :: (word: str) -> bool {
+    keywords := .[
+        "package", "use", "struct", "enum", "union", "interface", "where",
+        "if", "elseif", "else", "for", "while", "switch", "case", "fallthrough",
+        "return", "defer", "break", "continue", "do", "macro", "cast",
+        "sizeof", "alignof", "typeof", "as", "in", "true", "false", "null",
+    ];
+    for kw in keywords {
+        if str.equal(word, kw) do return true;
+    }
+    return false;
+}
+
+#local
+is_builtin_type :: (word: str) -> bool {
+    types := .[
+        "void", "bool", "u8", "u16", "u32", "u64",
+        "i8", "i16", "i32", "i64", "f32", "f64",
+        "str", "cstr", "dyn_str", "rawptr", "type_expr", "any",
+    ];
+    for t in types {
+        if str.equal(word, t) do return true;
+    }
+    return false;
+}
+
+/// Tokenizes one line of Onyx source into `out` spans (returns span count).
+lex_onyx_line :: (line: str, out: [] TokenSpan) -> i32 {
+    n := line.count;
+    i := 0;
+    count := 0;
+
+    while i < n && count < out.count {
+        c := line[i];
+
+        // Whitespace
+        if c == ' ' || c == '\t' {
+            start := i;
+            while i < n && (line[i] == ' ' || line[i] == '\t') do i += 1;
+            out[count] = .{ start, i, .Default };
+            count += 1;
+            continue;
+        }
+
+        // Line comment //
+        if c == '/' && i + 1 < n && line[i + 1] == '/' {
+            out[count] = .{ i, n, .Comment };
+            count += 1;
+            break;
+        }
+
+        // String or char literal
+        if c == '"' || c == '\'' {
+            quote := c;
+            start := i;
+            i += 1;
+            while i < n {
+                if line[i] == '\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                if line[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out[count] = .{ start, i, .String };
+            count += 1;
+            continue;
+        }
+
+        // Compiler directive `#load`, `#export`, `#foreign`, `#if`, ...
+        if c == '#' {
+            start := i;
+            i += 1;
+            while i < n && is_alnum(line[i]) do i += 1;
+            out[count] = .{ start, i, .Directive };
+            count += 1;
+            continue;
+        }
+
+        // Tag annotation `@...`
+        if c == '@' {
+            start := i;
+            i += 1;
+            while i < n && (is_alnum(line[i]) || line[i] == '.') do i += 1;
+            out[count] = .{ start, i, .Tag };
+            count += 1;
+            continue;
+        }
+
+        // Numeric literal
+        if is_digit(c) {
+            start := i;
+            i += 1;
+            while i < n && (is_alnum(line[i]) || line[i] == '.' || line[i] == '_') do i += 1;
+            out[count] = .{ start, i, .Number };
+            count += 1;
+            continue;
+        }
+
+        // Identifier / keyword / type / function
+        if is_alpha(c) {
+            start := i;
+            i += 1;
+            while i < n && is_alnum(line[i]) do i += 1;
+            word := line[start .. i];
+            kind := TokenKind.Default;
+            if is_keyword(word) {
+                kind = .Keyword;
+            } elseif is_builtin_type(word) {
+                kind = .Type;
+            } elseif i < n && line[i] == '(' {
+                kind = .Func;
+            } elseif word[0] >= 'A' && word[0] <= 'Z' {
+                kind = .Type;
+            } else {
+                // Check for `name :: (` function definition
+                look := i;
+                while look < n && line[look] == ' ' do look += 1;
+                if look + 1 < n && line[look] == ':' && line[look + 1] == ':' {
+                    look += 2;
+                    while look < n && line[look] == ' ' do look += 1;
+                    if look < n && line[look] == '(' do kind = .Func;
+                }
+            }
+            out[count] = .{ start, i, kind };
+            count += 1;
+            continue;
+        }
+
+        // Operators / punctuation
+        start := i;
+        if c == ':' || c == '=' || c == '-' || c == '>' || c == '<' ||
+           c == '|' || c == '&' || c == '+' || c == '*' || c == '/' || c == '!' {
+            i += 1;
+            if i < n && (line[i] == ':' || line[i] == '=' || line[i] == '>' || line[i] == '<' || line[i] == '|') {
+                i += 1;
+            }
+            out[count] = .{ start, i, .Operator };
+        } else {
+            i += 1;
+            out[count] = .{ start, i, .Default };
+        }
+        count += 1;
+    }
+
+    return count;
+}

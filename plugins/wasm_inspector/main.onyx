@@ -1,0 +1,270 @@
+// =============================================================================
+// Onyx Editor ("odit") — WASM Inspector (`.wat`) WASM Plugin (Phase 3.2)
+// =============================================================================
+// Select any function from the active Onyx file (sourced live from Onyx LSP
+// `ast_get_symbols`, or typed manually) and view its real compiled WebAssembly
+// Text Format (`.wat`) instructions (`local.get`, `i32.add`, `call`, etc.)
+// with syntax coloring.
+
+#load "../../abi/abi.onyx"
+#load "../../sdk/plugin_sdk.onyx"
+
+use core { memory, Array }
+use odit.abi
+use odit.sdk
+
+FuncItem :: struct {
+    name: str;
+    line: i32;
+}
+
+g_funcs:        [..] FuncItem;
+g_selected_idx: i32 = -1;
+g_active_file:  str = "";
+g_func_buf:     [96] u8;
+g_func_len:     u32 = 0;
+
+g_wat_lines:    [..] str;
+g_wat_func_idx: i32 = -1;
+g_wat_scroll:   f32 = 0.0f;
+g_list_scroll:  f32 = 0.0f;
+g_needs_syms:   bool = true;
+
+MANIFEST_JSON :: """{"id":"odit.wasm_inspector","title":"WASM Inspector (.wat)","version":"0.1.0","default_slot":0,"default_width":440,"default_height":380,"event_mask":95,"allow_multiple":false}"""
+
+#export "odit_plugin_manifest" plugin_manifest
+plugin_manifest :: (out_ptr: u32, out_cap: u32) -> i32 {
+    return sdk.write_out_str(MANIFEST_JSON, out_ptr, out_cap);
+}
+
+#export "odit_plugin_init" plugin_init
+plugin_init :: (window_id: u32) -> i32 {
+    g_funcs     = make([..] FuncItem);
+    g_wat_lines = make([..] str);
+
+    g_active_file = str.copy(sdk.editor_active_path(context.temp_allocator));
+    def_fn := "main";
+    memory.copy(&g_func_buf[0], def_fn.data, def_fn.count);
+    g_func_len = cast(u32) def_fn.count;
+
+    sdk.register_command("wasm_inspector.inspect", "WASM Inspector: Disassemble Selected Function", "");
+    sdk.register_command("wasm_inspector.refresh", "WASM Inspector: Refresh Function List", "");
+
+    set_wat_text(";; Select a function above and click 'Inspect WAT' to disassemble.");
+    g_needs_syms = true;
+    return 0;
+}
+
+#export "odit_plugin_shutdown" plugin_shutdown
+plugin_shutdown :: (window_id: u32) -> void {}
+
+#export "odit_plugin_event" plugin_event
+plugin_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len: u32) -> void {
+    ev := cast(abi.EventType) event_type;
+    if ev == .ActiveFileChanged && payload_ptr != 0 && payload_len > 0 {
+        p := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
+        g_active_file = str.copy(p);
+        g_needs_syms = true;
+    } elseif ev == .SymbolsUpdated {
+        g_needs_syms = true;
+    } elseif ev == .CommandInvoked && payload_ptr != 0 && payload_len > 0 {
+        payload := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
+        if str_has(payload, "wasm_inspector.inspect") {
+            inspect_current_func();
+        } elseif str_has(payload, "wasm_inspector.refresh") {
+            g_needs_syms = true;
+        }
+    }
+}
+
+#local
+refresh_functions :: () {
+    for &f in g_funcs do str.free(f.name);
+    Array.clear(&g_funcs);
+
+    js := sdk.ast_symbols_json(g_active_file, context.temp_allocator);
+    pos := 0;
+    obj: str;
+    while sdk.json_next_object(js, &pos, &obj) {
+        kind := sdk.json_get_i32(obj, "kind");
+        if kind == cast(i32) abi.SymbolKind.Procedure {
+            name := sdk.json_get_str(obj, "name", context.temp_allocator);
+            line := sdk.json_get_i32(obj, "line");
+            if name.count > 0 {
+                g_funcs << .{ str.copy(name), line };
+            }
+        }
+    }
+    g_needs_syms = false;
+}
+
+#local
+set_wat_text :: (wat: str) {
+    for &l in g_wat_lines do str.free(*l);
+    Array.clear(&g_wat_lines);
+    g_wat_scroll = 0.0f;
+
+    start := 0;
+    for i in 0 .. (wat.count + 1) {
+        if i == wat.count || wat[i] == '\n' {
+            g_wat_lines << str.copy(wat[start .. i]);
+            start = i + 1;
+        }
+    }
+}
+
+#local
+inspect_current_func :: () {
+    fname := str.{ &g_func_buf[0], cast(i32) g_func_len };
+    if fname.count == 0 do fname = "main";
+    ap := sdk.editor_active_path(context.temp_allocator);
+    if ap.count > 0 do g_active_file = str.copy(ap);
+
+    js := sdk.compiler_function_wat_json(g_active_file, fname, context.allocator);
+    defer str.free(js);
+
+    if js.count == 0 {
+        set_wat_text(";; Host returned empty WAT response.");
+        g_wat_func_idx = -1;
+        return;
+    }
+
+    g_wat_func_idx = sdk.json_get_i32(js, "wasm_func_idx");
+    wat_txt := sdk.json_get_str(js, "wat_text", context.temp_allocator);
+    if wat_txt.count == 0 {
+        set_wat_text(";; Could not decode wat_text.");
+    } else {
+        set_wat_text(wat_txt);
+    }
+}
+
+#local
+wat_line_color :: (line: str) -> u32 {
+    i := 0;
+    while i < line.count && line[i] == ' ' do i += 1;
+    t := line[i .. line.count];
+
+    if str.starts_with(t, ";;")                                        do return sdk.theme_color(.TextDisabled);
+    if str.starts_with(t, "(func") || str.starts_with(t, "(param") ||
+       str.starts_with(t, "(result") || str.starts_with(t, "(local")   do return sdk.theme_color(.Accent);
+    if str.starts_with(t, "local.") || str.starts_with(t, "global.")   do return sdk.theme_color(.Info);
+    if str.starts_with(t, "call") || str.starts_with(t, "return") ||
+       str.starts_with(t, "if") || str.starts_with(t, "else") ||
+       str.starts_with(t, "end") || str.starts_with(t, "loop") ||
+       str.starts_with(t, "block") || str.starts_with(t, "br")         do return sdk.theme_color(.Warning);
+    if str.starts_with(t, "i32.") || str.starts_with(t, "i64.") ||
+       str.starts_with(t, "f32.") || str.starts_with(t, "f64.") ||
+       str.starts_with(t, "memory.")                                   do return sdk.theme_color(.Success);
+    return sdk.theme_color(.TextPrimary);
+}
+
+#export "odit_plugin_render" plugin_render
+plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
+    sdk.begin_frame();
+
+    ctx := cast(&abi.FrameContext) ctx_ptr;
+    if g_needs_syms do refresh_functions();
+
+    pad: f32 = 10.0f;
+    w := ctx.width - pad * 2.0f;
+    if w < 140.0f do w = 140.0f;
+    y := pad;
+
+    // Row 1: Function name input + Inspect button + Refresh symbols button
+    insp_w: f32 = 96.0f;
+    ref_w:  f32 = 64.0f;
+    inp_w := w - insp_w - ref_w - 12.0f;
+    if inp_w < 60.0f do inp_w = 60.0f;
+
+    if sdk.input_text(1, pad, y, inp_w, 26.0f, g_func_buf, &g_func_len, "Function name...") & .Submitted {
+        inspect_current_func();
+    }
+    if sdk.button(2, pad + inp_w + 6.0f, y, insp_w, 26.0f, "Inspect WAT", .Primary) & .Clicked {
+        inspect_current_func();
+    }
+    if sdk.button(3, pad + inp_w + insp_w + 12.0f, y, ref_w, 26.0f, "Syms", .Ghost) & .Clicked {
+        refresh_functions();
+    }
+    y += 32.0f;
+
+    // Row 2: Function picker strip from active file (LSP symbols)
+    list_h: f32 = 92.0f;
+    if g_funcs.count == 0 do list_h = 30.0f;
+    sdk.draw_rect(pad, y, w, list_h, sdk.theme_color(.BgSurface), 5.0f, sdk.theme_color(.Border), 1.0f);
+
+    if g_funcs.count == 0 {
+        sdk.draw_text(pad + 8.0f, y + 7.0f, "No LSP functions yet — type a name above & click Inspect WAT", 12.0f, sdk.theme_color(.TextSecondary));
+    } else {
+        row_h: f32 = 22.0f;
+        ch := cast(f32) g_funcs.count * row_h + 6.0f;
+        sdk.scroll_begin(10, pad + 2.0f, y + 2.0f, w - 4.0f, list_h - 4.0f, ch, &g_list_scroll);
+
+        mx := ctx.mouse_x;
+        my := ctx.mouse_y + g_list_scroll;
+        in_l := (ctx.flags & abi.FRAME_FLAG_HOVERED) != 0 && ctx.mouse_y >= y && ctx.mouse_y <= (y + list_h);
+        lclick := in_l && (ctx.mouse_pressed & cast(u32) abi.MouseButton.Left) != 0;
+
+        ry := y + 3.0f;
+        clicked_idx: i32 = -1;
+        for i in 0 .. g_funcs.count {
+            f := &g_funcs[i];
+            hov := in_l && mx >= pad && mx <= (pad + w - 8.0f) && my >= ry && my < (ry + row_h);
+            if i == g_selected_idx {
+                sdk.draw_rect(pad + 4.0f, ry, w - 12.0f, row_h - 1.0f, sdk.theme_color(.BgSelection), 3.0f);
+            } elseif hov {
+                sdk.draw_rect(pad + 4.0f, ry, w - 12.0f, row_h - 1.0f, sdk.theme_color(.BgHover), 3.0f);
+            }
+            sdk.draw_text(pad + 10.0f, ry + 3.0f, "fn", 11.0f, sdk.theme_color(.Accent), .Bold);
+            sdk.draw_text(pad + 32.0f, ry + 3.0f, f.name, 12.5f, sdk.theme_color(.TextPrimary), .Mono);
+            if hov && lclick do clicked_idx = i;
+            ry += row_h;
+        }
+        sdk.scroll_end();
+
+        if clicked_idx >= 0 {
+            g_selected_idx = clicked_idx;
+            nm := g_funcs[clicked_idx].name;
+            n := nm.count if nm.count < 95 else 95;
+            memory.copy(&g_func_buf[0], nm.data, n);
+            g_func_len = cast(u32) n;
+            inspect_current_func();
+        }
+    }
+    y += list_h + 8.0f;
+
+    // Header badge for WAT view
+    pw := sdk.pill(pad, y, "WAT", sdk.theme_color(.Success), 0x11111BFF);
+    fname_disp := str.{ &g_func_buf[0], cast(i32) g_func_len };
+    sdk.draw_text(pad + pw + 8.0f, y + 3.0f, fname_disp, 13.0f, sdk.theme_color(.TextPrimary), .Mono);
+    y += 26.0f;
+
+    // Disassembled WAT Code View
+    wat_h := ctx.height - y - pad;
+    if wat_h < 60.0f do wat_h = 60.0f;
+    sdk.draw_rect(pad, y, w, wat_h, sdk.theme_color(.BgBase), 5.0f, sdk.theme_color(.Border), 1.0f);
+
+    w_row_h: f32 = 18.0f;
+    w_ch := cast(f32) g_wat_lines.count * w_row_h + 12.0f;
+    sdk.scroll_begin(20, pad + 4.0f, y + 4.0f, w - 8.0f, wat_h - 8.0f, w_ch, &g_wat_scroll);
+
+    wy := y + 6.0f;
+    for &ln in g_wat_lines {
+        sdk.draw_text(pad + 8.0f, wy, *ln, 12.0f, wat_line_color(*ln), .Mono);
+        wy += w_row_h;
+    }
+    sdk.scroll_end();
+}
+
+#local
+str_has :: (haystack: str, needle: str) -> bool {
+    if needle.count == 0 do return true;
+    if haystack.count < needle.count do return false;
+    for i in 0 .. (haystack.count - needle.count + 1) {
+        ok := true;
+        for j in 0 .. needle.count {
+            if haystack[i + j] != needle[j] { ok = false; break; }
+        }
+        if ok do return true;
+    }
+    return false;
+}

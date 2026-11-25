@@ -1,0 +1,804 @@
+package odit.lsp
+
+// =============================================================================
+// Onyx Editor ("odit") — Non-Blocking Onyx LSP Client (JSON-RPC 2.0 over stdio)
+// =============================================================================
+// Spawns `onyx lsp` as an asynchronous child process (`non_blocking_io = true`),
+// frames `Content-Length` JSON-RPC messages without blocking the Raylib loop,
+// and exposes diagnostics, document symbols, hover, go-to-definition,
+// references, and completions to both the Core Editor and WASM Plugin Host ABI.
+
+use core { package, os, io, memory, printf, Array }
+use core.encoding.json
+use odit.abi
+
+#local
+#foreign "odit_wasm_host" {
+    native_proc_spawn :: (cmd_ptr: rawptr, cmd_len: i32, args_ptr: rawptr, args_len: i32, cwd_ptr: rawptr, cwd_len: i32) -> u32 ---
+    native_proc_write :: (handle: u32, src_ptr: rawptr, src_len: i32) -> i32 ---
+    native_proc_read  :: (handle: u32, stream_mask: i32, out_ptr: rawptr, out_cap: i32) -> i32 ---
+    native_proc_poll  :: (handle: u32, out_exit_code: &i32) -> u32 ---
+    native_proc_kill  :: (handle: u32) -> i32 ---
+}
+
+LspState :: enum {
+    Disconnected;
+    Starting;
+    Ready;
+    Failed;
+}
+
+PendingKind :: enum {
+    Initialize;
+    Hover;
+    Definition;
+    DocumentSymbol;
+    References;
+    Completion;
+}
+
+PendingRequest :: struct {
+    id:   i32;
+    kind: PendingKind;
+    path: str; // Workspace-relative path context
+}
+
+LspLocation :: struct {
+    path:   str; // Workspace-relative (or absolute if outside workspace)
+    line:   u32; // 1-based
+    column: u32; // 1-based
+}
+
+LspCompletionItem :: struct {
+    label:       str;
+    detail:      str;
+    insert_text: str;
+    kind:        i32;
+}
+
+LspClient :: struct {
+    state:              LspState;
+    proc_handle:        u32;
+    proc_active:        bool;
+
+    workspace_abs:      str;
+    onyx_bin:           str;
+
+    next_req_id:        i32;
+    pending:            [..] PendingRequest;
+    rx_buf:             [..] u8;
+
+    // Currently synced document
+    opened_path:        str;
+    opened_version:     i32;
+    change_pending:     bool;
+    change_timer:       f32;
+
+    // Live LSP data consumed by Editor & WASM Host ABI
+    diagnostics:        [..] abi.Diagnostic;
+    symbols:            [..] abi.SymbolInfo;
+    symbols_path:       str;
+    references:         [..] LspLocation;
+
+    // Interactive editor features
+    hover_text:         str;
+    hover_line:         i32;
+    hover_col:          i32;
+    hover_visible:      bool;
+
+    pending_jump:       ? LspLocation;
+
+    completions:        [..] LspCompletionItem;
+    comp_open:          bool;
+    comp_selected:      i32;
+
+    // Change flags for host main loop to broadcast plugin events
+    diagnostics_dirty:  bool;
+    symbols_dirty:      bool;
+    last_log:           str;
+}
+
+#local
+resolve_onyx_bin :: () -> str {
+    if onyx_path := os.env("ONYX_PATH"); onyx_path {
+        cand := core.tprintf("{}/bin/onyx", onyx_path->unwrap());
+        if os.file_exists(cand) do return str.copy(cand);
+    }
+    if home := os.env("HOME"); home {
+        cand := core.tprintf("{}/.onyx/bin/onyx", home->unwrap());
+        if os.file_exists(cand) do return str.copy(cand);
+    }
+    return str.copy("onyx");
+}
+
+#local
+path_to_uri :: (c: &LspClient, path: str) -> str {
+    if str.starts_with(path, "file://") do return path;
+    if path.count > 0 && path[0] == '/' {
+        return core.tprintf("file://{}", path);
+    }
+    clean := path;
+    if str.starts_with(clean, "./") do clean = clean[2 .. clean.count];
+    return core.tprintf("file://{}/{}", c.workspace_abs, clean);
+}
+
+#local
+uri_to_rel_path :: (c: &LspClient, uri: str) -> str {
+    p := uri;
+    if str.starts_with(p, "file://") {
+        p = p[7 .. p.count];
+    }
+    prefix := core.tprintf("{}/", c.workspace_abs);
+    if str.starts_with(p, prefix) {
+        return p[prefix.count .. p.count];
+    }
+    return p;
+}
+
+#local
+json_escape :: (s: str, allocator := context.temp_allocator) -> str {
+    out := make(dyn_str, s.count + 16, allocator);
+    for i in 0 .. s.count {
+        ch := s[i];
+        switch ch {
+            case '"'  do Array.concat(&out, "\\\"");
+            case '\\' do Array.concat(&out, "\\\\");
+            case '\n' do Array.concat(&out, "\\n");
+            case '\r' do Array.concat(&out, "\\r");
+            case '\t' do Array.concat(&out, "\\t");
+            case _ {
+                if ch >= 32 {
+                    out << ch;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+#local
+lsp_send_raw :: (c: &LspClient, body: str) -> bool {
+    if !c.proc_active || c.proc_handle == 0 do return false;
+    hdr := core.tprintf("Content-Length: {}\r\n\r\n", body.count);
+
+    // Send header then body directly (avoids tprintf's 8KB fixed buffer limit!)
+    parts := str.[ hdr, body ];
+    for part in parts {
+        written := 0;
+        while written < part.count {
+            slice := part[written .. part.count];
+            n := native_proc_write(c.proc_handle, slice.data, slice.count);
+            if n <= 0 do return false;
+            written += n;
+        }
+    }
+    return true;
+}
+
+lsp_init :: (c: &LspClient) {
+    c.state          = .Disconnected;
+    c.proc_handle    = 0;
+    c.proc_active    = false;
+    c.next_req_id    = 1;
+    c.pending        = make([..] PendingRequest);
+    c.rx_buf         = make([..] u8, 8192);
+    c.diagnostics    = make([..] abi.Diagnostic);
+    c.symbols        = make([..] abi.SymbolInfo);
+    c.references     = make([..] LspLocation);
+    c.completions    = make([..] LspCompletionItem);
+    c.workspace_abs  = str.copy(os.getcwd());
+    c.onyx_bin       = resolve_onyx_bin();
+    c.opened_path    = "";
+    c.symbols_path   = "";
+    c.hover_text     = "";
+    c.last_log       = "";
+    c.pending_jump   = .None;
+}
+
+lsp_start :: (c: &LspClient) -> bool {
+    if c.proc_active do lsp_shutdown(c);
+
+    arg := "lsp";
+    h := native_proc_spawn(
+        c.onyx_bin.data, c.onyx_bin.count,
+        arg.data, arg.count,
+        c.workspace_abs.data, c.workspace_abs.count
+    );
+    if h == 0 {
+        c.state = .Failed;
+        return false;
+    }
+
+    c.proc_handle = h;
+    c.proc_active = true;
+    c.state       = .Starting;
+    Array.clear(&c.rx_buf);
+    Array.clear(&c.pending);
+
+    req_id := c.next_req_id;
+    c.next_req_id += 1;
+    c.pending << .{ req_id, .Initialize, "" };
+
+    root_uri := core.tprintf("file://{}", c.workspace_abs);
+    init_msg := core.tprintf(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"initialize\",\"params\":{{\"processId\":null,\"rootUri\":\"{}\",\"capabilities\":{{}}}}}}",
+        req_id, json_escape(root_uri)
+    );
+    if !lsp_send_raw(c, init_msg) {
+        c.state = .Failed;
+        return false;
+    }
+    return true;
+}
+
+lsp_shutdown :: (c: &LspClient) {
+    if !c.proc_active || c.proc_handle == 0 do return;
+    lsp_send_raw(c, "{\"jsonrpc\":\"2.0\",\"id\":999999,\"method\":\"shutdown\",\"params\":null}");
+    lsp_send_raw(c, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+    native_proc_kill(c.proc_handle);
+    c.proc_handle = 0;
+    c.proc_active = false;
+    c.state = .Disconnected;
+}
+
+lsp_did_open :: (c: &LspClient, rel_path: str, text: str) {
+    if c.state != .Ready || rel_path.count == 0 do return;
+    if !str.ends_with(rel_path, ".onyx") do return;
+
+    // Close previously opened doc if switching
+    if c.opened_path.count > 0 && !str.equal(c.opened_path, rel_path) {
+        old_uri := path_to_uri(c, c.opened_path);
+        lsp_send_raw(c, core.tprintf(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{{\"textDocument\":{{\"uri\":\"{}\"}}}}}}",
+            json_escape(old_uri)
+        ));
+    }
+
+    c.opened_path    = str.copy(rel_path);
+    c.opened_version = 1;
+    c.change_pending = false;
+    c.hover_visible  = false;
+    c.comp_open      = false;
+
+    uri := path_to_uri(c, rel_path);
+    msg := make(dyn_str, text.count + 256, context.temp_allocator);
+    Array.concat(&msg, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"");
+    Array.concat(&msg, json_escape(uri));
+    Array.concat(&msg, "\",\"languageId\":\"onyx\",\"version\":1,\"text\":\"");
+    Array.concat(&msg, json_escape(text));
+    Array.concat(&msg, "\"}}}");
+    lsp_send_raw(c, msg);
+    lsp_request_symbols(c, rel_path);
+}
+
+lsp_mark_changed :: (c: &LspClient) {
+    if c.state != .Ready || c.opened_path.count == 0 do return;
+    c.change_pending = true;
+    c.change_timer   = 0.35f; // debounce 350ms
+}
+
+lsp_flush_change :: (c: &LspClient, text: str) {
+    if c.state != .Ready || c.opened_path.count == 0 do return;
+    c.change_pending = false;
+    c.opened_version += 1;
+    uri := path_to_uri(c, c.opened_path);
+    msg := make(dyn_str, text.count + 256, context.temp_allocator);
+    Array.concat(&msg, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"");
+    Array.concat(&msg, json_escape(uri));
+    Array.concat(&msg, core.tprintf("\",\"version\":{}}},\"contentChanges\":[{{\"text\":\"", c.opened_version));
+    Array.concat(&msg, json_escape(text));
+    Array.concat(&msg, "\"}]}}");
+    lsp_send_raw(c, msg);
+}
+
+lsp_did_save :: (c: &LspClient, rel_path: str, text: str) {
+    if c.state != .Ready || rel_path.count == 0 do return;
+    if !str.ends_with(rel_path, ".onyx") do return;
+    if c.change_pending do lsp_flush_change(c, text);
+
+    uri := path_to_uri(c, rel_path);
+    msg := core.tprintf(
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{{\"textDocument\":{{\"uri\":\"{}\"}}}}}}",
+        json_escape(uri)
+    );
+    lsp_send_raw(c, msg);
+    lsp_request_symbols(c, rel_path);
+}
+
+lsp_request_symbols :: (c: &LspClient, rel_path: str) {
+    if c.state != .Ready || rel_path.count == 0 do return;
+    req_id := c.next_req_id;
+    c.next_req_id += 1;
+    c.pending << .{ req_id, .DocumentSymbol, str.copy(rel_path) };
+
+    uri := path_to_uri(c, rel_path);
+    lsp_send_raw(c, core.tprintf(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"textDocument/documentSymbol\",\"params\":{{\"textDocument\":{{\"uri\":\"{}\"}}}}}}",
+        req_id, json_escape(uri)
+    ));
+}
+
+lsp_request_hover :: (c: &LspClient, rel_path: str, line_0: i32, col_0: i32) {
+    if c.state != .Ready || rel_path.count == 0 do return;
+    req_id := c.next_req_id;
+    c.next_req_id += 1;
+    c.pending << .{ req_id, .Hover, str.copy(rel_path) };
+    c.hover_line = line_0;
+    c.hover_col  = col_0;
+
+    uri := path_to_uri(c, rel_path);
+    lsp_send_raw(c, core.tprintf(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{}\"}},\"position\":{{\"line\":{},\"character\":{}}}}}}}",
+        req_id, json_escape(uri), line_0, col_0
+    ));
+}
+
+lsp_request_definition :: (c: &LspClient, rel_path: str, line_0: i32, col_0: i32) {
+    if c.state != .Ready || rel_path.count == 0 do return;
+    req_id := c.next_req_id;
+    c.next_req_id += 1;
+    c.pending << .{ req_id, .Definition, str.copy(rel_path) };
+
+    uri := path_to_uri(c, rel_path);
+    lsp_send_raw(c, core.tprintf(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"textDocument/definition\",\"params\":{{\"textDocument\":{{\"uri\":\"{}\"}},\"position\":{{\"line\":{},\"character\":{}}}}}}}",
+        req_id, json_escape(uri), line_0, col_0
+    ));
+}
+
+lsp_request_references :: (c: &LspClient, rel_path: str, line_0: i32, col_0: i32) {
+    if c.state != .Ready || rel_path.count == 0 do return;
+    req_id := c.next_req_id;
+    c.next_req_id += 1;
+    c.pending << .{ req_id, .References, str.copy(rel_path) };
+
+    uri := path_to_uri(c, rel_path);
+    lsp_send_raw(c, core.tprintf(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"textDocument/references\",\"params\":{{\"textDocument\":{{\"uri\":\"{}\"}},\"position\":{{\"line\":{},\"character\":{}}},\"context\":{{\"includeDeclaration\":true}}}}}}",
+        req_id, json_escape(uri), line_0, col_0
+    ));
+}
+
+lsp_request_completion :: (c: &LspClient, rel_path: str, line_0: i32, col_0: i32) {
+    if c.state != .Ready || rel_path.count == 0 do return;
+    req_id := c.next_req_id;
+    c.next_req_id += 1;
+    c.pending << .{ req_id, .Completion, str.copy(rel_path) };
+
+    uri := path_to_uri(c, rel_path);
+    lsp_send_raw(c, core.tprintf(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"textDocument/completion\",\"params\":{{\"textDocument\":{{\"uri\":\"{}\"}},\"position\":{{\"line\":{},\"character\":{}}}}}}}",
+        req_id, json_escape(uri), line_0, col_0
+    ));
+}
+
+// -----------------------------------------------------------------------------
+// Non-Blocking Poll & JSON-RPC Message Dispatch
+// -----------------------------------------------------------------------------
+
+/// Drains available stdout bytes from `onyx lsp` and processes all complete
+/// JSON-RPC frames. Returns true if the server just transitioned to Ready.
+lsp_poll :: (c: &LspClient, dt: f32) -> bool {
+    if !c.proc_active do return false;
+
+    if c.change_pending && c.change_timer > 0.0f {
+        c.change_timer -= dt;
+    }
+
+    // Drain all available non-blocking chunks from stdout
+    chunk: [8192] u8;
+    for _ in 0 .. 16 {
+        n := native_proc_read(c.proc_handle, 1, &chunk[0], 8192);
+        if n > 0 {
+            Array.concat(&c.rx_buf, chunk[0 .. n]);
+        } elseif n < 0 {
+            c.proc_active = false;
+            c.state = .Failed;
+            break;
+        } else {
+            break;
+        }
+    }
+
+    // Drain stderr silently so pipe never fills
+    err_chunk: [1024] u8;
+    native_proc_read(c.proc_handle, 2, &err_chunk[0], 1024);
+
+    became_ready := false;
+
+    // Parse framed messages: `Content-Length: N\r\n...\r\n\r\n<N bytes>`
+    while c.rx_buf.count > 0 {
+        buf_str := str.{ c.rx_buf.data, c.rx_buf.count };
+        hdr_end := find_header_end(buf_str);
+        if hdr_end < 0 do break;
+
+        header_part := buf_str[0 .. hdr_end];
+        content_len := parse_content_length(header_part);
+        body_start  := hdr_end + 4;
+
+        if content_len < 0 {
+            // Corrupt header — drop past delimiter
+            consume_prefix(&c.rx_buf, body_start);
+            continue;
+        }
+        if c.rx_buf.count < body_start + content_len {
+            break; // Wait for rest of body
+        }
+
+        body := str.temp_copy(buf_str[body_start .. (body_start + content_len)]);
+        consume_prefix(&c.rx_buf, body_start + content_len);
+
+        if handle_lsp_message(c, body) {
+            became_ready = true;
+        }
+    }
+
+    return became_ready;
+}
+
+#local
+find_header_end :: (s: str) -> i32 {
+    if s.count < 4 do return -1;
+    for i in 0 .. (s.count - 3) {
+        if s[i] == '\r' && s[i + 1] == '\n' && s[i + 2] == '\r' && s[i + 3] == '\n' {
+            return i;
+        }
+    }
+    return -1;
+}
+
+#local
+parse_content_length :: (hdr: str) -> i32 {
+    key := "Content-Length:";
+    idx := -1;
+    if hdr.count >= key.count {
+        for i in 0 .. (hdr.count - key.count + 1) {
+            match := true;
+            for j in 0 .. key.count {
+                a := hdr[i + j];
+                b := key[j];
+                if a >= 'A' && a <= 'Z' do a += 32;
+                if b >= 'A' && b <= 'Z' do b += 32;
+                if a != b { match = false; break; }
+            }
+            if match { idx = i + key.count; break; }
+        }
+    }
+    if idx < 0 do return -1;
+    while idx < hdr.count && (hdr[idx] == ' ' || hdr[idx] == '\t') do idx += 1;
+    val := 0;
+    digits := 0;
+    while idx < hdr.count && hdr[idx] >= '0' && hdr[idx] <= '9' {
+        val = val * 10 + cast(i32) (hdr[idx] - '0');
+        idx += 1;
+        digits += 1;
+    }
+    return val if digits > 0 else -1;
+}
+
+#local
+consume_prefix :: (buf: &[..] u8, count: i32) {
+    if count <= 0 do return;
+    if count >= buf.count {
+        buf.count = 0;
+        return;
+    }
+    rem := buf.count - count;
+    memory.copy(buf.data, &buf.data[count], rem);
+    buf.count = rem;
+}
+
+#local
+pop_pending :: (c: &LspClient, id: i32) -> ? PendingRequest {
+    for i in 0 .. c.pending.count {
+        if c.pending[i].id == id {
+            return Array.remove_at(&c.pending, i);
+        }
+    }
+    return .None;
+}
+
+#local
+handle_lsp_message :: (c: &LspClient, body: str) -> bool {
+    doc: json.Json;
+    switch json.decode(body, context.temp_allocator) {
+        case .Ok as d  do doc = d;
+        case .Err      do return false;
+    }
+    root := doc.root;
+
+    method := root["method"]->as_str();
+
+    // Server Notification
+    if method.count > 0 {
+        if str.equal(method, "textDocument/publishDiagnostics") {
+            handle_publish_diagnostics(c, root["params"]);
+        } elseif str.equal(method, "window/logMessage") {
+            msg := root["params"]["message"]->as_str();
+            if msg.count > 0 {
+                c.last_log = str.copy(msg);
+            }
+        }
+        return false;
+    }
+
+    // Response to one of our requests
+    id_val := root["id"];
+    if id_val->type() == .Null do return false;
+    req_id := cast(i32) id_val->as_int();
+
+    req_opt := pop_pending(c, req_id);
+    if !req_opt do return false;
+    req := req_opt->unwrap();
+    res := root["result"];
+
+    switch req.kind {
+        case .Initialize {
+            c.state = .Ready;
+            lsp_send_raw(c, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+            return true;
+        }
+        case .DocumentSymbol {
+            handle_symbols_response(c, req.path, res);
+        }
+        case .Hover {
+            handle_hover_response(c, res);
+        }
+        case .Definition {
+            handle_definition_response(c, res);
+        }
+        case .References {
+            handle_references_response(c, res);
+        }
+        case .Completion {
+            handle_completion_response(c, res);
+        }
+    }
+    return false;
+}
+
+#local
+handle_publish_diagnostics :: (c: &LspClient, params: json.Value) {
+    uri := params["uri"]->as_str();
+    rel := uri_to_rel_path(c, uri);
+
+    // Replace existing diagnostics for this file
+    i := 0;
+    while i < c.diagnostics.count {
+        if str.equal(c.diagnostics[i].path, rel) {
+            Array.remove_at(&c.diagnostics, i);
+        } else {
+            i += 1;
+        }
+    }
+
+    diags := params["diagnostics"]->as_array();
+    for d in diags {
+        rng   := d["range"];
+        start := rng["start"];
+        end   := rng["end"];
+        line  := cast(u32) start["line"]->as_int() + 1;
+        col   := cast(u32) start["character"]->as_int() + 1;
+        end_c := cast(u32) end["character"]->as_int() + 1;
+        dlen  := (end_c - col) if end_c > col else 1;
+        sev   := cast(u32) d["severity"]->as_int();
+        if sev == 0 do sev = 1;
+        msg   := d["message"]->as_str();
+
+        c.diagnostics << .{
+            path     = str.copy(rel),
+            line     = line,
+            column   = col,
+            length   = dlen,
+            severity = sev,
+            source   = "onyx-lsp",
+            message  = str.copy(msg),
+        };
+    }
+
+    c.diagnostics_dirty = true;
+}
+
+#local
+map_lsp_symbol_kind :: (lsp_kind: i32) -> u32 {
+    return switch lsp_kind {
+        case 12, 6  => cast(u32) abi.SymbolKind.Procedure; // Function / Method
+        case 23, 5  => cast(u32) abi.SymbolKind.Struct;    // Struct / Class
+        case 10, 22 => cast(u32) abi.SymbolKind.Enum;      // Enum / EnumMember
+        case 11     => cast(u32) abi.SymbolKind.Interface; // Interface
+        case 8, 7   => cast(u32) abi.SymbolKind.Field;     // Field / Property
+        case 13, 14 => cast(u32) abi.SymbolKind.Global;    // Variable / Constant
+        case 2, 3, 4 => cast(u32) abi.SymbolKind.Package;  // Module / Namespace / Package
+        case _      => cast(u32) abi.SymbolKind.Unknown;
+    };
+}
+
+#local
+collect_doc_symbols :: (out: &[..] abi.SymbolInfo, arr: [] json.Value, rel_path: str, container: str) {
+    for s in arr {
+        name := s["name"]->as_str();
+        detail := s["detail"]->as_str();
+        kind := map_lsp_symbol_kind(cast(i32) s["kind"]->as_int());
+        rng := s["range"];
+        s_line := cast(u32) rng["start"]["line"]->as_int() + 1;
+        s_col  := cast(u32) rng["start"]["character"]->as_int() + 1;
+        e_line := cast(u32) rng["end"]["line"]->as_int() + 1;
+
+        *out << .{
+            name      = str.copy(name),
+            kind      = kind,
+            detail    = str.copy(detail),
+            container = str.copy(container),
+            path      = str.copy(rel_path),
+            line      = s_line,
+            column    = s_col,
+            end_line  = e_line,
+            tags      = .{},
+        };
+
+        children := s["children"]->as_array();
+        if children.count > 0 {
+            collect_doc_symbols(out, children, rel_path, name);
+        }
+    }
+}
+
+#local
+handle_symbols_response :: (c: &LspClient, rel_path: str, res: json.Value) {
+    Array.clear(&c.symbols);
+    c.symbols_path = str.copy(rel_path);
+    if res->type() != .Null {
+        arr := res->as_array();
+        collect_doc_symbols(&c.symbols, arr, rel_path, "");
+    }
+    c.symbols_dirty = true;
+}
+
+#local
+handle_hover_response :: (c: &LspClient, res: json.Value) {
+    if res->type() == .Null {
+        c.hover_visible = false;
+        return;
+    }
+    contents := res["contents"];
+    txt := contents["value"]->as_str();
+    if txt.count == 0 {
+        txt = contents->as_str();
+    }
+    if txt.count > 0 {
+        c.hover_text    = str.copy(txt);
+        c.hover_visible = true;
+    } else {
+        c.hover_visible = false;
+    }
+}
+
+#local
+parse_location :: (c: &LspClient, v: json.Value) -> ? LspLocation {
+    uri := v["uri"]->as_str();
+    if uri.count == 0 do return .None;
+    rng := v["range"]["start"];
+    return LspLocation.{
+        path   = str.copy(uri_to_rel_path(c, uri)),
+        line   = cast(u32) rng["line"]->as_int() + 1,
+        column = cast(u32) rng["character"]->as_int() + 1,
+    };
+}
+
+#local
+handle_definition_response :: (c: &LspClient, res: json.Value) {
+    if res->type() == .Null do return;
+    if loc := parse_location(c, res); loc {
+        c.pending_jump = loc;
+        return;
+    }
+    arr := res->as_array();
+    if arr.count > 0 {
+        if loc := parse_location(c, arr[0]); loc {
+            c.pending_jump = loc;
+        }
+    }
+}
+
+#local
+handle_references_response :: (c: &LspClient, res: json.Value) {
+    Array.clear(&c.references);
+    if res->type() == .Null do return;
+    arr := res->as_array();
+    for item in arr {
+        if loc := parse_location(c, item); loc {
+            c.references << loc->unwrap();
+        }
+    }
+}
+
+#local
+handle_completion_response :: (c: &LspClient, res: json.Value) {
+    Array.clear(&c.completions);
+    c.comp_selected = 0;
+    if res->type() == .Null {
+        c.comp_open = false;
+        return;
+    }
+    items := res["items"]->as_array();
+    if items.count == 0 {
+        items = res->as_array();
+    }
+    max_items := 24;
+    for item in items {
+        if c.completions.count >= max_items do break;
+        lbl := item["label"]->as_str();
+        if lbl.count == 0 do continue;
+        ins := item["insertText"]->as_str();
+        if ins.count == 0 do ins = lbl;
+        c.completions << .{
+            label       = str.copy(lbl),
+            detail      = str.copy(item["detail"]->as_str()),
+            insert_text = str.copy(ins),
+            kind        = cast(i32) item["kind"]->as_int(),
+        };
+    }
+    c.comp_open = c.completions.count > 0;
+}
+
+// -----------------------------------------------------------------------------
+// JSON Serialization Helpers for Host ABI (`ast_get_*`)
+// -----------------------------------------------------------------------------
+
+lsp_diagnostics_to_json :: (c: &LspClient, filter_path: str, allocator := context.temp_allocator) -> str {
+    out := make(dyn_str, allocator);
+    Array.concat(&out, "[");
+    first := true;
+    for &d in c.diagnostics {
+        if filter_path.count > 0 && !str.equal(d.path, filter_path) do continue;
+        if !first do Array.concat(&out, ",");
+        first = false;
+        Array.concat(&out, core.tprintf(
+            "{{\"path\":\"{}\",\"line\":{},\"column\":{},\"length\":{},\"severity\":{},\"source\":\"{}\",\"message\":\"{}\"}}",
+            json_escape(d.path), d.line, d.column, d.length, d.severity, json_escape(d.source), json_escape(d.message)
+        ));
+    }
+    Array.concat(&out, "]");
+    return out;
+}
+
+lsp_symbols_to_json :: (c: &LspClient, allocator := context.temp_allocator) -> str {
+    out := make(dyn_str, allocator);
+    Array.concat(&out, "[");
+    for i in 0 .. c.symbols.count {
+        s := &c.symbols[i];
+        if i > 0 do Array.concat(&out, ",");
+        Array.concat(&out, core.tprintf(
+            "{{\"name\":\"{}\",\"kind\":{},\"detail\":\"{}\",\"container\":\"{}\",\"path\":\"{}\",\"line\":{},\"column\":{},\"end_line\":{},\"tags\":[]}}",
+            json_escape(s.name), s.kind, json_escape(s.detail), json_escape(s.container),
+            json_escape(s.path), s.line, s.column, s.end_line
+        ));
+    }
+    Array.concat(&out, "]");
+    return out;
+}
+
+lsp_references_to_json :: (c: &LspClient, allocator := context.temp_allocator) -> str {
+    out := make(dyn_str, allocator);
+    Array.concat(&out, "[");
+    for i in 0 .. c.references.count {
+        r := &c.references[i];
+        if i > 0 do Array.concat(&out, ",");
+        Array.concat(&out, core.tprintf(
+            "{{\"path\":\"{}\",\"line\":{},\"column\":{}}}",
+            json_escape(r.path), r.line, r.column
+        ));
+    }
+    Array.concat(&out, "]");
+    return out;
+}
+
+lsp_count_errors_warnings :: (c: &LspClient) -> (i32, i32) {
+    errs := 0;
+    warns := 0;
+    for &d in c.diagnostics {
+        if d.severity == 1 do errs += 1;
+        elseif d.severity == 2 do warns += 1;
+    }
+    return errs, warns;
+}

@@ -1,0 +1,666 @@
+package odit.ui
+
+// =============================================================================
+// Onyx Editor ("odit") — Host Immediate UI Renderer for WASM Plugins
+// =============================================================================
+// Translates window-local plugin coordinates to screen space, maintains an
+// intersected scissor clip stack, manages immediate widget interaction state
+// (buttons, text inputs, dropdowns, scroll areas, tables), and caches loaded
+// PNG/JPG/animated GIF textures.
+
+use core { memory, math }
+use raylib
+use odit.abi
+use odit.theme
+use odit.settings
+
+ClipRect :: struct {
+    x, y, w, h: f32;
+}
+
+TextureSlot :: struct {
+    in_use:        bool;
+    is_anim:       bool;
+    texture:       raylib.Texture2D;
+    frame_count:   i32;
+    current_frame: i32;
+    frame_timer:   f32;
+}
+
+TableState :: struct {
+    active:     bool;
+    id:         u32;
+    x, y, w, h: f32;
+    cur_y:      f32;
+    col_count:  u32;
+    col_widths: [16] f32;
+    row_index:  u32;
+}
+
+UiContext :: struct {
+    // Active plugin pane frame state
+    window_id:     u32;
+    origin_x:      f32;
+    origin_y:      f32;
+    pane_w:        f32;
+    pane_h:        f32;
+    scroll_offset: f32;
+    focused:       bool;
+    hovered:       bool;
+
+    // Input state for current frame (screen-space mouse + queued chars)
+    mouse_x:       f32;
+    mouse_y:       f32;
+    wheel_y:       f32;
+    mouse_down:    bool;
+    mouse_pressed: bool;
+    mouse_dbl:     bool;
+    dt:            f32;
+
+    // Keyboard input captured for plugin text inputs
+    typed_chars:   [32] u32;
+    typed_count:   i32;
+    key_backspace: bool;
+    key_enter:     bool;
+    key_escape:    bool;
+
+    // Persistent focused text input across frames
+    focused_input_win: u32;
+    focused_input_id:  u32;
+    last_click_time:   f64;
+    last_click_x:      f32;
+    last_click_y:      f32;
+    blink_timer:       f32;
+
+    // Nested scissor clip stack
+    clip_stack:    [16] ClipRect;
+    clip_depth:    i32;
+
+    // Active table layout state
+    table:         TableState;
+
+    // Texture & animated GIF pool
+    textures:      [64] TextureSlot;
+}
+
+g_ui: UiContext;
+
+ui_begin_frame :: (dt: f32, capture_keys_for_plugins: bool) {
+    g_ui.dt = dt;
+    g_ui.blink_timer += dt;
+
+    mpos := raylib.GetMousePosition();
+    g_ui.mouse_x = mpos.x;
+    g_ui.mouse_y = mpos.y;
+    g_ui.wheel_y = raylib.GetMouseWheelMove();
+    g_ui.mouse_down    = raylib.IsMouseButtonDown(.LEFT);
+    g_ui.mouse_pressed = raylib.IsMouseButtonPressed(.LEFT);
+    g_ui.mouse_dbl     = false;
+
+    if g_ui.mouse_pressed {
+        now := raylib.GetTime();
+        dx := mpos.x - g_ui.last_click_x;
+        dy := mpos.y - g_ui.last_click_y;
+        if (now - g_ui.last_click_time) < 0.32 && (dx * dx + dy * dy) < 64.0 {
+            g_ui.mouse_dbl = true;
+            g_ui.last_click_time = 0.0;
+        } else {
+            g_ui.last_click_time = now;
+            g_ui.last_click_x = mpos.x;
+            g_ui.last_click_y = mpos.y;
+        }
+    }
+
+    g_ui.typed_count = 0;
+    g_ui.key_backspace = false;
+    g_ui.key_enter = false;
+    g_ui.key_escape = false;
+
+    if capture_keys_for_plugins {
+        while true {
+            ch := raylib.GetCharPressed();
+            if ch <= 0 do break;
+            if g_ui.typed_count < 32 {
+                g_ui.typed_chars[g_ui.typed_count] = cast(u32) ch;
+                g_ui.typed_count += 1;
+            }
+        }
+        g_ui.key_backspace = raylib.IsKeyPressed(.BACKSPACE) || raylib.IsKeyPressedRepeat(.BACKSPACE);
+        g_ui.key_enter     = raylib.IsKeyPressed(.ENTER) || raylib.IsKeyPressed(.KP_ENTER);
+        g_ui.key_escape    = raylib.IsKeyPressed(.ESCAPE);
+        if g_ui.key_escape {
+            g_ui.focused_input_win = 0;
+            g_ui.focused_input_id = 0;
+        }
+    }
+
+    // Advance animated texture timers
+    for &slot in g_ui.textures {
+        if slot.in_use && slot.is_anim && slot.frame_count > 1 {
+            slot.frame_timer += dt;
+            if slot.frame_timer >= 0.08 {
+                slot.frame_timer = 0.0;
+                slot.current_frame = (slot.current_frame + 1) % slot.frame_count;
+            }
+        }
+    }
+}
+
+ui_has_focused_input :: () -> bool {
+    return g_ui.focused_input_win != 0 && g_ui.focused_input_id != 0;
+}
+
+ui_clear_focused_input :: () {
+    g_ui.focused_input_win = 0;
+    g_ui.focused_input_id = 0;
+}
+
+ui_begin_pane :: (window_id: u32, x, y, w, h: f32, focused: bool, hovered: bool) {
+    g_ui.window_id     = window_id;
+    g_ui.origin_x      = x;
+    g_ui.origin_y      = y;
+    g_ui.pane_w        = w;
+    g_ui.pane_h        = h;
+    g_ui.scroll_offset = 0.0;
+    g_ui.focused       = focused;
+    g_ui.hovered       = hovered;
+    g_ui.clip_depth    = 0;
+    g_ui.table.active  = false;
+
+    push_clip_screen(x, y, w, h);
+}
+
+ui_end_pane :: () {
+    if g_ui.table.active {
+        ui_table_end();
+    }
+    while g_ui.clip_depth > 0 {
+        ui_pop_clip();
+    }
+    g_ui.scroll_offset = 0.0;
+}
+
+#local
+apply_top_clip :: () {
+    if g_ui.clip_depth <= 0 {
+        raylib.EndScissorMode();
+        return;
+    }
+    c := g_ui.clip_stack[g_ui.clip_depth - 1];
+    ix := cast(i32) c.x;
+    iy := cast(i32) c.y;
+    iw := cast(i32) c.w;
+    ih := cast(i32) c.h;
+    if iw < 0 do iw = 0;
+    if ih < 0 do ih = 0;
+    raylib.BeginScissorMode(ix, iy, iw, ih);
+}
+
+#local
+push_clip_screen :: (x, y, w, h: f32) {
+    if g_ui.clip_depth >= 16 do return;
+    nx := x;
+    ny := y;
+    nx2 := x + w;
+    ny2 := y + h;
+
+    if g_ui.clip_depth > 0 {
+        p := g_ui.clip_stack[g_ui.clip_depth - 1];
+        if nx < p.x do nx = p.x;
+        if ny < p.y do ny = p.y;
+        if nx2 > p.x + p.w do nx2 = p.x + p.w;
+        if ny2 > p.y + p.h do ny2 = p.y + p.h;
+    }
+
+    nw := nx2 - nx;
+    nh := ny2 - ny;
+    if nw < 0.0 do nw = 0.0;
+    if nh < 0.0 do nh = 0.0;
+
+    g_ui.clip_stack[g_ui.clip_depth] = .{ nx, ny, nw, nh };
+    g_ui.clip_depth += 1;
+    apply_top_clip();
+}
+
+#local
+to_screen_x :: (lx: f32) -> f32 { return g_ui.origin_x + lx; }
+#local
+to_screen_y :: (ly: f32) -> f32 { return g_ui.origin_y + ly - g_ui.scroll_offset; }
+
+#local
+point_in_rect :: (px, py, rx, ry, rw, rh: f32) -> bool {
+    return px >= rx && px <= (rx + rw) && py >= ry && py <= (ry + rh);
+}
+
+#local
+point_in_clip :: (px, py: f32) -> bool {
+    if g_ui.clip_depth <= 0 do return true;
+    c := g_ui.clip_stack[g_ui.clip_depth - 1];
+    return point_in_rect(px, py, c.x, c.y, c.w, c.h);
+}
+
+// -----------------------------------------------------------------------------
+// ABI UI Primitives Implementation
+// -----------------------------------------------------------------------------
+
+ui_push_clip :: (x, y, w, h: f32) {
+    push_clip_screen(to_screen_x(x), to_screen_y(y), w, h);
+}
+
+ui_pop_clip :: () {
+    if g_ui.clip_depth <= 0 do return;
+    g_ui.clip_depth -= 1;
+    apply_top_clip();
+}
+
+ui_draw_rect :: (x, y, w, h, radius: f32, fill_rgba, border_rgba: u32, border_w: f32) {
+    theme.draw_rect(to_screen_x(x), to_screen_y(y), w, h, fill_rgba, radius, border_rgba, border_w);
+}
+
+ui_draw_line :: (x1, y1, x2, y2, thickness: f32, rgba: u32) {
+    p1 := raylib.Vector2.{ to_screen_x(x1), to_screen_y(y1) };
+    p2 := raylib.Vector2.{ to_screen_x(x2), to_screen_y(y2) };
+    raylib.DrawLineEx(p1, p2, thickness, theme.rgba_to_rl(rgba));
+}
+
+ui_draw_arrow :: (x1, y1, x2, y2, thickness, head_size: f32, rgba: u32) {
+    sx1 := to_screen_x(x1);
+    sy1 := to_screen_y(y1);
+    sx2 := to_screen_x(x2);
+    sy2 := to_screen_y(y2);
+    col := theme.rgba_to_rl(rgba);
+
+    raylib.DrawLineEx(.{ sx1, sy1 }, .{ sx2, sy2 }, thickness, col);
+
+    dx := sx2 - sx1;
+    dy := sy2 - sy1;
+    len := math.sqrt(dx * dx + dy * dy);
+    if len > 0.001 {
+        ux := dx / len;
+        uy := dy / len;
+        px := -uy;
+        py := ux;
+        hs := head_size if head_size > 2.0 else 6.0;
+        base_x := sx2 - ux * hs;
+        base_y := sy2 - uy * hs;
+        v1 := raylib.Vector2.{ sx2, sy2 };
+        v2 := raylib.Vector2.{ base_x + px * (hs * 0.55), base_y + py * (hs * 0.55) };
+        v3 := raylib.Vector2.{ base_x - px * (hs * 0.55), base_y - py * (hs * 0.55) };
+        raylib.DrawTriangle(v1, v3, v2, col);
+        raylib.DrawTriangle(v1, v2, v3, col);
+    }
+}
+
+ui_draw_circle :: (cx, cy, radius: f32, fill_rgba, border_rgba: u32, border_w: f32) {
+    scx := to_screen_x(cx);
+    scy := to_screen_y(cy);
+    if (fill_rgba & 0xFF) != 0 {
+        raylib.DrawCircleV(.{ scx, scy }, radius, theme.rgba_to_rl(fill_rgba));
+    }
+    if border_w > 0.0 && (border_rgba & 0xFF) != 0 {
+        raylib.DrawCircleLinesV(.{ scx, scy }, radius, theme.rgba_to_rl(border_rgba));
+    }
+}
+
+ui_draw_text :: (x, y: f32, text: str, font_size: f32, rgba: u32, flags: u32) {
+    if text.count == 0 do return;
+    fs := font_size * settings.g_settings.ui_scale;
+    sx := to_screen_x(x);
+    sy := to_screen_y(y);
+    tflags := cast(abi.TextFlags) flags;
+    if tflags & .AlignCenter {
+        tw := theme.measure_text(text, fs);
+        sx -= tw * 0.5f;
+    } elseif tflags & .AlignRight {
+        tw := theme.measure_text(text, fs);
+        sx -= tw;
+    }
+    theme.draw_text(sx, sy, text, fs, rgba);
+    if tflags & .Bold {
+        // Subtle faux-bold horizontal offset for monospace legibility
+        theme.draw_text(sx + 0.6f, sy, text, fs, rgba);
+    }
+}
+
+ui_pill :: (x, y: f32, text: str, bg_rgba, fg_rgba: u32) -> f32 {
+    s := settings.g_settings.ui_scale;
+    font_sz := 12.0f * s;
+    tw := theme.measure_text(text, font_sz);
+    pad_x := 8.0f * s;
+    pw := tw + pad_x * 2.0f;
+    ph := 20.0f * s;
+    sx := to_screen_x(x);
+    sy := to_screen_y(y);
+
+    theme.draw_rect(sx, sy, pw, ph, bg_rgba, ph * 0.5f);
+    theme.draw_text(sx + pad_x, sy + (ph - font_sz) * 0.5f, text, font_sz, fg_rgba);
+    return pw;
+}
+
+ui_button :: (id: u32, x, y, w, h: f32, label: str, style_flags: u32) -> u32 {
+    sx := to_screen_x(x);
+    sy := to_screen_y(y);
+    sflags := cast(abi.ButtonFlags) style_flags;
+    disabled := (style_flags & cast(u32) abi.ButtonFlags.Disabled) != 0;
+
+    hovered := !disabled && g_ui.hovered &&
+               point_in_clip(g_ui.mouse_x, g_ui.mouse_y) &&
+               point_in_rect(g_ui.mouse_x, g_ui.mouse_y, sx, sy, w, h);
+    active  := hovered && g_ui.mouse_down;
+    clicked := hovered && g_ui.mouse_pressed;
+
+    bg := theme.get_color(.BgSurface);
+    fg := theme.get_color(.TextPrimary);
+    border := theme.get_color(.Border);
+
+    if disabled {
+        bg = theme.get_color(.BgPanel);
+        fg = theme.get_color(.TextDisabled);
+    } elseif sflags & .Primary {
+        bg = 0x9BBFFAFF if hovered else theme.get_color(.BorderFocused);
+        if active do bg = 0x74A3F0FF;
+        fg = 0x11111BFF;
+        border = 0;
+    } elseif sflags & .Danger {
+        bg = 0xF5A0B8FF if hovered else theme.get_color(.Error);
+        fg = 0x11111BFF;
+        border = 0;
+    } elseif sflags & .Ghost {
+        bg = theme.get_color(.BgHover) if hovered else 0x00000000;
+        border = theme.get_color(.Border) if hovered else 0x31324488;
+    } else {
+        if hovered do bg = theme.get_color(.BgHover);
+        if sflags & .Active do border = theme.get_color(.BorderFocused);
+    }
+
+    theme.draw_rect(sx, sy, w, h, bg, 5.0f, border, 1.0f if border != 0 else 0.0f);
+
+    font_sz := 13.0f * settings.g_settings.ui_scale;
+    tw := theme.measure_text(label, font_sz);
+    tx := sx + (w - tw) * 0.5f;
+    ty := sy + (h - font_sz) * 0.5f;
+    theme.draw_text(tx, ty, label, font_sz, fg);
+
+    res: u32 = 0;
+    if hovered do res |= cast(u32) abi.WidgetState.Hovered;
+    if active  do res |= cast(u32) abi.WidgetState.Active;
+    if clicked do res |= cast(u32) abi.WidgetState.Clicked;
+    return res;
+}
+
+/// Renders an editable text input box, mutating `buf[0..*len]` in-place.
+ui_input :: (id: u32, x, y, w, h: f32, buf: [] u8, len: &u32, placeholder: str) -> u32 {
+    sx := to_screen_x(x);
+    sy := to_screen_y(y);
+
+    hovered := g_ui.hovered &&
+               point_in_clip(g_ui.mouse_x, g_ui.mouse_y) &&
+               point_in_rect(g_ui.mouse_x, g_ui.mouse_y, sx, sy, w, h);
+
+    if g_ui.mouse_pressed {
+        if hovered {
+            g_ui.focused_input_win = g_ui.window_id;
+            g_ui.focused_input_id  = id;
+            g_ui.blink_timer = 0.0;
+        } elseif g_ui.focused_input_win == g_ui.window_id && g_ui.focused_input_id == id {
+            g_ui.focused_input_win = 0;
+            g_ui.focused_input_id  = 0;
+        }
+    }
+
+    is_focused := g_ui.focused && g_ui.focused_input_win == g_ui.window_id && g_ui.focused_input_id == id;
+    res: u32 = 0;
+    if hovered    do res |= cast(u32) abi.WidgetState.Hovered;
+    if is_focused do res |= cast(u32) abi.WidgetState.Focused;
+
+    cur_len := cast(i32) *len;
+    if cur_len > buf.count do cur_len = buf.count;
+
+    if is_focused {
+        for i in 0 .. g_ui.typed_count {
+            ch := g_ui.typed_chars[i];
+            if ch >= 32 && ch < 127 && cur_len < buf.count {
+                buf[cur_len] = cast(u8) ch;
+                cur_len += 1;
+                res |= cast(u32) abi.WidgetState.Changed;
+                g_ui.blink_timer = 0.0;
+            }
+        }
+        if g_ui.key_backspace && cur_len > 0 {
+            cur_len -= 1;
+            res |= cast(u32) abi.WidgetState.Changed;
+            g_ui.blink_timer = 0.0;
+        }
+        if g_ui.key_enter {
+            res |= cast(u32) abi.WidgetState.Submitted;
+        }
+    }
+
+    *len = cast(u32) cur_len;
+
+    bg := theme.get_color(.BgBase);
+    border := theme.get_color(.BorderFocused) if is_focused else theme.get_color(.Border);
+    theme.draw_rect(sx, sy, w, h, bg, 4.0f, border, 1.5f if is_focused else 1.0f);
+
+    push_clip_screen(sx + 6.0f, sy + 2.0f, w - 12.0f, h - 4.0f);
+    font_sz := 13.0f * settings.g_settings.ui_scale;
+    ty := sy + (h - font_sz) * 0.5f;
+    if cur_len > 0 {
+        txt := str.{ buf.data, cur_len };
+        theme.draw_text(sx + 8.0, ty, txt, font_sz, theme.get_color(.TextPrimary));
+        if is_focused && (cast(i32) (g_ui.blink_timer * 2.0) % 2) == 0 {
+            cx := sx + 8.0 + theme.measure_text(txt, font_sz) + 1.0;
+            raylib.DrawRectangle(cast(i32) cx, cast(i32) (sy + 5.0), 2, cast(i32) (h - 10.0), theme.get_rl(.Accent));
+        }
+    } else {
+        theme.draw_text(sx + 8.0, ty, placeholder, font_sz, theme.get_color(.TextDisabled));
+        if is_focused && (cast(i32) (g_ui.blink_timer * 2.0) % 2) == 0 {
+            raylib.DrawRectangle(cast(i32) (sx + 8.0), cast(i32) (sy + 5.0), 2, cast(i32) (h - 10.0), theme.get_rl(.Accent));
+        }
+    }
+    ui_pop_clip();
+
+    return res;
+}
+
+/// Simple cycle dropdown (`items` separated by `\n`). Returns new selected index.
+ui_dropdown :: (id: u32, x, y, w, h: f32, items_str: str, selected_idx: i32) -> i32 {
+    // Count items & find selected item label
+    count: i32 = 0;
+    sel_label := "";
+    start := 0;
+    for i in 0 .. (items_str.count + 1) {
+        if i == items_str.count || items_str[i] == '\n' {
+            item := items_str[start .. i];
+            if count == selected_idx do sel_label = item;
+            count += 1;
+            start = i + 1;
+        }
+    }
+    if count <= 0 do return 0;
+
+    sx := to_screen_x(x);
+    sy := to_screen_y(y);
+    hovered := g_ui.hovered &&
+               point_in_clip(g_ui.mouse_x, g_ui.mouse_y) &&
+               point_in_rect(g_ui.mouse_x, g_ui.mouse_y, sx, sy, w, h);
+
+    bg := theme.get_color(.BgHover) if hovered else theme.get_color(.BgSurface);
+    theme.draw_rect(sx, sy, w, h, bg, 4.0, theme.get_color(.Border), 1.0);
+    theme.draw_text(sx + 8.0, sy + (h - 13.0) * 0.5, sel_label, 13.0, theme.get_color(.TextPrimary));
+    theme.draw_text(sx + w - 18.0, sy + (h - 13.0) * 0.5, "v", 12.0, theme.get_color(.TextSecondary));
+
+    if hovered && g_ui.mouse_pressed {
+        return (selected_idx + 1) % count;
+    }
+    return selected_idx;
+}
+
+ui_scroll_area_begin :: (id: u32, x, y, w, h, content_h: f32, scroll_y: &f32) {
+    sx := to_screen_x(x);
+    sy := to_screen_y(y);
+
+    if g_ui.hovered && point_in_rect(g_ui.mouse_x, g_ui.mouse_y, sx, sy, w, h) && g_ui.wheel_y != 0.0 {
+        *scroll_y -= g_ui.wheel_y * 28.0;
+    }
+    max_scroll := content_h - h;
+    if max_scroll < 0.0 do max_scroll = 0.0;
+    if *scroll_y < 0.0 do *scroll_y = 0.0;
+    if *scroll_y > max_scroll do *scroll_y = max_scroll;
+
+    // Subtle scrollbar track if scrollable
+    if content_h > h && h > 16.0 {
+        ratio := h / content_h;
+        bar_h := h * ratio;
+        if bar_h < 20.0 do bar_h = 20.0;
+        bar_y := sy + (*scroll_y / max_scroll) * (h - bar_h);
+        theme.draw_rect(sx + w - 5.0, bar_y, 4.0, bar_h, 0x6C708688, 2.0);
+    }
+
+    push_clip_screen(sx, sy, w, h);
+    g_ui.scroll_offset += *scroll_y;
+}
+
+ui_scroll_area_end :: () {
+    g_ui.scroll_offset = 0.0;
+    ui_pop_clip();
+}
+
+ui_table_begin :: (id: u32, x, y, w, h: f32, col_count: u32, headers: str, col_widths: [] f32) {
+    sx := to_screen_x(x);
+    sy := to_screen_y(y);
+
+    cols := col_count;
+    if cols > 16 do cols = 16;
+    if cols == 0 do cols = 1;
+
+    g_ui.table.active = true;
+    g_ui.table.id = id;
+    g_ui.table.x = sx;
+    g_ui.table.y = sy;
+    g_ui.table.w = w;
+    g_ui.table.h = h;
+    g_ui.table.col_count = cols;
+    g_ui.table.row_index = 0;
+
+    for i in 0 .. cols {
+        if cast(i32) i < col_widths.count && col_widths[i] > 0.0 {
+            g_ui.table.col_widths[i] = col_widths[i];
+        } else {
+            g_ui.table.col_widths[i] = w / cast(f32) cols;
+        }
+    }
+
+    // Header bar
+    header_h: f32 = 24.0;
+    theme.draw_rect(sx, sy, w, header_h, theme.get_color(.BgHeader), 0.0, theme.get_color(.Border), 1.0);
+    cx := sx;
+    col_i: u32 = 0;
+    start := 0;
+    for i in 0 .. (headers.count + 1) {
+        if i == headers.count || headers[i] == '\t' {
+            if col_i < cols {
+                label := headers[start .. i];
+                theme.draw_text(cx + 8.0, sy + 5.0, label, 12.0, theme.get_color(.TextSecondary));
+                cx += g_ui.table.col_widths[col_i];
+                col_i += 1;
+            }
+            start = i + 1;
+        }
+    }
+
+    push_clip_screen(sx, sy + header_h, w, h - header_h);
+    g_ui.table.cur_y = sy + header_h;
+}
+
+ui_table_row :: (row_id: u32, cells: str, flags: u32) -> u32 {
+    if !g_ui.table.active do return 0;
+
+    row_h: f32 = 24.0;
+    rx := g_ui.table.x;
+    ry := g_ui.table.cur_y;
+    rw := g_ui.table.w;
+    rflags := cast(abi.TableRowFlags) flags;
+
+    hovered := g_ui.hovered &&
+               point_in_clip(g_ui.mouse_x, g_ui.mouse_y) &&
+               point_in_rect(g_ui.mouse_x, g_ui.mouse_y, rx, ry, rw, row_h);
+
+    bg: u32 = 0x00000000;
+    if rflags & .Selected {
+        bg = theme.get_color(.BgSelection);
+    } elseif hovered {
+        bg = theme.get_color(.BgHover);
+    } elseif (g_ui.table.row_index % 2) == 1 {
+        bg = 0x1E1E2E66;
+    }
+    if (bg & 0xFF) != 0 {
+        theme.draw_rect(rx, ry, rw, row_h, bg);
+    }
+
+    fg := theme.get_color(.TextSecondary) if (flags & cast(u32) abi.TableRowFlags.Muted) != 0 else theme.get_color(.TextPrimary);
+    cx := rx;
+    col_i: u32 = 0;
+    start := 0;
+    for i in 0 .. (cells.count + 1) {
+        if i == cells.count || cells[i] == '\t' {
+            if col_i < g_ui.table.col_count {
+                cell := cells[start .. i];
+                theme.draw_text(cx + 8.0, ry + 5.0, cell, 13.0, fg);
+                cx += g_ui.table.col_widths[col_i];
+                col_i += 1;
+            }
+            start = i + 1;
+        }
+    }
+
+    g_ui.table.cur_y += row_h;
+    g_ui.table.row_index += 1;
+
+    res: u32 = 0;
+    if hovered do res |= cast(u32) abi.WidgetState.Hovered;
+    if hovered && g_ui.mouse_pressed do res |= cast(u32) abi.WidgetState.Clicked;
+    if hovered && g_ui.mouse_dbl     do res |= cast(u32) abi.WidgetState.DoubleClicked;
+    return res;
+}
+
+ui_table_end :: () {
+    if !g_ui.table.active do return;
+    g_ui.table.active = false;
+    ui_pop_clip();
+}
+
+ui_texture_load :: (path: str) -> u32 {
+    if path.count == 0 do return 0;
+    cpath := theme.to_temp_cstr(path);
+    if !raylib.FileExists(cpath) do return 0;
+
+    for i in 0 .. 64 {
+        if !g_ui.textures[i].in_use {
+            slot := &g_ui.textures[i];
+            raylib.LoadTexture(cpath, &slot.texture);
+            if slot.texture.id == 0 do return 0;
+            slot.in_use = true;
+            slot.is_anim = false;
+            return cast(u32) (i + 1);
+        }
+    }
+    return 0;
+}
+
+ui_texture_unload :: (handle: u32) {
+    if handle == 0 || handle > 64 do return;
+    slot := &g_ui.textures[handle - 1];
+    if !slot.in_use do return;
+    raylib.UnloadTexture(slot.texture);
+    slot.in_use = false;
+}
+
+ui_draw_texture :: (handle: u32, x, y, w, h: f32, tint_rgba: u32) {
+    if handle == 0 || handle > 64 do return;
+    slot := &g_ui.textures[handle - 1];
+    if !slot.in_use do return;
+    src := raylib.Rectangle.{ 0, 0, cast(f32) slot.texture.width, cast(f32) slot.texture.height };
+    dst := raylib.Rectangle.{ to_screen_x(x), to_screen_y(y), w, h };
+    raylib.DrawTexturePro(slot.texture, src, dst, .{ 0, 0 }, 0.0, theme.rgba_to_rl(tint_rgba));
+}

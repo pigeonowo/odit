@@ -1,0 +1,281 @@
+package odit.theme
+
+// =============================================================================
+// Onyx Editor ("odit") — Theme Presets, Crisp Fonts & Safe Raylib Text Helpers
+// =============================================================================
+
+use core { memory, alloc }
+use raylib
+use odit.abi
+
+Theme :: struct {
+    name:          str;
+    font_mono:     raylib.Font;
+    font_loaded:   bool;
+    colors:        [16] u32;
+
+    // Syntax highlighting colors (0xRRGGBBAA)
+    syn_default:   u32;
+    syn_keyword:   u32;
+    syn_directive: u32;
+    syn_type:      u32;
+    syn_string:    u32;
+    syn_number:    u32;
+    syn_comment:   u32;
+    syn_operator:  u32;
+    syn_func:      u32;
+    syn_tag:       u32;
+}
+
+g_theme: Theme;
+
+rgba_to_rl :: (c: u32) -> raylib.Color {
+    return .{
+        r = cast(u8) ((c >> 24) & 0xFF),
+        g = cast(u8) ((c >> 16) & 0xFF),
+        b = cast(u8) ((c >> 8)  & 0xFF),
+        a = cast(u8) (c & 0xFF),
+    };
+}
+
+theme_apply_preset :: (preset_name: str) {
+    if str.equal(preset_name, "tokyo_night") {
+        g_theme.name = "tokyo_night";
+        g_theme.colors[cast(u32) abi.ThemeColor.BgBase]        = 0x1A1B26FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgPanel]       = 0x16161EFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgHeader]      = 0x1F2335FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgSurface]     = 0x24283BFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgHover]       = 0x292E42FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgSelection]   = 0x364A82FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Border]        = 0x292E42FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BorderFocused] = 0x7AA2F7FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.TextPrimary]   = 0xC0CAF5FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.TextSecondary] = 0x9AA5CEFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.TextDisabled]  = 0x565F89FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Accent]        = 0xBB9AF7FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Success]       = 0x9ECE6AFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Warning]       = 0xE0AF68FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Error]         = 0xF7768EFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Info]          = 0x7DCFFFFF;
+
+        g_theme.syn_default   = 0xC0CAF5FF;
+        g_theme.syn_keyword   = 0xBB9AF7FF;
+        g_theme.syn_directive = 0xFF9E64FF;
+        g_theme.syn_type      = 0x2AC3DEFF;
+        g_theme.syn_string    = 0x9ECE6AFF;
+        g_theme.syn_number    = 0xFF9E64FF;
+        g_theme.syn_comment   = 0x565F89FF;
+        g_theme.syn_operator  = 0x89DDFFFF;
+        g_theme.syn_func      = 0x7AA2F7FF;
+        g_theme.syn_tag       = 0xF7768EFF;
+        return;
+    }
+
+    if str.equal(preset_name, "gruvbox") {
+        g_theme.name = "gruvbox";
+        g_theme.colors[cast(u32) abi.ThemeColor.BgBase]        = 0x1D2021FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgPanel]       = 0x282828FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgHeader]      = 0x32302FFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgSurface]     = 0x3C3836FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgHover]       = 0x504945FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgSelection]   = 0x665C54FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Border]        = 0x504945FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BorderFocused] = 0xFABD2FFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.TextPrimary]   = 0xEBDBB2FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.TextSecondary] = 0xBDAE93FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.TextDisabled]  = 0x928374FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Accent]        = 0xFE8019FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Success]       = 0xB8BB26FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Warning]       = 0xFABD2FFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Error]         = 0xFB4934FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Info]          = 0x83A598FF;
+
+        g_theme.syn_default   = 0xEBDBB2FF;
+        g_theme.syn_keyword   = 0xFB4934FF;
+        g_theme.syn_directive = 0xFE8019FF;
+        g_theme.syn_type      = 0xFABD2FFF;
+        g_theme.syn_string    = 0xB8BB26FF;
+        g_theme.syn_number    = 0xD3869BFF;
+        g_theme.syn_comment   = 0x928374FF;
+        g_theme.syn_operator  = 0x8EC07CFF;
+        g_theme.syn_func      = 0x83A598FF;
+        g_theme.syn_tag       = 0xD3869BFF;
+        return;
+    }
+
+    if str.equal(preset_name, "light") {
+        g_theme.name = "light";
+        g_theme.colors[cast(u32) abi.ThemeColor.BgBase]        = 0xEFF1F5FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgPanel]       = 0xE6E9EFFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgHeader]      = 0xDCE0E8FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgSurface]     = 0xCCD0DAFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgHover]       = 0xBCC0CCFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BgSelection]   = 0xACB0BEFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Border]        = 0xBCC0CCFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.BorderFocused] = 0x1E66F5FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.TextPrimary]   = 0x4C4F69FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.TextSecondary] = 0x6C6F85FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.TextDisabled]  = 0x9CA0B0FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Accent]        = 0x8839EFFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Success]       = 0x40A02BFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Warning]       = 0xDF8E1DFF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Error]         = 0xD20F39FF;
+        g_theme.colors[cast(u32) abi.ThemeColor.Info]          = 0x04A5E5FF;
+
+        g_theme.syn_default   = 0x4C4F69FF;
+        g_theme.syn_keyword   = 0x8839EFFF;
+        g_theme.syn_directive = 0xFE640BFF;
+        g_theme.syn_type      = 0xDF8E1DFF;
+        g_theme.syn_string    = 0x40A02BFF;
+        g_theme.syn_number    = 0xFE640BFF;
+        g_theme.syn_comment   = 0x8C8FA1FF;
+        g_theme.syn_operator  = 0x04A5E5FF;
+        g_theme.syn_func      = 0x1E66F5FF;
+        g_theme.syn_tag       = 0xEA76CBFF;
+        return;
+    }
+
+    // Default: Catppuccin Mocha
+    g_theme.name = "mocha";
+    g_theme.colors[cast(u32) abi.ThemeColor.BgBase]        = 0x11111BFF;
+    g_theme.colors[cast(u32) abi.ThemeColor.BgPanel]       = 0x181825FF;
+    g_theme.colors[cast(u32) abi.ThemeColor.BgHeader]      = 0x1E1E2EFF;
+    g_theme.colors[cast(u32) abi.ThemeColor.BgSurface]     = 0x242538FF;
+    g_theme.colors[cast(u32) abi.ThemeColor.BgHover]       = 0x313244FF;
+    g_theme.colors[cast(u32) abi.ThemeColor.BgSelection]   = 0x45475AFF;
+    g_theme.colors[cast(u32) abi.ThemeColor.Border]        = 0x313244FF;
+    g_theme.colors[cast(u32) abi.ThemeColor.BorderFocused] = 0x89B4FAFF;
+    g_theme.colors[cast(u32) abi.ThemeColor.TextPrimary]   = 0xCDD6F4FF;
+    g_theme.colors[cast(u32) abi.ThemeColor.TextSecondary] = 0x9399B2FF;
+    g_theme.colors[cast(u32) abi.ThemeColor.TextDisabled]  = 0x6C7086FF;
+    g_theme.colors[cast(u32) abi.ThemeColor.Accent]        = 0xB4BEFEFF;
+    g_theme.colors[cast(u32) abi.ThemeColor.Success]       = 0xA6E3A1FF;
+    g_theme.colors[cast(u32) abi.ThemeColor.Warning]       = 0xF9E2AFFF;
+    g_theme.colors[cast(u32) abi.ThemeColor.Error]         = 0xF38BA8FF;
+    g_theme.colors[cast(u32) abi.ThemeColor.Info]          = 0x89DCEBFF;
+
+    g_theme.syn_default   = 0xCDD6F4FF;
+    g_theme.syn_keyword   = 0xCBA6F7FF;
+    g_theme.syn_directive = 0xFAB387FF;
+    g_theme.syn_type      = 0xF9E2AFFF;
+    g_theme.syn_string    = 0xA6E3A1FF;
+    g_theme.syn_number    = 0xFAB387FF;
+    g_theme.syn_comment   = 0x6C7086FF;
+    g_theme.syn_operator  = 0x89DCEBFF;
+    g_theme.syn_func      = 0x89B4FAFF;
+    g_theme.syn_tag       = 0xF5C2E7FF;
+}
+
+theme_load_font :: (custom_font_path: str = "") {
+    if g_theme.font_loaded {
+        raylib.UnloadFont(g_theme.font_mono);
+        g_theme.font_loaded = false;
+    }
+
+    empty_cp: [] i32 = .{ null, 0 };
+
+    // Try user-configured font path first
+    if custom_font_path.count > 0 {
+        cpath := to_temp_cstr(custom_font_path);
+        if raylib.FileExists(cpath) {
+            raylib.LoadFontEx(cpath, 48, empty_cp, &g_theme.font_mono);
+            if g_theme.font_mono.texture.id != 0 {
+                raylib.SetTextureFilter(g_theme.font_mono.texture, .BILINEAR);
+                g_theme.font_loaded = true;
+                return;
+            }
+        }
+    }
+
+    // Fallback to bundled or system monospace fonts (rasterized at 48px for sharp scaling)
+    font_candidates := .[
+        "assets/fonts/JetBrainsMono-Regular.ttf\0",
+        "assets/fonts/NotoSansMono-Regular.ttf\0",
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf\0",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf\0",
+    ];
+
+    for path in font_candidates {
+        cpath := cast(cstr) path.data;
+        if raylib.FileExists(cpath) {
+            raylib.LoadFontEx(cpath, 48, empty_cp, &g_theme.font_mono);
+            if g_theme.font_mono.texture.id != 0 {
+                raylib.SetTextureFilter(g_theme.font_mono.texture, .BILINEAR);
+                g_theme.font_loaded = true;
+                return;
+            }
+        }
+    }
+
+    raylib.GetFontDefault(&g_theme.font_mono);
+}
+
+theme_init :: (preset_name: str = "mocha", custom_font_path: str = "") {
+    theme_apply_preset(preset_name);
+    theme_load_font(custom_font_path);
+}
+
+theme_shutdown :: () {
+    if g_theme.font_loaded {
+        raylib.UnloadFont(g_theme.font_mono);
+        g_theme.font_loaded = false;
+    }
+}
+
+get_color :: (role: abi.ThemeColor) -> u32 {
+    idx := cast(u32) role;
+    if idx >= 16 do return 0xFFFFFFFF;
+    return g_theme.colors[idx];
+}
+
+get_rl :: (role: abi.ThemeColor) -> raylib.Color {
+    return rgba_to_rl(get_color(role));
+}
+
+/// Null-terminates an Onyx `str` into temporary memory for Raylib C calls.
+to_temp_cstr :: (s: str) -> cstr {
+    buf := make([] u8, s.count + 1, context.temp_allocator);
+    if s.count > 0 {
+        memory.copy(buf.data, s.data, s.count);
+    }
+    buf[s.count] = 0;
+    return cast(cstr) buf.data;
+}
+
+measure_text :: (text: str, font_size: f32) -> f32 {
+    if text.count == 0 do return 0.0;
+    cs := to_temp_cstr(text);
+    sz: raylib.Vector2;
+    raylib.MeasureTextEx(g_theme.font_mono, cs, font_size, 0.5, &sz);
+    return sz.x;
+}
+
+draw_text :: (x, y: f32, text: str, font_size: f32, rgba: u32) {
+    if text.count == 0 do return;
+    cs := to_temp_cstr(text);
+    raylib.DrawTextEx(g_theme.font_mono, cs, .{ x, y }, font_size, 0.5, rgba_to_rl(rgba));
+}
+
+draw_rect :: (x, y, w, h: f32, fill_rgba: u32, radius: f32 = 0.0, border_rgba: u32 = 0, border_w: f32 = 0.0) {
+    rec := raylib.Rectangle.{ x, y, w, h };
+    if (fill_rgba & 0xFF) != 0 {
+        if radius > 0.0 && w > 0.0 && h > 0.0 {
+            min_dim := w if w < h else h;
+            roundness := (radius * 2.0) / min_dim;
+            if roundness > 1.0 do roundness = 1.0;
+            raylib.DrawRectangleRounded(rec, roundness, 8, rgba_to_rl(fill_rgba));
+        } else {
+            raylib.DrawRectangleRec(rec, rgba_to_rl(fill_rgba));
+        }
+    }
+    if border_w > 0.0 && (border_rgba & 0xFF) != 0 {
+        if radius > 0.0 && w > 0.0 && h > 0.0 {
+            min_dim := w if w < h else h;
+            roundness := (radius * 2.0) / min_dim;
+            if roundness > 1.0 do roundness = 1.0;
+            raylib.DrawRectangleRoundedLines(rec, roundness, 8, border_w, rgba_to_rl(border_rgba));
+        } else {
+            raylib.DrawRectangleLinesEx(rec, border_w, rgba_to_rl(border_rgba));
+        }
+    }
+}

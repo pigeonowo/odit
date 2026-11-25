@@ -1,0 +1,764 @@
+// =============================================================================
+// Onyx Editor ("odit") — Main Native Host Application (Phase 1)
+// =============================================================================
+// Architecture: "Window = WASM Plugin"
+//   - Left pane:  Core Onyx Code Editor (syntax highlighting, modal + Ctrl+S/Z)
+//   - Right grid: Dynamically loaded `.wasm` plugin mini-app windows
+//   - Overlay:    Command-first `Ctrl+P` fuzzy Command Palette
+
+#load "./../lib/packages"
+#load "./../abi/abi.onyx"
+#load "./settings.onyx"
+#load "./theme.onyx"
+#load "./services/workspace.onyx"
+#load "./services/compiler_wat.onyx"
+#load "./services/docs_index.onyx"
+#load "./wm/layout.onyx"
+#load "./lsp/client.onyx"
+#load "./ui/renderer.onyx"
+#load "./ui/palette.onyx"
+#load "./ui/file_finder.onyx"
+#load "./ui/settings_view.onyx"
+#load "./editor/buffer.onyx"
+#load "./editor/lexer.onyx"
+#load "./editor/view.onyx"
+#load "./plugin/loader.onyx"
+#load "./plugin/host_abi.onyx"
+
+use core { package, os, println, printf, Array, alloc }
+use raylib
+use odit.abi
+use odit.settings
+use odit.theme
+use odit.services
+use odit.wm
+use odit.lsp
+use odit.ui
+use odit.editor
+use odit.plugin
+
+AppState :: struct {
+    workspace_root:  str;
+    window_mgr:      wm.WindowManager;
+    ed:              editor.EditorView;
+    lsp_client:      lsp.LspClient;
+    palette:         ui.CommandPalette;
+    file_finder:     ui.FileFinder;
+    settings_view:   ui.SettingsView;
+    loaded_plugins:  [..] plugin.LoadedPlugin;
+    available_wasms: [..] str;
+    headless_test:   bool;
+}
+
+g_app: AppState;
+
+discover_plugins :: () {
+    Array.clear(&g_app.available_wasms);
+    plugin_dir := "build/plugins";
+    if !os.Directory.exists(plugin_dir) do return;
+
+    for entry in os.Directory.list(plugin_dir) {
+        name := entry->name();
+        if str.ends_with(name, ".wasm") {
+            full := core.tprintf("{}/{}", plugin_dir, name);
+            g_app.available_wasms << str.copy(full);
+            cmd_id := core.tprintf("plugin.spawn.{}", name);
+            label  := core.tprintf("Plugin: Open {}", name);
+            ui.palette_register(&g_app.palette, cmd_id, label, "", 0);
+        }
+    }
+}
+
+spawn_plugin_from_wasm :: (wasm_path: str) -> u32 {
+    loaded := plugin.plugin_load_from_file(wasm_path);
+    if !loaded do return 0;
+
+    lp := loaded->unwrap();
+    wid := wm.wm_add_pane(&g_app.window_mgr, lp.handle, lp.manifest.id, lp.manifest.title, lp.manifest.event_mask);
+    g_app.loaded_plugins << lp;
+
+    plugin.wasm_plugin_init(lp.handle, wid);
+    printf("[odit] Spawned WASM plugin '{}' (window_id={}, handle={})\n", lp.manifest.title, wid, lp.handle);
+    return wid;
+}
+
+close_plugin_window :: (wid: u32) {
+    for i in 0 .. g_app.window_mgr.panes.count {
+        if g_app.window_mgr.panes[i].window_id == wid {
+            handle := g_app.window_mgr.panes[i].plugin_handle;
+            ui.palette_unregister_window(&g_app.palette, wid);
+            plugin.wasm_plugin_shutdown(handle, wid);
+
+            for pi in 0 .. g_app.loaded_plugins.count {
+                if g_app.loaded_plugins[pi].handle == handle {
+                    if g_app.loaded_plugins[pi].ctx_guest_ptr != 0 {
+                        plugin.wasm_plugin_free(handle, g_app.loaded_plugins[pi].ctx_guest_ptr);
+                    }
+                    plugin.wasm_plugin_unload(handle);
+                    Array.remove_at(&g_app.loaded_plugins, pi);
+                    break;
+                }
+            }
+
+            Array.remove_at(&g_app.window_mgr.panes, i);
+            if g_app.window_mgr.focused_window_id == wid {
+                g_app.window_mgr.focused_window_id = 0;
+            }
+            wm.wm_notify(&g_app.window_mgr, 1, "Closed plugin window");
+            return;
+        }
+    }
+}
+
+reload_all_plugins :: () {
+    paths := make([..] str, context.temp_allocator);
+    for &lp in g_app.loaded_plugins {
+        paths << str.copy(lp.wasm_path, context.temp_allocator);
+    }
+    while g_app.window_mgr.panes.count > 0 {
+        close_plugin_window(g_app.window_mgr.panes[0].window_id);
+    }
+    discover_plugins();
+    for p in paths {
+        spawn_plugin_from_wasm(p);
+    }
+    wm.wm_notify(&g_app.window_mgr, 1, "Reloaded WASM plugins");
+}
+
+broadcast_event :: (mask_bit: abi.EventMask, ev_type: abi.EventType, payload: [] u8) {
+    for &pane in g_app.window_mgr.panes {
+        if (pane.event_mask & cast(u32) mask_bit) != 0 {
+            plugin.plugin_send_event_bytes(pane.plugin_handle, pane.window_id, ev_type, payload);
+        }
+    }
+}
+
+register_builtin_commands :: () {
+    ui.palette_register(&g_app.palette, "file.quick_open",      "File: Quick Open (Fuzzy File Finder)",   "Ctrl+O",   0);
+    ui.palette_register(&g_app.palette, "settings.open",        "Settings: Open Settings Panel",          "Ctrl+,",   0);
+    ui.palette_register(&g_app.palette, "settings.font_up",     "Settings: Increase Font Size",           "Ctrl+=",   0);
+    ui.palette_register(&g_app.palette, "settings.font_down",   "Settings: Decrease Font Size",           "Ctrl+-",   0);
+    ui.palette_register(&g_app.palette, "settings.font_reset",  "Settings: Reset Font Size (18px)",       "Ctrl+0",   0);
+    ui.palette_register(&g_app.palette, "settings.scale_up",    "Settings: Increase UI Scale",            "",         0);
+    ui.palette_register(&g_app.palette, "settings.scale_down",  "Settings: Decrease UI Scale",            "",         0);
+    ui.palette_register(&g_app.palette, "settings.cycle_theme", "Settings: Cycle Color Theme",            "",         0);
+    ui.palette_register(&g_app.palette, "settings.edit_json",   "Settings: Open odit.json in Editor",     "",         0);
+    ui.palette_register(&g_app.palette, "settings.reload",      "Settings: Reload odit.json",             "",         0);
+    ui.palette_register(&g_app.palette, "editor.save",          "Editor: Save Active File",               "Ctrl+S",   0);
+    ui.palette_register(&g_app.palette, "editor.toggle_modal",  "Editor: Toggle Modal Mode (Normal/Insert)", "",      0);
+    ui.palette_register(&g_app.palette, "editor.undo",          "Editor: Undo",                           "Ctrl+Z",   0);
+    ui.palette_register(&g_app.palette, "lsp.definition",       "LSP: Go to Definition",                  "F12 / gd", 0);
+    ui.palette_register(&g_app.palette, "lsp.hover",            "LSP: Show Hover Info",                   "K",        0);
+    ui.palette_register(&g_app.palette, "lsp.completion",       "LSP: Trigger Completion",                "Ctrl+Spc", 0);
+    ui.palette_register(&g_app.palette, "lsp.next_diag",        "LSP: Jump to Next Diagnostic",           "F8",       0);
+    ui.palette_register(&g_app.palette, "lsp.restart",          "LSP: Restart Onyx Language Server",      "",         0);
+    ui.palette_register(&g_app.palette, "wm.cycle_focus",       "Window: Cycle Pane Focus",               "Ctrl+Tab", 0);
+    ui.palette_register(&g_app.palette, "wm.close_focused",     "Window: Close Focused Plugin Pane",      "",         0);
+    ui.palette_register(&g_app.palette, "plugin.reload_all",    "Plugins: Reload All .wasm Plugins",      "",         0);
+}
+
+apply_live_settings :: () {
+    settings.settings_clamp(&settings.g_settings);
+    theme.theme_apply_preset(settings.g_settings.theme);
+    editor.editor_sync_settings(&g_app.ed);
+    if !settings.g_settings.modal_editing {
+        g_app.ed.mode = .Insert;
+    }
+}
+
+adjust_font_size :: (delta: f32) {
+    settings.g_settings.editor_font_size += delta;
+    apply_live_settings();
+    settings.settings_save();
+    wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Font size: {}px", cast(i32) settings.g_settings.editor_font_size));
+}
+
+execute_command :: (cmd: &ui.CommandEntry) {
+    if cmd.window_id > 0 {
+        // Dispatch command to owning WASM plugin
+        if pane := wm.wm_find_pane(&g_app.window_mgr, cmd.window_id); pane != null {
+            payload := core.tprintf("{{\"id\":\"{}\",\"arg\":\"\"}}", cmd.id);
+            plugin.plugin_send_event_bytes(pane.plugin_handle, pane.window_id, .CommandInvoked, payload);
+        }
+        return;
+    }
+
+    if str.equal(cmd.id, "file.quick_open") {
+        ui.finder_open(&g_app.file_finder, g_app.workspace_root);
+    } elseif str.equal(cmd.id, "settings.open") {
+        g_app.settings_view.open = true;
+    } elseif str.equal(cmd.id, "settings.font_up") {
+        adjust_font_size(2.0f);
+    } elseif str.equal(cmd.id, "settings.font_down") {
+        adjust_font_size(-2.0f);
+    } elseif str.equal(cmd.id, "settings.font_reset") {
+        settings.g_settings.editor_font_size = 18.0f;
+        apply_live_settings();
+        settings.settings_save();
+        wm.wm_notify(&g_app.window_mgr, 1, "Font size reset to 18px");
+    } elseif str.equal(cmd.id, "settings.scale_up") {
+        settings.g_settings.ui_scale += 0.1f;
+        apply_live_settings();
+        settings.settings_save();
+        wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("UI scale: {}%", cast(i32) (settings.g_settings.ui_scale * 100.0f + 0.5f)));
+    } elseif str.equal(cmd.id, "settings.scale_down") {
+        settings.g_settings.ui_scale -= 0.1f;
+        apply_live_settings();
+        settings.settings_save();
+        wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("UI scale: {}%", cast(i32) (settings.g_settings.ui_scale * 100.0f + 0.5f)));
+    } elseif str.equal(cmd.id, "settings.cycle_theme") {
+        t := settings.settings_cycle_theme();
+        apply_live_settings();
+        settings.settings_save();
+        wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Theme: {}", t));
+    } elseif str.equal(cmd.id, "settings.edit_json") {
+        if !os.file_exists(settings.SETTINGS_FILE) do settings.settings_save();
+        if editor.buffer_load_file(&g_app.ed.buf, settings.SETTINGS_FILE) {
+            g_app.window_mgr.focused_window_id = 0;
+            wm.wm_notify(&g_app.window_mgr, 1, "Opened odit.json (save with Ctrl+S to apply)");
+        }
+    } elseif str.equal(cmd.id, "settings.reload") {
+        settings.settings_load();
+        apply_live_settings();
+        theme.theme_load_font(settings.g_settings.font_path);
+        wm.wm_notify(&g_app.window_mgr, 1, "Reloaded odit.json");
+    } elseif str.equal(cmd.id, "editor.save") {
+        if editor.buffer_save_file(&g_app.ed.buf) {
+            if str.equal(g_app.ed.buf.path, settings.SETTINGS_FILE) {
+                settings.settings_load();
+                apply_live_settings();
+                theme.theme_load_font(settings.g_settings.font_path);
+                wm.wm_notify(&g_app.window_mgr, 1, "Saved & applied odit.json");
+            } else {
+                wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Saved {}", g_app.ed.buf.path));
+            }
+        } else {
+            wm.wm_notify(&g_app.window_mgr, 3, "Failed to save file");
+        }
+    } elseif str.equal(cmd.id, "editor.toggle_modal") {
+        settings.g_settings.modal_editing = !settings.g_settings.modal_editing;
+        apply_live_settings();
+        settings.settings_save();
+        wm.wm_notify(&g_app.window_mgr, 1,
+            "Modal editing enabled" if settings.g_settings.modal_editing else "Always-Insert mode enabled");
+    } elseif str.equal(cmd.id, "editor.undo") {
+        editor.buffer_undo(&g_app.ed.buf);
+    } elseif str.equal(cmd.id, "lsp.definition") {
+        lsp.lsp_request_definition(&g_app.lsp_client, g_app.ed.buf.path, g_app.ed.buf.cursor_line, g_app.ed.buf.cursor_col);
+    } elseif str.equal(cmd.id, "lsp.hover") {
+        lsp.lsp_request_hover(&g_app.lsp_client, g_app.ed.buf.path, g_app.ed.buf.cursor_line, g_app.ed.buf.cursor_col);
+    } elseif str.equal(cmd.id, "lsp.completion") {
+        lsp.lsp_request_completion(&g_app.lsp_client, g_app.ed.buf.path, g_app.ed.buf.cursor_line, g_app.ed.buf.cursor_col);
+    } elseif str.equal(cmd.id, "lsp.next_diag") {
+        jump_next_diagnostic();
+    } elseif str.equal(cmd.id, "lsp.restart") {
+        lsp.lsp_start(&g_app.lsp_client);
+        wm.wm_notify(&g_app.window_mgr, 1, "Restarting onyx-lsp...");
+    } elseif str.equal(cmd.id, "wm.cycle_focus") {
+        wm.wm_cycle_focus(&g_app.window_mgr);
+    } elseif str.equal(cmd.id, "wm.close_focused") {
+        if g_app.window_mgr.focused_window_id > 0 {
+            close_plugin_window(g_app.window_mgr.focused_window_id);
+        }
+    } elseif str.equal(cmd.id, "plugin.reload_all") {
+        reload_all_plugins();
+    } elseif str.starts_with(cmd.id, "plugin.spawn.") {
+        fname := cmd.id["plugin.spawn.".count .. cmd.id.count];
+        wasm_path := core.tprintf("build/plugins/{}", fname);
+        if spawn_plugin_from_wasm(wasm_path) > 0 {
+            wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Opened {}", fname));
+        } else {
+            wm.wm_notify(&g_app.window_mgr, 3, core.tprintf("Failed to open {}", fname));
+        }
+    }
+}
+
+find_loaded_plugin :: (handle: u32) -> &plugin.LoadedPlugin {
+    for &lp in g_app.loaded_plugins {
+        if lp.handle == handle do return lp;
+    }
+    return null;
+}
+
+sync_diagnostic_gutter_markers :: () {
+    editor.buffer_clear_gutter_markers(&g_app.ed.buf, cast(u32) abi.GutterMarkerKind.DiagnosticErr);
+    editor.buffer_clear_gutter_markers(&g_app.ed.buf, cast(u32) abi.GutterMarkerKind.DiagnosticWarn);
+    for &d in g_app.lsp_client.diagnostics {
+        kind := cast(u32) abi.GutterMarkerKind.DiagnosticErr if d.severity == 1 else cast(u32) abi.GutterMarkerKind.DiagnosticWarn;
+        col  := theme.get_color(.Error) if d.severity == 1 else theme.get_color(.Warning);
+        editor.buffer_set_gutter_marker(&g_app.ed.buf, d.path, d.line, kind, col);
+    }
+}
+
+jump_next_diagnostic :: () {
+    if g_app.lsp_client.diagnostics.count == 0 {
+        wm.wm_notify(&g_app.window_mgr, 1, "No LSP diagnostics");
+        return;
+    }
+    cur_line := cast(u32) (g_app.ed.buf.cursor_line + 1);
+    chosen := &g_app.lsp_client.diagnostics[0];
+    for &d in g_app.lsp_client.diagnostics {
+        if str.equal(d.path, g_app.ed.buf.path) && d.line > cur_line {
+            chosen = d;
+            break;
+        }
+    }
+    if !str.equal(chosen.path, g_app.ed.buf.path) {
+        if editor.buffer_load_file(&g_app.ed.buf, chosen.path) {
+            txt := editor.buffer_to_string(&g_app.ed.buf, context.temp_allocator);
+            lsp.lsp_did_open(&g_app.lsp_client, chosen.path, txt);
+            broadcast_event(.ActiveFileChanged, .ActiveFileChanged, chosen.path);
+        }
+    }
+    editor.buffer_set_cursor_1based(&g_app.ed.buf, cast(i32) chosen.line, cast(i32) chosen.column);
+    editor.editor_ensure_cursor_visible(&g_app.ed, g_app.window_mgr.editor_content.h);
+    wm.wm_notify(&g_app.window_mgr, 3 if chosen.severity == 1 else 2, chosen.message);
+}
+
+open_file_in_editor :: (path: str, line: i32 = 1, col: i32 = 1) -> bool {
+    if !str.equal(path, g_app.ed.buf.path) {
+        if !editor.buffer_load_file(&g_app.ed.buf, path) do return false;
+        txt := editor.buffer_to_string(&g_app.ed.buf, context.temp_allocator);
+        lsp.lsp_did_open(&g_app.lsp_client, path, txt);
+        broadcast_event(.ActiveFileChanged, .ActiveFileChanged, path);
+    }
+    editor.buffer_set_cursor_1based(&g_app.ed.buf, line, col);
+    editor.editor_ensure_cursor_visible(&g_app.ed, g_app.window_mgr.editor_content.h);
+    g_app.window_mgr.focused_window_id = 0;
+    return true;
+}
+
+run_headless_selftest :: () {
+    println("[odit] Running headless WASM plugin ABI + Settings + Onyx LSP self-test...");
+    g_app.workspace_root = ".";
+    settings.settings_load();
+    printf("[odit] Loaded settings: font={}px, ui_scale={}, theme='{}'\n",
+           cast(i32) settings.g_settings.editor_font_size,
+           settings.g_settings.ui_scale,
+           settings.g_settings.theme);
+    wm.wm_init(&g_app.window_mgr);
+    ui.palette_init(&g_app.palette);
+    editor.buffer_init(&g_app.ed.buf);
+    editor.buffer_load_file(&g_app.ed.buf, "src/settings.onyx");
+
+    lsp.lsp_init(&g_app.lsp_client);
+    lsp_started := lsp.lsp_start(&g_app.lsp_client);
+    plugin.host_abi_bind(g_app.workspace_root, &g_app.window_mgr, &g_app.ed, &g_app.palette, &g_app.lsp_client);
+
+    if !plugin.plugin_runtime_init() {
+        println("[odit] FAIL: plugin_runtime_init failed");
+        os.exit(1);
+    }
+
+    discover_plugins();
+    ws_files := services.workspace_find_files(".", ".onyx", context.temp_allocator);
+    printf("[odit] Workspace .onyx files discovered: {}\n", ws_files.count);
+
+    wid_fe  := spawn_plugin_from_wasm("build/plugins/file_explorer.wasm");
+    wid_br  := spawn_plugin_from_wasm("build/plugins/build_run.wasm");
+    wid_wat := spawn_plugin_from_wasm("build/plugins/wasm_inspector.wasm");
+    wid_doc := spawn_plugin_from_wasm("build/plugins/docs_browser.wasm");
+    wid_w   := spawn_plugin_from_wasm("build/plugins/welcome.wasm");
+    if wid_fe == 0 || wid_br == 0 || wid_wat == 0 || wid_doc == 0 || wid_w == 0 {
+        println("[odit] FAIL: could not spawn all Phase 3 WASM plugins");
+        lsp.lsp_shutdown(&g_app.lsp_client);
+        os.exit(1);
+    }
+
+    // Verify Docs Index & WAT Disassembly host services
+    docs_js := services.docs_search_as_json("format", context.temp_allocator);
+    printf("[odit] Docs search 'format' JSON bytes: {}\n", docs_js.count);
+    if docs_js.count < 20 {
+        println("[odit] FAIL: docs_search returned empty results");
+        os.exit(1);
+    }
+    wat_js := services.wat_get_function_json("src/settings.onyx", "settings_defaults", 1, context.temp_allocator);
+    printf("[odit] WAT disassembly for settings_defaults bytes: {} (preview: {})\n",
+           wat_js.count, wat_js[0 .. (120 if wat_js.count > 120 else wat_js.count)]);
+    if wat_js.count < 200 || !str.contains(wat_js, "(func $settings_defaults") {
+        println("[odit] FAIL: wat_get_function_json did not return real WAT for settings_defaults");
+        os.exit(1);
+    }
+
+    // Pump Onyx LSP up to 6 seconds to verify initialize -> didOpen -> documentSymbol
+    if lsp_started {
+        opened := false;
+        for _ in 0 .. 120 {
+            alloc.clear_temp_allocator();
+            if lsp.lsp_poll(&g_app.lsp_client, 0.05f) && !opened {
+                opened = true;
+                txt := editor.buffer_to_string(&g_app.ed.buf, context.temp_allocator);
+                lsp.lsp_did_open(&g_app.lsp_client, g_app.ed.buf.path, txt);
+            }
+            if g_app.lsp_client.symbols.count > 0 {
+                break;
+            }
+            os.sleep(50);
+        }
+        printf("[odit] Onyx LSP state={}, symbols={}, diagnostics={}, pending={}, rx_buf={}, last_log='{}'\n",
+               cast(i32) g_app.lsp_client.state,
+               g_app.lsp_client.symbols.count,
+               g_app.lsp_client.diagnostics.count,
+               g_app.lsp_client.pending.count,
+               g_app.lsp_client.rx_buf.count,
+               g_app.lsp_client.last_log);
+        if g_app.lsp_client.state != .Ready || g_app.lsp_client.symbols.count == 0 {
+            println("[odit] FAIL: Onyx LSP did not return symbols");
+            lsp.lsp_shutdown(&g_app.lsp_client);
+            os.exit(1);
+        }
+        broadcast_event(.SymbolsUpdated, .SymbolsUpdated, g_app.ed.buf.path);
+    }
+
+    // Trigger events & verify commands from all 3 loaded WASM plugins
+    broadcast_event(.ActiveFileChanged, .ActiveFileChanged, g_app.ed.buf.path);
+    printf("[odit] Commands registered (host + WASM): {}\n", g_app.palette.commands.count);
+    for &c in g_app.palette.commands {
+        printf("  - [win={}] {} ({})\n", c.window_id, c.label, c.id);
+    }
+
+    for &c in g_app.palette.commands {
+        if str.equal(c.id, "inspector.ping") {
+            execute_command(c);
+            printf("[odit] Toast after WASM command: '{}'\n", g_app.window_mgr.toast_text);
+        }
+    }
+
+    close_plugin_window(wid_w);
+    close_plugin_window(wid_doc);
+    close_plugin_window(wid_wat);
+    close_plugin_window(wid_br);
+    close_plugin_window(wid_fe);
+    lsp.lsp_shutdown(&g_app.lsp_client);
+    println("[odit] PASS: All 5 WASM plugins + Onyx LSP + WAT Disassembly + Core Docs self-test succeeded!");
+}
+
+main :: (args: [] cstr) {
+    initial_file := "src/main.onyx";
+    for i in 0 .. args.count {
+        a := core.string.from_cstr(args[i]);
+        if str.equal(a, "--self-test") {
+            run_headless_selftest();
+            return;
+        }
+        if i > 0 && !str.starts_with(a, "-") && !str.ends_with(a, ".wasm") && !str.ends_with(a, "odit") {
+            initial_file = a;
+        }
+    }
+
+    g_app.workspace_root = ".";
+    g_app.loaded_plugins  = make([..] plugin.LoadedPlugin);
+    g_app.available_wasms = make([..] str);
+
+    // Load persistent user settings (creating default odit.json on first run)
+    if !settings.settings_load() {
+        settings.settings_save();
+    }
+
+    raylib.SetTraceLogLevel(.WARNING);
+    raylib.InitWindow(1440, 900, "Onyx Editor (odit) — Modular WASM IDE");
+    raylib.SetWindowState(raylib.ConfigFlags.WINDOW_RESIZABLE | .VSYNC_HINT);
+    defer raylib.CloseWindow();
+
+    raylib.SetTargetFPS(settings.g_settings.target_fps);
+    raylib.SetExitKey(.NULL); // Allow Esc for modal Normal mode & Command Palette
+
+    theme.theme_init(settings.g_settings.theme, settings.g_settings.font_path);
+    defer theme.theme_shutdown();
+
+    wm.wm_init(&g_app.window_mgr);
+    ui.palette_init(&g_app.palette);
+    ui.finder_init(&g_app.file_finder);
+    editor.editor_init(&g_app.ed);
+
+    if !editor.buffer_load_file(&g_app.ed.buf, initial_file) {
+        editor.buffer_set_text(&g_app.ed.buf, "// Welcome to Onyx Editor (odit)\nuse core { println }\n\nmain :: () {\n    println(\"Hello from Onyx!\");\n}\n");
+        g_app.ed.buf.path = str.copy(initial_file);
+    }
+
+    lsp.lsp_init(&g_app.lsp_client);
+    defer lsp.lsp_shutdown(&g_app.lsp_client);
+    lsp.lsp_start(&g_app.lsp_client);
+
+    plugin.host_abi_bind(g_app.workspace_root, &g_app.window_mgr, &g_app.ed, &g_app.palette, &g_app.lsp_client);
+    register_builtin_commands();
+
+    if plugin.plugin_runtime_init() {
+        discover_plugins();
+        // Auto-spawn Phase 3.1 Core Mini-Apps on startup
+        if os.file_exists("build/plugins/file_explorer.wasm") {
+            spawn_plugin_from_wasm("build/plugins/file_explorer.wasm");
+        }
+        if os.file_exists("build/plugins/build_run.wasm") {
+            spawn_plugin_from_wasm("build/plugins/build_run.wasm");
+        }
+    } else {
+        wm.wm_notify(&g_app.window_mgr, 3, "WASM runtime failed to initialize (check libwasmer.so)");
+    }
+
+    while !raylib.WindowShouldClose() {
+        alloc.clear_temp_allocator();
+
+        dt := raylib.GetFrameTime();
+        screen_w := cast(f32) raylib.GetScreenWidth();
+        screen_h := cast(f32) raylib.GetScreenHeight();
+        ctrl := raylib.IsKeyDown(.LEFT_CONTROL) || raylib.IsKeyDown(.RIGHT_CONTROL);
+
+        // Non-blocking Onyx LSP poll every frame
+        if lsp.lsp_poll(&g_app.lsp_client, dt) {
+            txt := editor.buffer_to_string(&g_app.ed.buf, context.temp_allocator);
+            lsp.lsp_did_open(&g_app.lsp_client, g_app.ed.buf.path, txt);
+            wm.wm_notify(&g_app.window_mgr, 1, "Onyx LSP connected");
+        }
+        if g_app.lsp_client.change_pending && g_app.lsp_client.change_timer <= 0.0f {
+            txt := editor.buffer_to_string(&g_app.ed.buf, context.temp_allocator);
+            lsp.lsp_flush_change(&g_app.lsp_client, txt);
+        }
+        if g_app.lsp_client.diagnostics_dirty {
+            g_app.lsp_client.diagnostics_dirty = false;
+            sync_diagnostic_gutter_markers();
+            broadcast_event(.DiagnosticsUpdated, .DiagnosticsUpdated, g_app.ed.buf.path);
+        }
+        if g_app.lsp_client.symbols_dirty {
+            g_app.lsp_client.symbols_dirty = false;
+            broadcast_event(.SymbolsUpdated, .SymbolsUpdated, g_app.lsp_client.symbols_path);
+        }
+        if g_app.lsp_client.pending_jump {
+            loc := g_app.lsp_client.pending_jump->unwrap();
+            g_app.lsp_client.pending_jump = .None;
+            if open_file_in_editor(loc.path, cast(i32) loc.line, cast(i32) loc.column) {
+                wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Jumped to {}:{}", loc.path, loc.line));
+            }
+        }
+
+        // Global shortcuts: Ctrl+P Palette, Ctrl+O Fuzzy File Finder, Ctrl+, Settings, F8 Next Diag, Ctrl+=/+/- /0 Zoom, Ctrl+Tab focus
+        if ctrl && raylib.IsKeyPressed(.P) {
+            g_app.settings_view.open = false;
+            ui.finder_close(&g_app.file_finder);
+            if g_app.palette.open do ui.palette_close(&g_app.palette);
+            else do ui.palette_open(&g_app.palette);
+        } elseif ctrl && raylib.IsKeyPressed(.O) {
+            g_app.settings_view.open = false;
+            ui.palette_close(&g_app.palette);
+            if g_app.file_finder.open do ui.finder_close(&g_app.file_finder);
+            else do ui.finder_open(&g_app.file_finder, g_app.workspace_root);
+        } elseif ctrl && raylib.IsKeyPressed(.COMMA) {
+            ui.palette_close(&g_app.palette);
+            ui.finder_close(&g_app.file_finder);
+            g_app.settings_view.open = !g_app.settings_view.open;
+        } elseif raylib.IsKeyPressed(.F8) {
+            jump_next_diagnostic();
+        } elseif ctrl && (raylib.IsKeyPressed(.EQUAL) || raylib.IsKeyPressed(.KP_ADD)) {
+            adjust_font_size(2.0f);
+        } elseif ctrl && (raylib.IsKeyPressed(.MINUS) || raylib.IsKeyPressed(.KP_SUBTRACT)) {
+            adjust_font_size(-2.0f);
+        } elseif ctrl && (raylib.IsKeyPressed(.ZERO) || raylib.IsKeyPressed(.KP_0)) {
+            settings.g_settings.editor_font_size = 18.0f;
+            apply_live_settings();
+            settings.settings_save();
+            wm.wm_notify(&g_app.window_mgr, 1, "Font size reset to 18px");
+        } elseif !g_app.palette.open && !g_app.file_finder.open && !g_app.settings_view.open && ctrl && raylib.IsKeyPressed(.TAB) {
+            wm.wm_cycle_focus(&g_app.window_mgr);
+        }
+
+        overlay_open := g_app.palette.open || g_app.file_finder.open || g_app.settings_view.open;
+
+        // Update tiled window manager layout
+        closed_wid := wm.wm_update_layout(&g_app.window_mgr, screen_w, screen_h, dt, overlay_open);
+        if closed_wid > 0 {
+            close_plugin_window(closed_wid);
+        }
+
+        // Focus routing: clear plugin text input focus when main editor is focused
+        editor_focused := g_app.window_mgr.focused_window_id == 0 && !overlay_open;
+        if editor_focused do ui.ui_clear_focused_input();
+
+        // Update core code editor
+        ed_ev := editor.editor_update(&g_app.ed, g_app.window_mgr.editor_content, editor_focused, dt, overlay_open, &g_app.lsp_client);
+        if ed_ev.req_hover {
+            lsp.lsp_request_hover(&g_app.lsp_client, g_app.ed.buf.path, g_app.ed.buf.cursor_line, g_app.ed.buf.cursor_col);
+        }
+        if ed_ev.req_definition {
+            lsp.lsp_request_definition(&g_app.lsp_client, g_app.ed.buf.path, g_app.ed.buf.cursor_line, g_app.ed.buf.cursor_col);
+        }
+        if ed_ev.req_completion {
+            lsp.lsp_request_completion(&g_app.lsp_client, g_app.ed.buf.path, g_app.ed.buf.cursor_line, g_app.ed.buf.cursor_col);
+        }
+        if ed_ev.buffer_saved {
+            if str.equal(g_app.ed.buf.path, settings.SETTINGS_FILE) {
+                settings.settings_load();
+                apply_live_settings();
+                theme.theme_load_font(settings.g_settings.font_path);
+                wm.wm_notify(&g_app.window_mgr, 1, "Saved & applied odit.json");
+            } else {
+                txt := editor.buffer_to_string(&g_app.ed.buf, context.temp_allocator);
+                lsp.lsp_did_save(&g_app.lsp_client, g_app.ed.buf.path, txt);
+                wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Saved {}", g_app.ed.buf.path));
+            }
+        }
+        if ed_ev.buffer_modified {
+            if !ed_ev.buffer_saved do lsp.lsp_mark_changed(&g_app.lsp_client);
+            payload := core.tprintf("{{\"path\":\"{}\",\"version\":{},\"saved\":{}}}",
+                g_app.ed.buf.path, g_app.ed.buf.version, "true" if ed_ev.buffer_saved else "false");
+            broadcast_event(.BufferModified, .BufferModified, payload);
+        }
+        if ed_ev.cursor_moved {
+            g_app.lsp_client.hover_visible = false;
+            cur := editor.buffer_get_abi_cursor(&g_app.ed.buf);
+            broadcast_event(.CursorMoved, .CursorMoved, .{ cast([&] u8) &cur, sizeof abi.EditorCursor });
+        }
+
+        // Begin Raylib frame
+        raylib.BeginDrawing();
+        raylib.ClearBackground(theme.get_rl(.BgBase));
+
+        lsp_lbl := switch g_app.lsp_client.state {
+            case .Ready    => "LSP: Ready";
+            case .Starting => "LSP: Init...";
+            case .Failed   => "LSP: Err";
+            case _         => "LSP: Off";
+        };
+        d_errs, d_warns := lsp.lsp_count_errors_warnings(&g_app.lsp_client);
+
+        // Draw top bar, splitter, status bar
+        chrome := wm.wm_draw_chrome(
+            &g_app.window_mgr, screen_w, screen_h,
+            g_app.ed.buf.path,
+            editor.editor_mode_label(&g_app.ed),
+            cast(u32) (g_app.ed.buf.cursor_line + 1),
+            cast(u32) (g_app.ed.buf.cursor_col + 1),
+            g_app.ed.buf.dirty,
+            overlay_open,
+            lsp_lbl, g_app.lsp_client.state == .Ready,
+            d_errs, d_warns
+        );
+        if chrome.open_palette {
+            g_app.settings_view.open = false;
+            ui.finder_close(&g_app.file_finder);
+            ui.palette_open(&g_app.palette);
+        }
+        if chrome.open_finder {
+            g_app.settings_view.open = false;
+            ui.palette_close(&g_app.palette);
+            ui.finder_open(&g_app.file_finder, g_app.workspace_root);
+        }
+        if chrome.open_settings {
+            ui.palette_close(&g_app.palette);
+            ui.finder_close(&g_app.file_finder);
+            g_app.settings_view.open = true;
+        }
+
+        // Draw Core Code Editor Pane (Left)
+        ed_title := core.tprintf("{}{}",
+            g_app.ed.buf.path if g_app.ed.buf.path.count > 0 else "untitled.onyx",
+            " *" if g_app.ed.buf.dirty else ""
+        );
+        wm.wm_draw_pane_frame(g_app.window_mgr.editor_rect, ed_title, g_app.window_mgr.focused_window_id == 0, false);
+        editor.editor_draw(&g_app.ed, g_app.window_mgr.editor_content, editor_focused, &g_app.lsp_client);
+
+        // Prepare plugin UI frame input & render each active WASM plugin pane
+        capture_plugin_keys := !overlay_open && g_app.window_mgr.focused_window_id > 0;
+        ui.ui_begin_frame(dt, capture_plugin_keys);
+
+        mpos := raylib.GetMousePosition();
+        mdown: u32 = (cast(u32) abi.MouseButton.Left if raylib.IsMouseButtonDown(.LEFT) else 0) |
+                     (cast(u32) abi.MouseButton.Right if raylib.IsMouseButtonDown(.RIGHT) else 0);
+        mpress: u32 = (cast(u32) abi.MouseButton.Left if raylib.IsMouseButtonPressed(.LEFT) else 0) |
+                      (cast(u32) abi.MouseButton.Right if raylib.IsMouseButtonPressed(.RIGHT) else 0);
+        mrel: u32 = (cast(u32) abi.MouseButton.Left if raylib.IsMouseButtonReleased(.LEFT) else 0) |
+                    (cast(u32) abi.MouseButton.Right if raylib.IsMouseButtonReleased(.RIGHT) else 0);
+        kmods: u32 = (cast(u32) abi.KeyMod.Shift if (raylib.IsKeyDown(.LEFT_SHIFT) || raylib.IsKeyDown(.RIGHT_SHIFT)) else 0) |
+                     (cast(u32) abi.KeyMod.Ctrl if ctrl else 0) |
+                     (cast(u32) abi.KeyMod.Alt if (raylib.IsKeyDown(.LEFT_ALT) || raylib.IsKeyDown(.RIGHT_ALT)) else 0);
+
+        for &pane in g_app.window_mgr.panes {
+            p_focused := g_app.window_mgr.focused_window_id == pane.window_id && !overlay_open;
+            p_hovered := !overlay_open && wm.hit_rect(mpos.x, mpos.y, pane.content_rect);
+            wm.wm_draw_pane_frame(pane.rect, pane.title, p_focused, true);
+
+            if lp := find_loaded_plugin(pane.plugin_handle); lp != null {
+                ui.ui_begin_pane(
+                    pane.window_id,
+                    pane.content_rect.x, pane.content_rect.y,
+                    pane.content_rect.w, pane.content_rect.h,
+                    p_focused, p_hovered
+                );
+
+                fctx := abi.FrameContext.{
+                    window_id      = pane.window_id,
+                    width          = pane.content_rect.w,
+                    height         = pane.content_rect.h,
+                    mouse_x        = mpos.x - pane.content_rect.x,
+                    mouse_y        = mpos.y - pane.content_rect.y,
+                    wheel_y        = raylib.GetMouseWheelMove() if p_hovered else 0.0,
+                    mouse_down     = mdown,
+                    mouse_pressed  = mpress,
+                    mouse_released = mrel,
+                    key_mods       = kmods,
+                    flags          = (abi.FRAME_FLAG_FOCUSED if p_focused else 0) |
+                                     (abi.FRAME_FLAG_HOVERED if p_hovered else 0),
+                    delta_time     = dt,
+                };
+                plugin.plugin_render_with_ctx(lp, pane.window_id, &fctx);
+                ui.ui_end_pane();
+            }
+        }
+
+        // Draw Command Palette overlay (if open)
+        if chosen := ui.palette_update_and_draw(&g_app.palette, screen_w, screen_h); chosen != null {
+            execute_command(chosen);
+        }
+
+        // Draw Fuzzy File Finder overlay (if open)
+        if chosen_file := ui.finder_update_and_draw(&g_app.file_finder, screen_w, screen_h); chosen_file.count > 0 {
+            if open_file_in_editor(chosen_file, 1, 1) {
+                wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Opened {}", chosen_file));
+            }
+        }
+
+        // Broadcast ActiveFileChanged if a WASM plugin opened a file via `editor_open_file`
+        if plugin.g_host_ctx.file_opened_dirty {
+            plugin.g_host_ctx.file_opened_dirty = false;
+            broadcast_event(.ActiveFileChanged, .ActiveFileChanged, g_app.ed.buf.path);
+            wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Opened {}", g_app.ed.buf.path));
+        }
+
+        // Draw Settings modal overlay (if open)
+        s_act := ui.settings_view_update_and_draw(&g_app.settings_view, screen_w, screen_h);
+        if s_act == .Changed || s_act == .Reset {
+            apply_live_settings();
+            if s_act == .Reset do wm.wm_notify(&g_app.window_mgr, 1, "Settings reset to defaults");
+        } elseif s_act == .OpenJsonFile {
+            if !os.file_exists(settings.SETTINGS_FILE) do settings.settings_save();
+            if editor.buffer_load_file(&g_app.ed.buf, settings.SETTINGS_FILE) {
+                g_app.window_mgr.focused_window_id = 0;
+                wm.wm_notify(&g_app.window_mgr, 1, "Opened odit.json (save with Ctrl+S to apply)");
+            }
+        }
+
+        // Drain deferred plugin-initiated actions safely outside WASM re-entry
+        if plugin.g_host_ctx.pending_spawn.count > 0 {
+            pid := plugin.g_host_ctx.pending_spawn;
+            plugin.g_host_ctx.pending_spawn = "";
+            path := core.tprintf("build/plugins/{}.wasm", pid);
+            if os.file_exists(path) do spawn_plugin_from_wasm(path);
+        }
+        if plugin.g_host_ctx.pending_cmd_id.count > 0 {
+            cid := plugin.g_host_ctx.pending_cmd_id;
+            plugin.g_host_ctx.pending_cmd_id = "";
+            for &c in g_app.palette.commands {
+                if str.equal(c.id, cid) {
+                    execute_command(c);
+                    break;
+                }
+            }
+        }
+
+        raylib.EndDrawing();
+    }
+
+    // Cleanly shut down all WASM plugins
+    while g_app.window_mgr.panes.count > 0 {
+        close_plugin_window(g_app.window_mgr.panes[0].window_id);
+    }
+}

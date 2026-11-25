@@ -1,0 +1,178 @@
+package odit.plugin
+
+// =============================================================================
+// Onyx Editor ("odit") — Native Wasmer Plugin Loader & Guest Memory Helpers
+// =============================================================================
+
+use core { os, memory, println, printf }
+use core.encoding.json
+use odit.abi
+
+#library "odit_wasm_host"
+
+#foreign "odit_wasm_host" {
+    wasm_host_init          :: (scratch_ptr: rawptr) -> i32 ---
+    wasm_host_last_error    :: (out_ptr: rawptr, out_cap: i32) -> i32 ---
+
+    wasm_plugin_load        :: (bytes_ptr: rawptr, bytes_len: i32) -> u32 ---
+    wasm_plugin_unload      :: (handle: u32) -> void ---
+    wasm_plugin_abi_version :: (handle: u32) -> u32 ---
+    wasm_plugin_alloc       :: (handle: u32, size: u32) -> u32 ---
+    wasm_plugin_free        :: (handle: u32, ptr: u32) -> void ---
+    wasm_plugin_manifest    :: (handle: u32, guest_out_ptr: u32, cap: u32) -> i32 ---
+    wasm_plugin_init        :: (handle: u32, window_id: u32) -> i32 ---
+    wasm_plugin_shutdown    :: (handle: u32, window_id: u32) -> void ---
+    wasm_plugin_event       :: (handle: u32, window_id: u32, event_type: u32, payload_ptr: u32, payload_len: u32) -> void ---
+    wasm_plugin_render      :: (handle: u32, window_id: u32, ctx_guest_ptr: u32) -> void ---
+
+    wasm_plugin_mem_read    :: (handle: u32, guest_ptr: u32, host_dst: rawptr, len: u32) -> i32 ---
+    wasm_plugin_mem_write   :: (handle: u32, guest_ptr: u32, host_src: rawptr, len: u32) -> i32 ---
+    wasm_plugin_mem_size    :: (handle: u32) -> u32 ---
+
+    native_proc_spawn       :: (cmd_ptr: rawptr, cmd_len: i32, args_ptr: rawptr, args_len: i32, cwd_ptr: rawptr, cwd_len: i32) -> u32 ---
+    native_proc_write       :: (handle: u32, src_ptr: rawptr, src_len: i32) -> i32 ---
+    native_proc_read        :: (handle: u32, stream_mask: i32, out_ptr: rawptr, out_cap: i32) -> i32 ---
+    native_proc_poll        :: (handle: u32, out_exit_code: &i32) -> u32 ---
+    native_proc_kill        :: (handle: u32) -> i32 ---
+}
+
+/// Shared scratch memory for `odit_wasm_host.so` <-> `__odit_host_dispatch`:
+///   [0..11] = call arguments packed as u64
+///   [12]    = return value packed as u64
+g_host_scratch: [13] u64;
+
+LoadedPlugin :: struct {
+    handle:          u32;
+    wasm_path:       str;
+    manifest:        abi.PluginManifest;
+    ctx_guest_ptr:   u32; // Reused 48-byte FrameContext buffer in guest linear memory
+}
+
+host_last_error :: (allocator := context.temp_allocator) -> str {
+    buf := make([] u8, 512, allocator);
+    n := wasm_host_last_error(buf.data, buf.count);
+    if n <= 0 do return "";
+    return buf[0 .. n];
+}
+
+plugin_runtime_init :: () -> bool {
+    ok := wasm_host_init(&g_host_scratch[0]);
+    if ok == 0 {
+        printf("[odit] Failed to initialize Wasmer plugin host: {}\n", host_last_error());
+        return false;
+    }
+    return true;
+}
+
+/// Safely reads a UTF-8 string from a plugin's linear memory into host memory.
+guest_read_str :: (handle: u32, guest_ptr: u32, guest_len: u32, allocator := context.temp_allocator) -> str {
+    if guest_ptr == 0 || guest_len == 0 do return "";
+    if guest_len > 16 * 1024 * 1024 do return ""; // 16MB safety cap
+    buf := make([] u8, cast(i32) guest_len, allocator);
+    got := wasm_plugin_mem_read(handle, guest_ptr, buf.data, guest_len);
+    if got < 0 do return "";
+    return buf[0 .. got];
+}
+
+/// Implements the standard `(out_ptr, out_cap) -> i32` ABI write-out convention.
+guest_write_out :: (handle: u32, data: str, out_ptr: u32, out_cap: u32) -> i32 {
+    if out_ptr == 0 || out_cap == 0 {
+        return cast(i32) data.count;
+    }
+    if cast(u32) data.count > out_cap {
+        return cast(i32) abi.AbiError.BufferTooSmall;
+    }
+    if data.count == 0 do return 0;
+    res := wasm_plugin_mem_write(handle, out_ptr, data.data, cast(u32) data.count);
+    return res;
+}
+
+/// Loads a `.wasm` plugin file, checks ABI version, parses its JSON manifest,
+/// and allocates a reusable `FrameContext` buffer inside the guest.
+plugin_load_from_file :: (wasm_path: str) -> ? LoadedPlugin {
+    bytes := os.get_contents(wasm_path);
+    if bytes.count == 0 {
+        printf("[odit] Could not read plugin file: {}\n", wasm_path);
+        return .None;
+    }
+    defer delete(&bytes);
+
+    handle := wasm_plugin_load(bytes.data, bytes.count);
+    if handle == 0 {
+        printf("[odit] Failed to load WASM plugin '{}': {}\n", wasm_path, host_last_error());
+        return .None;
+    }
+
+    ver := wasm_plugin_abi_version(handle);
+    if (ver >> 16) != abi.ABI_VERSION_MAJOR {
+        printf("[odit] Plugin '{}' ABI major mismatch (got 0x{b16}, expected 0x{b16})\n",
+               wasm_path, ver, abi.ABI_VERSION);
+        wasm_plugin_unload(handle);
+        return .None;
+    }
+
+    // Query PluginManifest JSON
+    manifest: abi.PluginManifest = .{
+        id             = str.copy(wasm_path),
+        title          = str.copy(wasm_path),
+        version        = "0.0.0",
+        default_slot   = 0,
+        default_width  = 360.0,
+        default_height = 240.0,
+        event_mask     = 0,
+        allow_multiple = false,
+    };
+
+    needed := wasm_plugin_manifest(handle, 0, 0);
+    if needed > 0 && needed < 65536 {
+        gptr := wasm_plugin_alloc(handle, cast(u32) needed);
+        if gptr != 0 {
+            got := wasm_plugin_manifest(handle, gptr, cast(u32) needed);
+            if got > 0 {
+                json_str := guest_read_str(handle, gptr, cast(u32) got, context.temp_allocator);
+                switch json.decode_as(json_str, abi.PluginManifest) {
+                    case .Ok as m {
+                        if m.id.count > 0    do manifest.id = str.copy(m.id);
+                        if m.title.count > 0 do manifest.title = str.copy(m.title);
+                        if m.version.count > 0 do manifest.version = str.copy(m.version);
+                        manifest.default_slot   = m.default_slot;
+                        manifest.default_width  = m.default_width;
+                        manifest.default_height = m.default_height;
+                        manifest.event_mask     = m.event_mask;
+                        manifest.allow_multiple = m.allow_multiple;
+                    }
+                    case .Err {}
+                }
+            }
+            wasm_plugin_free(handle, gptr);
+        }
+    }
+
+    ctx_ptr := wasm_plugin_alloc(handle, cast(u32) sizeof abi.FrameContext);
+
+    return LoadedPlugin.{
+        handle        = handle,
+        wasm_path     = str.copy(wasm_path),
+        manifest      = manifest,
+        ctx_guest_ptr = ctx_ptr,
+    };
+}
+
+plugin_send_event_bytes :: (handle: u32, window_id: u32, ev_type: abi.EventType, payload: [] u8) {
+    if handle == 0 do return;
+    if payload.count == 0 {
+        wasm_plugin_event(handle, window_id, cast(u32) ev_type, 0, 0);
+        return;
+    }
+    gptr := wasm_plugin_alloc(handle, cast(u32) payload.count);
+    if gptr == 0 do return;
+    wasm_plugin_mem_write(handle, gptr, payload.data, cast(u32) payload.count);
+    wasm_plugin_event(handle, window_id, cast(u32) ev_type, gptr, cast(u32) payload.count);
+    wasm_plugin_free(handle, gptr);
+}
+
+plugin_render_with_ctx :: (p: &LoadedPlugin, window_id: u32, ctx: &abi.FrameContext) {
+    if p.handle == 0 || p.ctx_guest_ptr == 0 do return;
+    wasm_plugin_mem_write(p.handle, p.ctx_guest_ptr, ctx, cast(u32) sizeof abi.FrameContext);
+    wasm_plugin_render(p.handle, window_id, p.ctx_guest_ptr);
+}

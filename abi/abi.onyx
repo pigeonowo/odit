@@ -1,0 +1,522 @@
+package odit.abi
+
+// =============================================================================
+// Onyx Editor ("odit") — Host <-> WASM Plugin ABI (v1.0.0)
+// =============================================================================
+//
+// Single source of truth loaded by BOTH:
+//   1. Native Host (`src/...`, compiled with `-r onyx`)
+//   2. WASM Plugins (`plugins/...`, compiled with `-r custom`)
+//
+// Design Principles:
+//   - Strict flat WASM scalar boundary (`i32`, `u32`, `i64`, `u64`, `f32`, `f64`).
+//     No ABI-dependent struct-by-value or slice-by-value crossings in `#foreign`.
+//   - Every variable-length query uses `(out_ptr: u32, out_cap: u32) -> i32`:
+//       * `out_ptr == 0 || out_cap == 0` -> returns required byte count (`>= 0`)
+//       * `>= 0`                         -> bytes written into guest memory
+//       * `< 0`                          -> `AbiError` negative error code
+//   - Hot-path per-frame data (`FrameContext`, `EditorCursor`, `KeyEvent`) uses
+//     fixed 4-byte-aligned POD structs in linear memory (zero JSON overhead).
+//   - Rich structured queries (`PluginManifest`, `DirEntry`, `SymbolInfo`,
+//     `Diagnostic`, `DebugState`, etc.) serialize as UTF-8 JSON.
+//   - All UI drawing uses window-local coordinates `(0, 0) .. (w, h)`; the host
+//     translates and scissor-clips all rendering to the plugin pane bounds.
+// =============================================================================
+
+use runtime
+
+// -----------------------------------------------------------------------------
+// 1. Version & Error Codes
+// -----------------------------------------------------------------------------
+
+ABI_VERSION_MAJOR :: 1
+ABI_VERSION_MINOR :: 0
+ABI_VERSION_PATCH :: 0
+ABI_VERSION       :: (ABI_VERSION_MAJOR << 16) | (ABI_VERSION_MINOR << 8) | ABI_VERSION_PATCH
+
+AbiError :: enum (i32) {
+    Ok                ::  0;
+    Unknown           :: -1;
+    NotFound          :: -2;
+    BufferTooSmall    :: -3;
+    InvalidArg        :: -4;
+    PermissionDenied  :: -5;
+    Busy              :: -6;
+    NotReady          :: -7;
+    ProcessFailed     :: -8;
+    Unsupported       :: -9;
+}
+
+// -----------------------------------------------------------------------------
+// 2. Color & Theme Helpers
+// -----------------------------------------------------------------------------
+
+/// Packed RGBA8 color: `0xRRGGBBAA` (big-endian channel order for readability).
+/// Example: `0x1E1E2EFF` = R:0x1E, G:0x1E, B:0x2E, A:0xFF.
+Color :: #distinct u32
+
+rgba :: (r, g, b: u32, a: u32 = 0xFF) -> u32 {
+    return ((r & 0xFF) << 24) | ((g & 0xFF) << 16) | ((b & 0xFF) << 8) | (a & 0xFF);
+}
+
+ThemeColor :: enum (u32) {
+    BgBase         :: 0;  // Main IDE canvas background
+    BgPanel        :: 1;  // Plugin panel background
+    BgHeader       :: 2;  // Window title bar background
+    BgSurface      :: 3;  // Cards / inputs / elevated surfaces
+    BgHover        :: 4;  // Hovered item highlight
+    BgSelection    :: 5;  // Selected row / text selection
+    Border         :: 6;  // Subtle pane & widget border
+    BorderFocused  :: 7;  // Active focused pane border
+    TextPrimary    :: 8;  // Primary readable text
+    TextSecondary  :: 9;  // Muted / metadata text
+    TextDisabled   :: 10; // Disabled controls / placeholders
+    Accent         :: 11; // Primary IDE accent (Onyx violet/blue)
+    Success        :: 12; // Green (build OK, GET badge, active run)
+    Warning        :: 13; // Yellow/amber (warnings, PUT/PATCH)
+    Error          :: 14; // Red (diagnostics, breakpoints, DELETE)
+    Info           :: 15; // Cyan/blue (info, POST badge, types)
+}
+
+// -----------------------------------------------------------------------------
+// 3. Logging, Notifications, & Docking Hints
+// -----------------------------------------------------------------------------
+
+LogLevel :: enum (u32) {
+    Debug :: 0;
+    Info  :: 1;
+    Warn  :: 2;
+    Error :: 3;
+}
+
+DockSlot :: enum (u32) {
+    RightGrid :: 0; // Default mini-app grid on the right half
+    LeftSide  :: 1; // Left sidebar (e.g. File Explorer)
+    Bottom    :: 2; // Bottom strip (e.g. Build & Run / Output)
+    Floating  :: 3; // Floating overlay window
+    MainArea  :: 4; // Center/main tabbed area
+}
+
+// -----------------------------------------------------------------------------
+// 4. Event Subscription & Delivery
+// -----------------------------------------------------------------------------
+
+EventMask :: enum #flags (u32) {
+    ActiveFileChanged;  // 1 << 0: Active buffer path switched
+    BufferModified;     // 1 << 1: Active buffer text edited or saved
+    CursorMoved;        // 1 << 2: Cursor or selection changed
+    DiagnosticsUpdated; // 1 << 3: Compiler/LSP diagnostics refreshed
+    SymbolsUpdated;     // 1 << 4: AST/LSP symbols refreshed
+    ProcessEvent;       // 1 << 5: Child process output or exit
+    CommandInvoked;     // 1 << 6: Registered command palette action triggered
+    DebugStateChanged;  // 1 << 7: Breakpoint hit / stepped / stopped
+    KeyInput;           // 1 << 8: Raw key event while plugin pane is focused
+    WorkspaceChanged;   // 1 << 9: Files created/deleted/renamed in workspace
+}
+
+EventType :: enum (u32) {
+    None               :: 0;
+    ActiveFileChanged  :: 1;  // payload: UTF-8 relative path
+    BufferModified     :: 2;  // payload: UTF-8 JSON { path, version, saved }
+    CursorMoved        :: 3;  // payload: EditorCursor (binary POD)
+    DiagnosticsUpdated :: 4;  // payload: UTF-8 relative path (empty = all)
+    SymbolsUpdated     :: 5;  // payload: UTF-8 relative path
+    ProcessOutput      :: 6;  // payload: ProcessEventHeader + output bytes
+    ProcessExited      :: 7;  // payload: ProcessEventHeader (exit_code set)
+    CommandInvoked     :: 8;  // payload: UTF-8 JSON { id, arg }
+    DebugStateChanged  :: 9;  // payload: UTF-8 JSON DebugState
+    KeyInput           :: 10; // payload: KeyEvent (binary POD)
+    WorkspaceChanged   :: 11; // payload: UTF-8 relative dir path
+}
+
+// -----------------------------------------------------------------------------
+// 5. UI Flags & Widget Interaction States
+// -----------------------------------------------------------------------------
+
+TextFlags :: enum #flags (u32) {
+    Mono;          // Use monospace code font (default UI sans/mono)
+    Bold;          // Emphasized weight
+    AlignCenter;   // Horizontally center inside available width
+    AlignRight;    // Right-align relative to x
+    Ellipsis;      // Truncate with "..." when clipped
+}
+
+ButtonFlags :: enum #flags (u32) {
+    Primary;       // Accent-colored primary button
+    Danger;        // Red destructive/stop action
+    Ghost;         // Transparent background until hovered
+    Disabled;      // Non-interactive muted appearance
+    Active;        // Toggled/pressed visual state
+}
+
+WidgetState :: enum #flags (u32) {
+    Hovered;       // Pointer currently over widget
+    Active;        // Pointer currently pressed down on widget
+    Clicked;       // Completed click on this frame
+    DoubleClicked; // Completed double-click on this frame
+    Focused;       // Widget currently holds keyboard focus
+    Changed;       // Value changed on this frame (input/dropdown)
+    Submitted;     // Enter pressed inside input on this frame
+}
+
+TableRowFlags :: enum #flags (u32) {
+    Selected;      // Render with selection highlight
+    Header;        // Emphasized section divider row
+    Muted;         // Dimmed text style
+}
+
+GutterMarkerKind :: enum (u32) {
+    Breakpoint     :: 1; // Solid red dot on line gutter
+    DebugCurrent   :: 2; // Yellow/green execution arrow / line highlight
+    DiagnosticErr  :: 3; // Red error indicator
+    DiagnosticWarn :: 4; // Amber warning indicator
+    PluginCustom   :: 5; // Custom colored dot/tag
+}
+
+// -----------------------------------------------------------------------------
+// 6. Compiler, Process & Debugger Enums
+// -----------------------------------------------------------------------------
+
+BuildTarget :: enum (u32) {
+    WasmOnyx   :: 0; // onyx build -r onyx
+    WasmWasi   :: 1; // onyx build -r wasi
+    WasmJs     :: 2; // onyx build -r js
+    WasmCustom :: 3; // onyx build -r custom
+    NativeExe  :: 4; // onyx build-exe
+}
+
+BuildFlags :: enum #flags (u32) {
+    DebugInfo;          // --debug
+    NameSection;        // --generate-name-section
+    FunctionMappings;   // --print-function-mappings
+    StackTrace;         // --stack-trace
+    MultiThreaded;      // --multi-threaded
+    RunAfterBuild;      // Execute immediately after clean build
+}
+
+ProcState :: enum (u32) {
+    Invalid :: 0;
+    Running :: 1;
+    Exited  :: 2;
+    Failed  :: 3;
+    Killed  :: 4;
+}
+
+StreamMask :: enum #flags (u32) {
+    Stdout; // 1 << 0
+    Stderr; // 1 << 1
+}
+
+DebugCommand :: enum (u32) {
+    Continue        :: 1;
+    Pause           :: 2;
+    StepOver        :: 3;
+    StepInto        :: 4;
+    StepOut         :: 5;
+    StepInstruction :: 6;
+    Stop            :: 7;
+}
+
+DebugStatus :: enum (u32) {
+    Idle      :: 0;
+    Compiling :: 1;
+    Running   :: 2;
+    Paused    :: 3;
+    Exited    :: 4;
+    Error     :: 5;
+}
+
+SymbolKind :: enum (u32) {
+    Unknown   :: 0;
+    Procedure :: 1;
+    Struct    :: 2;
+    Enum      :: 3;
+    Union     :: 4;
+    Interface :: 5;
+    Global    :: 6;
+    Macro     :: 7;
+    Field     :: 8;
+    Package   :: 9;
+    Tag       :: 10;
+}
+
+DiagnosticSeverity :: enum (u32) {
+    Error   :: 1;
+    Warning :: 2;
+    Info    :: 3;
+    Hint    :: 4;
+}
+
+KeyMod :: enum #flags (u32) {
+    Shift;
+    Ctrl;
+    Alt;
+    Super;
+}
+
+MouseButton :: enum #flags (u32) {
+    Left;
+    Right;
+    Middle;
+}
+
+// -----------------------------------------------------------------------------
+// 7. Binary POD Structs (Fixed 4-byte alignment across WASM linear memory)
+// -----------------------------------------------------------------------------
+
+/// Passed to `odit_plugin_render(window_id, ctx_ptr)` every frame.
+/// Total size: 48 bytes (12 x 4-byte fields).
+FrameContext :: struct {
+    window_id:       u32; // Unique host-assigned pane instance ID
+    width:           f32; // Drawable content area width in pixels
+    height:          f32; // Drawable content area height in pixels
+    mouse_x:         f32; // Pointer X local to content area
+    mouse_y:         f32; // Pointer Y local to content area
+    wheel_y:         f32; // Vertical scroll wheel delta for this frame
+    mouse_down:      u32; // Bitmask of MouseButton currently held
+    mouse_pressed:   u32; // Bitmask of MouseButton pressed this frame
+    mouse_released:  u32; // Bitmask of MouseButton released this frame
+    key_mods:        u32; // Bitmask of KeyMod currently held
+    flags:           u32; // bit 0: pane focused, bit 1: pointer hovered over pane
+    delta_time:      f32; // Seconds since previous frame
+}
+
+FRAME_FLAG_FOCUSED :: 1 << 0
+FRAME_FLAG_HOVERED :: 1 << 1
+
+/// Written by `editor_get_cursor(out_ptr)` and `EventType.CursorMoved`.
+/// Total size: 28 bytes (7 x 4-byte fields).
+EditorCursor :: struct {
+    line:            u32; // 1-based line number
+    column:          u32; // 1-based UTF-8 column
+    byte_offset:     u32; // 0-based byte offset in active buffer
+    sel_start:       u32; // Selection start byte offset (== byte_offset if none)
+    sel_end:         u32; // Selection end byte offset
+    buffer_version:  u32; // Monotonic revision counter incremented on every edit
+    is_dirty:        u32; // 1 if active buffer has unsaved changes, else 0
+}
+
+/// Delivered with `EventType.KeyInput`.
+/// Total size: 16 bytes (4 x 4-byte fields).
+KeyEvent :: struct {
+    key_code:  u32; // Raylib key code
+    char_code: u32; // Unicode codepoint (0 if non-printable)
+    mods:      u32; // Bitmask of KeyMod
+    pressed:   u32; // 1 = pressed/repeat, 0 = released
+}
+
+/// Prefix header for `EventType.ProcessOutput` and `EventType.ProcessExited`.
+/// Total size: 16 bytes (4 x 4-byte fields). Output bytes follow immediately.
+ProcessEventHeader :: struct {
+    handle:    u32; // ProcessHandle returned by proc_spawn / compiler_build
+    state:     u32; // ProcState
+    exit_code: i32; // Valid when state == Exited
+    stream:    u32; // StreamMask (Stdout or Stderr)
+}
+
+// -----------------------------------------------------------------------------
+// 8. Structured JSON Payload Schemas (Shared by Host & Plugins)
+// -----------------------------------------------------------------------------
+
+/// Returned as JSON from `odit_plugin_manifest`.
+PluginManifest :: struct {
+    id:             str; // Unique plugin identifier, e.g. "odit.file_explorer"
+    title:          str; // Window header title, e.g. "File Explorer"
+    version:        str; // Semver string, e.g. "0.1.0"
+    default_slot:   u32; // DockSlot value
+    default_width:  f32; // Preferred initial width in pixels
+    default_height: f32; // Preferred initial height in pixels
+    event_mask:     u32; // Bitmask of EventMask the plugin subscribes to
+    allow_multiple: bool; // Whether multiple instances of this window can spawn
+}
+
+/// Element of JSON array returned by `workspace_list_dir`.
+DirEntry :: struct {
+    name:   str;
+    path:   str; // Workspace-relative path
+    is_dir: bool;
+    size:   u64;
+}
+
+/// Element of JSON array returned by `ast_get_symbols`.
+SymbolInfo :: struct {
+    name:       str;
+    kind:       u32;    // SymbolKind
+    detail:     str;    // Type signature / field type / return type
+    container:  str;    // Parent struct/package name if any
+    path:       str;    // Workspace-relative file path
+    line:       u32;    // 1-based start line
+    column:     u32;    // 1-based start column
+    end_line:   u32;    // 1-based end line
+    tags:       [] str; // Attached `@...` tags/annotations (for ORM/HTTP/etc.)
+}
+
+/// Element of JSON array returned by `ast_get_diagnostics`.
+Diagnostic :: struct {
+    path:     str;
+    line:     u32;
+    column:   u32;
+    length:   u32;
+    severity: u32; // DiagnosticSeverity
+    source:   str; // "onyx-lsp" or "onyx-compiler"
+    message:  str;
+}
+
+/// Element of JSON array returned by `docs_search`.
+DocEntry :: struct {
+    name:      str; // e.g. "core.conv.format" or "#format"
+    pkg:       str; // e.g. "core.conv" or "directive"
+    kind:      str; // "proc", "struct", "enum", "directive", "package"
+    signature: str;
+    summary:   str;
+    file:      str;
+    line:      u32;
+}
+
+/// Mapping entry between an Onyx source line and a WAT instruction line range.
+SourceWatMap :: struct {
+    onyx_line:      u32; // 1-based Onyx line number
+    wat_start_line: u32; // 0-based line index inside `wat_text`
+    wat_end_line:   u32; // 0-based inclusive end line index
+}
+
+/// Returned as JSON from `compiler_get_function_wat`.
+FunctionWatInfo :: struct {
+    func_name:     str;
+    wasm_func_idx: i32;
+    source_path:   str;
+    start_line:    u32;
+    end_line:      u32;
+    wat_text:      str;
+    line_map:      [] SourceWatMap;
+}
+
+/// Variable/local snapshot shown in Live Debugger.
+DebugVariable :: struct {
+    name:  str;
+    type:  str;
+    value: str;
+}
+
+/// Returned as JSON from `debug_get_state`.
+DebugState :: struct {
+    status:           u32; // DebugStatus
+    source_path:      str;
+    current_line:     u32; // Active Onyx source line (1-based, 0 if none)
+    current_func:     str; // Active WASM function name
+    current_wat_line: i32; // Highlighted instruction line in `wat_text` (-1 if none)
+    wat_text:         str; // Disassembled WAT for `current_func`
+    line_map:         [] SourceWatMap;
+    locals:           [] DebugVariable;
+    last_error:       str;
+}
+
+// -----------------------------------------------------------------------------
+// 9. Plugin-Side Foreign Imports (`#foreign "odit_host"`)
+// -----------------------------------------------------------------------------
+// Only compiled into WASM plugins (`-r custom`). The native host implements
+// every function below through the Wasmer bridge (`native/wasm_host.c` +
+// `src/plugin/host_abi.onyx`).
+
+#if runtime.runtime == .Custom {
+
+    #foreign "odit_host" {
+        // ---- A. Host Core, Logging & Command Palette ----
+
+        host_log              :: (level: u32, msg_ptr: u32, msg_len: u32) -> void ---
+        host_set_window_title :: (title_ptr: u32, title_len: u32) -> void ---
+        host_request_redraw   :: () -> void ---
+        host_notify           :: (severity: u32, msg_ptr: u32, msg_len: u32) -> void ---
+        host_register_command :: (id_ptr: u32, id_len: u32, label_ptr: u32, label_len: u32, shortcut_ptr: u32, shortcut_len: u32) -> u32 ---
+        host_execute_command  :: (id_ptr: u32, id_len: u32, arg_ptr: u32, arg_len: u32) -> i32 ---
+        host_spawn_plugin     :: (plugin_id_ptr: u32, plugin_id_len: u32) -> u32 ---
+
+        // ---- B. UI Drawing Primitives & Immediate Widgets ----
+
+        ui_push_clip         :: (x: f32, y: f32, w: f32, h: f32) -> void ---
+        ui_pop_clip          :: () -> void ---
+        ui_measure_text      :: (text_ptr: u32, text_len: u32, font_size: f32, flags: u32) -> f32 ---
+        ui_get_theme_color   :: (role: u32) -> u32 ---
+
+        ui_draw_rect         :: (x: f32, y: f32, w: f32, h: f32, radius: f32, fill_rgba: u32, border_rgba: u32, border_width: f32) -> void ---
+        ui_draw_line         :: (x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, rgba: u32) -> void ---
+        ui_draw_arrow        :: (x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, head_size: f32, rgba: u32) -> void ---
+        ui_draw_circle       :: (cx: f32, cy: f32, radius: f32, fill_rgba: u32, border_rgba: u32, border_width: f32) -> void ---
+        ui_draw_text         :: (x: f32, y: f32, text_ptr: u32, text_len: u32, font_size: f32, rgba: u32, flags: u32) -> void ---
+
+        ui_pill              :: (x: f32, y: f32, text_ptr: u32, text_len: u32, bg_rgba: u32, fg_rgba: u32) -> f32 ---
+        ui_button            :: (id: u32, x: f32, y: f32, w: f32, h: f32, label_ptr: u32, label_len: u32, style_flags: u32) -> u32 ---
+        ui_input             :: (id: u32, x: f32, y: f32, w: f32, h: f32, buf_ptr: u32, buf_len: u32, buf_cap: u32, placeholder_ptr: u32, placeholder_len: u32, out_len_ptr: u32) -> u32 ---
+        ui_dropdown          :: (id: u32, x: f32, y: f32, w: f32, h: f32, items_ptr: u32, items_len: u32, selected_idx: i32) -> i32 ---
+
+        ui_scroll_area_begin :: (id: u32, x: f32, y: f32, w: f32, h: f32, content_h: f32, scroll_y_ptr: u32) -> void ---
+        ui_scroll_area_end   :: () -> void ---
+
+        ui_table_begin       :: (id: u32, x: f32, y: f32, w: f32, h: f32, col_count: u32, headers_ptr: u32, headers_len: u32, col_widths_ptr: u32) -> void ---
+        ui_table_row         :: (row_id: u32, cells_ptr: u32, cells_len: u32, flags: u32) -> u32 ---
+        ui_table_end         :: () -> void ---
+
+        ui_texture_load      :: (path_ptr: u32, path_len: u32) -> u32 ---
+        ui_texture_unload    :: (handle: u32) -> void ---
+        ui_draw_texture      :: (handle: u32, x: f32, y: f32, w: f32, h: f32, tint_rgba: u32) -> void ---
+
+        // ---- C. Workspace, Editor Buffer, AST / LSP & Docs ----
+
+        workspace_get_root   :: (out_ptr: u32, out_cap: u32) -> i32 ---
+        workspace_list_dir   :: (rel_path_ptr: u32, rel_path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        workspace_read_file  :: (rel_path_ptr: u32, rel_path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        workspace_write_file :: (rel_path_ptr: u32, rel_path_len: u32, data_ptr: u32, data_len: u32) -> i32 ---
+        workspace_find_files :: (ext_ptr: u32, ext_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+
+        editor_get_active_path      :: (out_ptr: u32, out_cap: u32) -> i32 ---
+        editor_get_buffer_len       :: () -> i32 ---
+        editor_get_buffer           :: (out_ptr: u32, out_cap: u32) -> i32 ---
+        editor_get_cursor           :: (out_cursor_ptr: u32) -> i32 ---
+        editor_open_file            :: (path_ptr: u32, path_len: u32, line: i32, col: i32) -> i32 ---
+        editor_set_cursor           :: (line: i32, col: i32) -> void ---
+        editor_set_gutter_marker    :: (path_ptr: u32, path_len: u32, line: i32, kind: u32, rgba: u32) -> void ---
+        editor_clear_gutter_markers :: (kind: u32) -> void ---
+
+        ast_get_symbols      :: (path_ptr: u32, path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        ast_get_references   :: (path_ptr: u32, path_len: u32, line: u32, col: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        ast_get_diagnostics  :: (path_ptr: u32, path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        docs_search          :: (query_ptr: u32, query_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+
+        // ---- D. Process Execution & Compiler / WAT Disassembly ----
+
+        proc_spawn           :: (cmd_ptr: u32, cmd_len: u32, args_ptr: u32, args_len: u32, cwd_ptr: u32, cwd_len: u32) -> u32 ---
+        proc_poll_status     :: (handle: u32, out_exit_code_ptr: u32) -> u32 ---
+        proc_read_output     :: (handle: u32, stream_mask: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        proc_kill            :: (handle: u32) -> i32 ---
+
+        compiler_build            :: (entry_ptr: u32, entry_len: u32, target: u32, flags: u32) -> u32 ---
+        compiler_get_function_wat :: (file_ptr: u32, file_len: u32, func_ptr: u32, func_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+
+        // ---- E. Live Debugger (Onyx <-> WASM Stepper) ----
+
+        debug_toggle_breakpoint :: (path_ptr: u32, path_len: u32, line: u32) -> u32 ---
+        debug_get_breakpoints   :: (path_ptr: u32, path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        debug_start             :: (entry_ptr: u32, entry_len: u32) -> i32 ---
+        debug_command           :: (cmd: u32) -> i32 ---
+        debug_get_state         :: (out_ptr: u32, out_cap: u32) -> i32 ---
+    }
+
+}
+
+// -----------------------------------------------------------------------------
+// 10. Required Plugin Exports (Guest -> Host Contract)
+// -----------------------------------------------------------------------------
+// Every plugin `.wasm` MUST export the following functions (automatically
+// wired up by `sdk/plugin_sdk.onyx` for Onyx plugins):
+//
+//   memory               : linear memory (exported by compiler)
+//   _initialize          :: () -> void                 (exported by Onyx runtime)
+//   odit_abi_version     :: () -> u32                  (returns ABI_VERSION)
+//   odit_alloc           :: (size: u32) -> u32         (guest heap alloc)
+//   odit_free            :: (ptr: u32) -> void         (guest heap free)
+//   odit_plugin_manifest :: (out_ptr: u32, out_cap: u32) -> i32
+//   odit_plugin_init     :: (window_id: u32) -> i32    (0 = Ok, <0 = AbiError)
+//   odit_plugin_shutdown :: (window_id: u32) -> void
+//   odit_plugin_event    :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len: u32) -> void
+//   odit_plugin_render   :: (window_id: u32, ctx_ptr: u32) -> void
+// -----------------------------------------------------------------------------
