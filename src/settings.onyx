@@ -31,7 +31,12 @@ Settings :: struct {
 
 SETTINGS_FILE :: "odit.json"
 
-g_settings: Settings;
+g_settings:      Settings;
+g_settings_path: str = SETTINGS_FILE;
+
+settings_set_path :: (path: str) {
+    if path.count > 0 do g_settings_path = str.copy(path);
+}
 
 settings_defaults :: () -> Settings {
     return .{
@@ -72,14 +77,15 @@ settings_clamp :: (s: &Settings) {
     if s.theme.count == 0 do s.theme = "mocha";
 }
 
-settings_load :: (path: str = SETTINGS_FILE) -> bool {
+settings_load :: (path: str = "") -> bool {
+    eff := path if path.count > 0 else g_settings_path;
     g_settings = settings_defaults();
 
-    if !os.file_exists(path) {
+    if !os.file_exists(eff) {
         return false;
     }
 
-    contents := os.get_contents(path);
+    contents := os.get_contents(eff);
     if contents.count == 0 do return false;
     defer delete(&contents);
 
@@ -92,13 +98,14 @@ settings_load :: (path: str = SETTINGS_FILE) -> bool {
             return true;
         }
         case .Err {
-            printf("[odit] Warning: could not parse {}, using defaults\n", path);
+            printf("[odit] Warning: could not parse {}, using defaults\n", eff);
             return false;
         }
     }
 }
 
-settings_save :: (path: str = SETTINGS_FILE) -> bool {
+settings_save :: (path: str = "") -> bool {
+    eff := path if path.count > 0 else g_settings_path;
     settings_clamp(&g_settings);
     body := core.tprintf("""{{
     "editor_font_size": {},
@@ -128,7 +135,7 @@ settings_save :: (path: str = SETTINGS_FILE) -> bool {
         g_settings.split_ratio,
         g_settings.target_fps,
     );
-    return os.File.write_contents(path, body);
+    return os.File.write_contents(eff, body);
 }
 
 settings_reset :: () {

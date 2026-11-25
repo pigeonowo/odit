@@ -33,7 +33,17 @@ nu build.nu              # Build native Wasmer bridge, all WASM plugins, and hos
 nu build.nu test         # Run headless Host <-> WASM Plugin ABI self-test
 nu build.nu run          # Launch Onyx Editor (opens src/main.onyx)
 nu build.nu run path.onyx
+nu build.nu install      # Install `odit` globally to ~/.local/bin/odit
 ```
+
+### Use `odit` in Any Project
+After running `nu build.nu install` (or `./build.sh install`), you can open any Onyx project from anywhere:
+```bash
+cd ~/my-onyx-project && odit
+odit ~/my-onyx-project
+odit ~/my-onyx-project/main.onyx
+```
+Installed mode loads plugins from `$ODIT_HOME/plugins` (`~/.local/share/odit/plugins`), native `.so` libraries from `$ONYX_PATH/lib`, global settings/layout from `~/.config/odit/`, and project build settings from `<project>/odit-build.json`.
 
 ### Build & Run (Bash)
 ```bash

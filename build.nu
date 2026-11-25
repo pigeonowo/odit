@@ -10,6 +10,7 @@
 #   nu build.nu plugins      # Build all plugins/*/main.onyx -> build/plugins/*.wasm
 #   nu build.nu host         # Build only build/odit.wasm
 #   nu build.nu sync-raylib  # Patch (Onyx 2611) and sync pkg-raylib native lib
+#   nu build.nu install      # Install `odit` globally to ~/.local/bin/odit
 #   nu build.nu clean        # Remove build artifacts
 
 def onyx-path []: nothing -> string {
@@ -100,6 +101,41 @@ export def "main test" [] {
     with-env { ONYX_PATH: (onyx-path) } {
         ^$onyx run src/main.onyx -- --self-test
     }
+}
+
+# Install odit globally (`~/.local/share/odit`, `~/.onyx/lib/*.so`, `~/.local/bin/odit`)
+export def "main install" [] {
+    main
+    let home      = $env.HOME
+    let onyx_lib  = ((onyx-path) | path join "lib")
+    let odit_home = ($home | path join ".local" "share" "odit")
+    let odit_plug = ($odit_home | path join "plugins")
+    let bin_dir   = ($home | path join ".local" "bin")
+    let launcher  = ($bin_dir | path join "odit")
+
+    mkdir $onyx_lib $odit_home $odit_plug $bin_dir
+
+    print $"Installing native libraries -> ($onyx_lib)"
+    cp -f bin/odit_wasm_host.so $onyx_lib
+    cp -f bin/onyx_raylib.so $onyx_lib
+
+    print $"Installing odit.wasm & plugins -> ($odit_home)"
+    cp -f build/odit.wasm ($odit_home | path join "odit.wasm")
+    for p in (ls build/plugins/*.wasm) {
+        cp -f $p.name $odit_plug
+    }
+
+    let script = "#!/usr/bin/env bash
+set -euo pipefail
+export ONYX_PATH=\"${ONYX_PATH:-$HOME/.onyx}\"
+export ODIT_HOME=\"${ODIT_HOME:-$HOME/.local/share/odit}\"
+exec \"$ONYX_PATH/bin/onyx\" run \"$ODIT_HOME/odit.wasm\" -- \"$@\"
+"
+    $script | save -f $launcher
+    ^chmod +x $launcher
+
+    print $"Installed! Run `odit` from any project directory."
+    print $"Make sure ($bin_dir) is on your PATH."
 }
 
 # Clean generated build outputs

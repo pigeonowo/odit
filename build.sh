@@ -67,11 +67,31 @@ case "$CMD" in
         shift || true
         onyx run src/main.onyx -- "${1:-src/main.onyx}"
         ;;
+    install)
+        build_native
+        build_plugins
+        build_host
+        ODIT_HOME="${ODIT_HOME:-$HOME/.local/share/odit}"
+        BIN_DIR="$HOME/.local/bin"
+        mkdir -p "$ONYX_PATH/lib" "$ODIT_HOME/plugins" "$BIN_DIR"
+        cp -f bin/odit_wasm_host.so bin/onyx_raylib.so "$ONYX_PATH/lib/"
+        cp -f build/odit.wasm "$ODIT_HOME/odit.wasm"
+        cp -f build/plugins/*.wasm "$ODIT_HOME/plugins/"
+        cat > "$BIN_DIR/odit" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+export ONYX_PATH="${ONYX_PATH:-$HOME/.onyx}"
+export ODIT_HOME="${ODIT_HOME:-$HOME/.local/share/odit}"
+exec "$ONYX_PATH/bin/onyx" run "$ODIT_HOME/odit.wasm" -- "$@"
+EOF
+        chmod +x "$BIN_DIR/odit"
+        echo "Installed! Run 'odit' from any project directory (ensure $BIN_DIR is on PATH)."
+        ;;
     clean)
         rm -rf build bin/odit_wasm_host.so
         ;;
     *)
-        echo "Usage: $0 {all|native|plugins|host|sync-raylib|run [file]|test|clean}"
+        echo "Usage: $0 {all|native|plugins|host|sync-raylib|run [file]|test|install|clean}"
         exit 1
         ;;
 esac

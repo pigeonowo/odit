@@ -135,6 +135,7 @@ WindowManager :: struct {
     panes:             [..] PluginPane;
 
     // Cached layout restored from `odit-layout.json`
+    layout_path:       str;
     saved_panes:       [..] SavedPaneLayout;
     has_saved_layout:  bool;
     autosave:          bool;
@@ -179,6 +180,7 @@ wm_init :: (wm: &WindowManager) {
     wm.next_window_id    = 1;
     wm.next_z_order      = 1;
     wm.panes             = make([..] PluginPane);
+    wm.layout_path       = LAYOUT_FILE;
     wm.saved_panes       = make([..] SavedPaneLayout);
     wm.has_saved_layout  = false;
     wm.autosave          = true;
@@ -225,9 +227,10 @@ find_saved_pane :: (wm: &WindowManager, plugin_id: str) -> &SavedPaneLayout {
     return null;
 }
 
-wm_load_layout :: (wm: &WindowManager, path: str = LAYOUT_FILE) -> bool {
-    if !os.file_exists(path) do return false;
-    contents := os.get_contents(path);
+wm_load_layout :: (wm: &WindowManager, path: str = "") -> bool {
+    eff := path if path.count > 0 else wm.layout_path;
+    if !os.file_exists(eff) do return false;
+    contents := os.get_contents(eff);
     if contents.count == 0 do return false;
     defer delete(&contents);
 
@@ -254,14 +257,15 @@ wm_load_layout :: (wm: &WindowManager, path: str = LAYOUT_FILE) -> bool {
             return true;
         }
         case .Err {
-            printf("[odit] Warning: could not parse {}, using default layout\n", path);
+            printf("[odit] Warning: could not parse {}, using default layout\n", eff);
             return false;
         }
     }
 }
 
-wm_save_layout :: (wm: &WindowManager, path: str = LAYOUT_FILE) -> bool {
-    if !wm.autosave && str.equal(path, LAYOUT_FILE) do return true;
+wm_save_layout :: (wm: &WindowManager, path: str = "") -> bool {
+    eff := path if path.count > 0 else wm.layout_path;
+    if !wm.autosave && str.equal(eff, wm.layout_path) do return true;
     clamp_ratios(wm);
     out := make(dyn_str, 512, context.temp_allocator);
     Array.concat(&out, core.tprintf("""{{
@@ -295,7 +299,7 @@ wm_save_layout :: (wm: &WindowManager, path: str = LAYOUT_FILE) -> bool {
             float_h   = p.float_h,
         };
     }
-    return os.File.write_contents(path, out);
+    return os.File.write_contents(eff, out);
 }
 
 wm_reset_layout :: (wm: &WindowManager) {
