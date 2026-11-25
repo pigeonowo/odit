@@ -45,6 +45,15 @@ This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolc
 
 ---
 
+## Completed: Core Polish & Draggable Window Manager
+
+- [x] **Null-safe WASM Guest String Helpers (`sdk.free_str` / `sdk.copy_str`)**: Fixed WASM out-of-bounds traps caused by calling `str.free("")` (null pointer) or freeing static fallback literals in plugins (e.g., Docs Browser live search).
+- [x] **Plugin Mouse-Event Bitmask Fix**: Replaced `cast(u32) abi.MouseButton.Left if cond else 0` ternary expressions in `src/main.onyx` with explicit `if ... do mask |= ...;` statements so `FrameContext.mouse_pressed`/`mouse_down`/`mouse_released`/`key_mods` always transmit accurate bits to plugins (fixing File Explorer folder expand & file open clicks, Docs Browser row selection, and Build & Run clickable errors).
+- [x] **Draggable, Dockable & Floating Window Manager (`src/wm/layout.onyx`)**: Drag plugin title bars to swap panes, dock to Left/Right/Bottom edges with live drop-zone previews, or pop out into z-ordered, resizable floating windows; active splitters for all occupied dock zones; layout persisted automatically in `odit-layout.json`; plus Command Palette actions (`Window: Toggle Float / Dock`, `Dock Left/Right/Bottom`, `Reset Workspace Layout`).
+- [x] **Headless UI Interaction Regression Suite (`--self-test`)**: Exercises `odit_plugin_render` across all 5 plugins, Docs Browser live typing, File Explorer folder+file clicks, and Window Manager docking/swapping/floating/persistence assertions.
+
+---
+
 ## Next: Phase 4 — Live Debugger & Domain-Specific Mini-Apps
 
 ### Host Services (`src/services/debugger.onyx`)
@@ -75,3 +84,5 @@ Keep these in mind when extending the codebase:
    - `raylib.SetWindowState(...)` is used after `InitWindow` (`SetConfigFlags` is not bound in `pkg-raylib` 0.0.8).
    - `core.tprintf` uses a fixed 8,196-byte stack buffer; build arbitrarily large payloads (like LSP `didOpen`/`didChange`) with `dyn_str` + `Array.concat`.
    - `os.Process.spawn(..., non_blocking_io = true)` sets `O_NONBLOCK` on the child's stdin fd too, causing `onyx lsp` to see `EAGAIN` and exit. Use `native_proc_spawn` in `native/wasm_host.c` for all interactive/async child processes.
+   - **Avoid `cast(T) X if cond else 0` inline ternaries**: In Onyx 2611, `cast(u32) Enum.Val if cond else 0` can evaluate to `0` when combined with bitwise `|`; use explicit `if cond do mask |= cast(u32) Enum.Val;` statements instead.
+   - **Never call `str.free` on empty/static strings in WASM plugins**: Calling `raw_free(null)` reads `0xFFFFFFF8` and triggers a Wasmer out-of-bounds trap. Always use `sdk.free_str` and `sdk.copy_str`.

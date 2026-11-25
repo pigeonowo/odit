@@ -74,7 +74,11 @@ spawn_plugin_from_wasm :: (wasm_path: str) -> u32 {
     if !loaded do return 0;
 
     lp := loaded->unwrap();
-    wid := wm.wm_add_pane(&g_app.window_mgr, lp.handle, lp.manifest.id, lp.manifest.title, lp.manifest.event_mask);
+    wid := wm.wm_add_pane(
+        &g_app.window_mgr,
+        lp.handle, lp.manifest.id, lp.manifest.title, lp.manifest.event_mask,
+        wasm_path, lp.manifest.default_slot, lp.manifest.default_width, lp.manifest.default_height
+    );
     g_app.loaded_plugins << lp;
 
     plugin.wasm_plugin_init(lp.handle, wid);
@@ -153,6 +157,11 @@ register_builtin_commands :: () {
     ui.palette_register(&g_app.palette, "lsp.next_diag",        "LSP: Jump to Next Diagnostic",           "F8",       0);
     ui.palette_register(&g_app.palette, "lsp.restart",          "LSP: Restart Onyx Language Server",      "",         0);
     ui.palette_register(&g_app.palette, "wm.cycle_focus",       "Window: Cycle Pane Focus",               "Ctrl+Tab", 0);
+    ui.palette_register(&g_app.palette, "wm.toggle_float",      "Window: Toggle Float / Dock Focused Pane", "",       0);
+    ui.palette_register(&g_app.palette, "wm.dock_left",         "Window: Dock Focused Pane Left",         "",         0);
+    ui.palette_register(&g_app.palette, "wm.dock_right",        "Window: Dock Focused Pane Right",        "",         0);
+    ui.palette_register(&g_app.palette, "wm.dock_bottom",       "Window: Dock Focused Pane Bottom",       "",         0);
+    ui.palette_register(&g_app.palette, "wm.reset_layout",      "Window: Reset Workspace Layout",         "",         0);
     ui.palette_register(&g_app.palette, "wm.close_focused",     "Window: Close Focused Plugin Pane",      "",         0);
     ui.palette_register(&g_app.palette, "plugin.reload_all",    "Plugins: Reload All .wasm Plugins",      "",         0);
 }
@@ -256,9 +265,24 @@ execute_command :: (cmd: &ui.CommandEntry) {
         wm.wm_notify(&g_app.window_mgr, 1, "Restarting onyx-lsp...");
     } elseif str.equal(cmd.id, "wm.cycle_focus") {
         wm.wm_cycle_focus(&g_app.window_mgr);
+    } elseif str.equal(cmd.id, "wm.toggle_float") {
+        if g_app.window_mgr.focused_window_id > 0 {
+            wm.wm_toggle_float(&g_app.window_mgr, g_app.window_mgr.focused_window_id);
+        } else {
+            wm.wm_notify(&g_app.window_mgr, 2, "Focus a plugin pane first to float/dock it");
+        }
+    } elseif str.equal(cmd.id, "wm.dock_left") {
+        if g_app.window_mgr.focused_window_id > 0 do wm.wm_set_pane_dock(&g_app.window_mgr, g_app.window_mgr.focused_window_id, .LeftSide);
+    } elseif str.equal(cmd.id, "wm.dock_right") {
+        if g_app.window_mgr.focused_window_id > 0 do wm.wm_set_pane_dock(&g_app.window_mgr, g_app.window_mgr.focused_window_id, .RightGrid);
+    } elseif str.equal(cmd.id, "wm.dock_bottom") {
+        if g_app.window_mgr.focused_window_id > 0 do wm.wm_set_pane_dock(&g_app.window_mgr, g_app.window_mgr.focused_window_id, .Bottom);
+    } elseif str.equal(cmd.id, "wm.reset_layout") {
+        wm.wm_reset_layout(&g_app.window_mgr);
     } elseif str.equal(cmd.id, "wm.close_focused") {
         if g_app.window_mgr.focused_window_id > 0 {
             close_plugin_window(g_app.window_mgr.focused_window_id);
+            if !g_app.headless_test do wm.wm_save_layout(&g_app.window_mgr);
         }
     } elseif str.equal(cmd.id, "plugin.reload_all") {
         reload_all_plugins();
@@ -266,6 +290,7 @@ execute_command :: (cmd: &ui.CommandEntry) {
         fname := cmd.id["plugin.spawn.".count .. cmd.id.count];
         wasm_path := core.tprintf("build/plugins/{}", fname);
         if spawn_plugin_from_wasm(wasm_path) > 0 {
+            if !g_app.headless_test do wm.wm_save_layout(&g_app.window_mgr);
             wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Opened {}", fname));
         } else {
             wm.wm_notify(&g_app.window_mgr, 3, core.tprintf("Failed to open {}", fname));
@@ -331,6 +356,7 @@ open_file_in_editor :: (path: str, line: i32 = 1, col: i32 = 1) -> bool {
 
 run_headless_selftest :: () {
     println("[odit] Running headless WASM plugin ABI + Settings + Onyx LSP self-test...");
+    g_app.headless_test = true;
     g_app.workspace_root = ".";
     settings.settings_load();
     printf("[odit] Loaded settings: font={}px, ui_scale={}, theme='{}'\n",
@@ -338,6 +364,7 @@ run_headless_selftest :: () {
            settings.g_settings.ui_scale,
            settings.g_settings.theme);
     wm.wm_init(&g_app.window_mgr);
+    g_app.window_mgr.autosave = false;
     ui.palette_init(&g_app.palette);
     editor.buffer_init(&g_app.ed.buf);
     editor.buffer_load_file(&g_app.ed.buf, "src/settings.onyx");
@@ -529,6 +556,46 @@ run_headless_selftest :: () {
         }
     }
 
+    // 4) Window Manager docking, swapping, floating z-order occlusion, and layout persistence tests
+    wm.wm_set_pane_dock(&g_app.window_mgr, wid_fe, .LeftSide);
+    wm.wm_set_pane_dock(&g_app.window_mgr, wid_br, .Bottom);
+    wm.wm_set_pane_dock(&g_app.window_mgr, wid_wat, .RightGrid);
+    wm.wm_toggle_float(&g_app.window_mgr, wid_doc);
+    wm.wm_compute_rects(&g_app.window_mgr, 1440.0f, 900.0f);
+
+    p_fe  := wm.wm_find_pane(&g_app.window_mgr, wid_fe);
+    p_br  := wm.wm_find_pane(&g_app.window_mgr, wid_br);
+    p_wat := wm.wm_find_pane(&g_app.window_mgr, wid_wat);
+    p_doc := wm.wm_find_pane(&g_app.window_mgr, wid_doc);
+    if p_fe == null || p_br == null || p_wat == null || p_doc == null ||
+       !(p_fe.rect.x < g_app.window_mgr.editor_rect.x) ||
+       !(g_app.window_mgr.editor_rect.x + g_app.window_mgr.editor_rect.w < p_wat.rect.x) ||
+       !(g_app.window_mgr.editor_rect.y + g_app.window_mgr.editor_rect.h < p_br.rect.y) ||
+       p_doc.dock_zone != .Floating {
+        println("[odit] FAIL: WindowManager dock geometry assertion failed");
+        os.exit(1);
+    }
+    // Floating pane must occlude content hit-testing over its center
+    hit_wid := wm.wm_content_pane_at(&g_app.window_mgr, p_doc.content_rect.x + 20.0f, p_doc.content_rect.y + 20.0f);
+    if hit_wid != wid_doc {
+        printf("[odit] FAIL: Expected floating pane {} to occlude hit-test, got {}\n", wid_doc, hit_wid);
+        os.exit(1);
+    }
+    // Swap LeftSide and Bottom panes
+    wm.wm_swap_panes(&g_app.window_mgr, wid_fe, wid_br);
+    if wm.wm_find_pane(&g_app.window_mgr, wid_fe).dock_zone != .Bottom ||
+       wm.wm_find_pane(&g_app.window_mgr, wid_br).dock_zone != .LeftSide {
+        println("[odit] FAIL: WindowManager pane swap failed");
+        os.exit(1);
+    }
+    // Save & reload layout round-trip to build/.test_layout.json
+    if !wm.wm_save_layout(&g_app.window_mgr, "build/.test_layout.json") ||
+       !wm.wm_load_layout(&g_app.window_mgr, "build/.test_layout.json") {
+        println("[odit] FAIL: WindowManager layout save/load round-trip failed");
+        os.exit(1);
+    }
+    println("[odit] PASS: WindowManager dock/swap/float/z-order/persistence tests succeeded!");
+
     close_plugin_window(wid_w);
     close_plugin_window(wid_doc);
     close_plugin_window(wid_wat);
@@ -536,6 +603,56 @@ run_headless_selftest :: () {
     close_plugin_window(wid_fe);
     lsp.lsp_shutdown(&g_app.lsp_client);
     println("[odit] PASS: All 5 WASM plugins + Onyx LSP + WAT Disassembly + Core Docs self-test succeeded!");
+}
+
+render_plugin_pane :: (
+    pane: &wm.PluginPane,
+    mpos: raylib.Vector2,
+    mdown, mpress, mrel, kmods: u32,
+    dt: f32,
+    overlay_open: bool,
+    hovered_wid: u32
+) {
+    is_floating := pane.dock_zone == .Floating;
+    is_dragging := g_app.window_mgr.drag_active && g_app.window_mgr.drag_window_id == pane.window_id;
+    p_focused   := g_app.window_mgr.focused_window_id == pane.window_id && !overlay_open;
+    p_hovered   := !overlay_open && hovered_wid == pane.window_id;
+
+    wm.wm_draw_pane_frame(pane.rect, pane.title, p_focused, true, is_floating, is_dragging);
+
+    if lp := find_loaded_plugin(pane.plugin_handle); lp != null {
+        ui.ui_begin_pane(
+            pane.window_id,
+            pane.content_rect.x, pane.content_rect.y,
+            pane.content_rect.w, pane.content_rect.h,
+            p_focused, p_hovered
+        );
+
+        fflags: u32 = 0;
+        if p_focused do fflags |= abi.FRAME_FLAG_FOCUSED;
+        if p_hovered do fflags |= abi.FRAME_FLAG_HOVERED;
+
+        fctx := abi.FrameContext.{
+            window_id      = pane.window_id,
+            width          = pane.content_rect.w,
+            height         = pane.content_rect.h,
+            mouse_x        = mpos.x - pane.content_rect.x,
+            mouse_y        = mpos.y - pane.content_rect.y,
+            wheel_y        = raylib.GetMouseWheelMove() if p_hovered else 0.0,
+            mouse_down     = mdown,
+            mouse_pressed  = mpress,
+            mouse_released = mrel,
+            key_mods       = kmods,
+            flags          = fflags,
+            delta_time     = dt,
+        };
+        plugin.plugin_render_with_ctx(lp, pane.window_id, &fctx);
+        ui.ui_end_pane();
+    }
+
+    if is_floating {
+        wm.wm_draw_floating_grip(pane.rect, p_focused);
+    }
 }
 
 main :: (args: [] cstr) {
@@ -590,12 +707,25 @@ main :: (args: [] cstr) {
 
     if plugin.plugin_runtime_init() {
         discover_plugins();
-        // Auto-spawn Phase 3.1 Core Mini-Apps on startup
-        if os.file_exists("build/plugins/file_explorer.wasm") {
-            spawn_plugin_from_wasm("build/plugins/file_explorer.wasm");
-        }
-        if os.file_exists("build/plugins/build_run.wasm") {
-            spawn_plugin_from_wasm("build/plugins/build_run.wasm");
+        wm.wm_load_layout(&g_app.window_mgr);
+        if g_app.window_mgr.has_saved_layout && g_app.window_mgr.saved_panes.count > 0 {
+            saved_paths := make([..] str, context.temp_allocator);
+            for &sp in g_app.window_mgr.saved_panes {
+                if sp.wasm_path.count > 0 && os.file_exists(sp.wasm_path) {
+                    saved_paths << str.copy(sp.wasm_path, context.temp_allocator);
+                }
+            }
+            for p in saved_paths {
+                spawn_plugin_from_wasm(p);
+            }
+        } else {
+            // Auto-spawn Phase 3.1 Core Mini-Apps on first run
+            if os.file_exists("build/plugins/file_explorer.wasm") {
+                spawn_plugin_from_wasm("build/plugins/file_explorer.wasm");
+            }
+            if os.file_exists("build/plugins/build_run.wasm") {
+                spawn_plugin_from_wasm("build/plugins/build_run.wasm");
+            }
         }
     } else {
         wm.wm_notify(&g_app.window_mgr, 3, "WASM runtime failed to initialize (check libwasmer.so)");
@@ -668,18 +798,22 @@ main :: (args: [] cstr) {
 
         overlay_open := g_app.palette.open || g_app.file_finder.open || g_app.settings_view.open;
 
-        // Update tiled window manager layout
+        // Update draggable/dockable/floating window manager layout
         closed_wid := wm.wm_update_layout(&g_app.window_mgr, screen_w, screen_h, dt, overlay_open);
         if closed_wid > 0 {
             close_plugin_window(closed_wid);
+            wm.wm_save_layout(&g_app.window_mgr);
         }
 
         // Focus routing: clear plugin text input focus when main editor is focused
+        mpos := raylib.GetMousePosition();
         editor_focused := g_app.window_mgr.focused_window_id == 0 && !overlay_open;
         if editor_focused do ui.ui_clear_focused_input();
+        editor_mouse_blocked := overlay_open || wm.wm_is_busy(&g_app.window_mgr) ||
+                                wm.wm_point_over_floating(&g_app.window_mgr, mpos.x, mpos.y);
 
         // Update core code editor
-        ed_ev := editor.editor_update(&g_app.ed, g_app.window_mgr.editor_content, editor_focused, dt, overlay_open, &g_app.lsp_client);
+        ed_ev := editor.editor_update(&g_app.ed, g_app.window_mgr.editor_content, editor_focused, dt, editor_mouse_blocked, &g_app.lsp_client);
         if ed_ev.req_hover {
             lsp.lsp_request_hover(&g_app.lsp_client, g_app.ed.buf.path, g_app.ed.buf.cursor_line, g_app.ed.buf.cursor_col);
         }
@@ -761,11 +895,10 @@ main :: (args: [] cstr) {
         wm.wm_draw_pane_frame(g_app.window_mgr.editor_rect, ed_title, g_app.window_mgr.focused_window_id == 0, false);
         editor.editor_draw(&g_app.ed, g_app.window_mgr.editor_content, editor_focused, &g_app.lsp_client);
 
-        // Prepare plugin UI frame input & render each active WASM plugin pane
+        // Prepare plugin UI frame input & render docked panes first, then z-sorted floating panes
         capture_plugin_keys := !overlay_open && g_app.window_mgr.focused_window_id > 0;
         ui.ui_begin_frame(dt, capture_plugin_keys);
 
-        mpos := raylib.GetMousePosition();
         mdown: u32 = 0;
         if raylib.IsMouseButtonDown(.LEFT)   do mdown |= cast(u32) abi.MouseButton.Left;
         if raylib.IsMouseButtonDown(.RIGHT)  do mdown |= cast(u32) abi.MouseButton.Right;
@@ -786,38 +919,25 @@ main :: (args: [] cstr) {
         if ctrl                                                            do kmods |= cast(u32) abi.KeyMod.Ctrl;
         if raylib.IsKeyDown(.LEFT_ALT) || raylib.IsKeyDown(.RIGHT_ALT)     do kmods |= cast(u32) abi.KeyMod.Alt;
 
-        for &pane in g_app.window_mgr.panes {
-            p_focused := g_app.window_mgr.focused_window_id == pane.window_id && !overlay_open;
-            p_hovered := !overlay_open && wm.hit_rect(mpos.x, mpos.y, pane.content_rect);
-            wm.wm_draw_pane_frame(pane.rect, pane.title, p_focused, true);
-
-            if lp := find_loaded_plugin(pane.plugin_handle); lp != null {
-                ui.ui_begin_pane(
-                    pane.window_id,
-                    pane.content_rect.x, pane.content_rect.y,
-                    pane.content_rect.w, pane.content_rect.h,
-                    p_focused, p_hovered
-                );
-
-                fctx := abi.FrameContext.{
-                    window_id      = pane.window_id,
-                    width          = pane.content_rect.w,
-                    height         = pane.content_rect.h,
-                    mouse_x        = mpos.x - pane.content_rect.x,
-                    mouse_y        = mpos.y - pane.content_rect.y,
-                    wheel_y        = raylib.GetMouseWheelMove() if p_hovered else 0.0,
-                    mouse_down     = mdown,
-                    mouse_pressed  = mpress,
-                    mouse_released = mrel,
-                    key_mods       = kmods,
-                    flags          = (abi.FRAME_FLAG_FOCUSED if p_focused else 0) |
-                                     (abi.FRAME_FLAG_HOVERED if p_hovered else 0),
-                    delta_time     = dt,
-                };
-                plugin.plugin_render_with_ctx(lp, pane.window_id, &fctx);
-                ui.ui_end_pane();
-            }
+        hovered_wid: u32 = 0xFFFFFFFF;
+        if !overlay_open && !wm.wm_is_busy(&g_app.window_mgr) {
+            hovered_wid = wm.wm_content_pane_at(&g_app.window_mgr, mpos.x, mpos.y);
         }
+
+        // Pass 1: Docked plugin panes (LeftSide, RightGrid, Bottom)
+        for &pane in g_app.window_mgr.panes {
+            if pane.dock_zone == .Floating do continue;
+            render_plugin_pane(pane, mpos, mdown, mpress, mrel, kmods, dt, overlay_open, hovered_wid);
+        }
+
+        // Pass 2: Floating plugin panes (sorted back-to-front by z_order)
+        float_idxs := wm.wm_floating_indices_sorted(&g_app.window_mgr, context.temp_allocator);
+        for idx in float_idxs {
+            render_plugin_pane(&g_app.window_mgr.panes[idx], mpos, mdown, mpress, mrel, kmods, dt, overlay_open, hovered_wid);
+        }
+
+        // Pass 3: Live drag-and-drop docking / swap / float preview overlay
+        wm.wm_draw_drag_overlay(&g_app.window_mgr);
 
         // Draw Command Palette overlay (if open)
         if chosen := ui.palette_update_and_draw(&g_app.palette, screen_w, screen_h); chosen != null {

@@ -1,45 +1,143 @@
 package odit.wm
 
 // =============================================================================
-// Onyx Editor ("odit") — Dockable / Tiled Window Manager
+// Onyx Editor ("odit") — Draggable, Dockable & Floating Window Manager
 // =============================================================================
 // Manages the multi-pane workspace:
-//   - Top IDE bar (`28px`) and bottom status bar (`24px`)
-//   - Main vertical splitter dividing the Core Code Editor (left) from the
-//     tiled grid of active WASM Plugin Windows (right)
-//   - Draggable splitter resize, click-to-focus, close button, and dynamic
-//     spawning/closing of plugin windows
+//   - Top IDE bar & bottom status bar
+//   - Core Code Editor in the center, surrounded by dynamic dock zones:
+//       * LeftSide  (vertical stack, resizable left splitter)
+//       * RightGrid (1-col or 2-col tiled grid, resizable right splitter)
+//       * Bottom    (horizontal strip beneath editor, resizable bottom splitter)
+//       * Floating  (free-moving, z-ordered, resizable overlay windows)
+//   - Title-bar drag-and-drop:
+//       * Drag near Left / Right / Bottom edge -> dock into that zone
+//       * Drag onto another docked pane        -> swap slots & order
+//       * Drag into open center area           -> detach into a Floating window
+//       * Header `[ ]` / `v` button            -> quick toggle Float <-> Dock
+//   - Automatic layout persistence in `odit-layout.json`
 
-use core { package, math }
+use core { package, math, os, Array, printf }
+use core.encoding.json
 use raylib
 use odit.theme
 use odit.settings
+
+LAYOUT_FILE :: "odit-layout.json"
 
 PaneRect :: struct {
     x, y, w, h: f32;
 }
 
+DockZone :: enum (u32) {
+    RightGrid :: 0;
+    LeftSide  :: 1;
+    Bottom    :: 2;
+    Floating  :: 3;
+}
+
+SplitterKind :: enum (u32) {
+    None   :: 0;
+    Left   :: 1;
+    Right  :: 2;
+    Bottom :: 3;
+}
+
+DropKind :: enum (u32) {
+    None       :: 0;
+    DockLeft   :: 1;
+    DockRight  :: 2;
+    DockBottom :: 3;
+    SwapPane   :: 4;
+    FloatFree  :: 5;
+}
+
+SavedPaneLayout :: struct {
+    plugin_id: str;
+    wasm_path: str;
+    dock_zone: u32;
+    float_x:   f32;
+    float_y:   f32;
+    float_w:   f32;
+    float_h:   f32;
+}
+
+SavedWorkspaceLayout :: struct {
+    left_ratio:   f32;
+    right_ratio:  f32;
+    bottom_ratio: f32;
+    panes:        [] SavedPaneLayout;
+}
+
 PluginPane :: struct {
-    window_id:     u32;
-    plugin_handle: u32;
-    plugin_id:     str;
-    title:         str;
-    event_mask:    u32;
-    rect:          PaneRect;
-    content_rect:  PaneRect;
-    alive:         bool;
+    window_id:      u32;
+    plugin_handle:  u32;
+    plugin_id:      str;
+    wasm_path:      str;
+    title:          str;
+    event_mask:     u32;
+    dock_zone:      DockZone;
+    last_dock_zone: DockZone;
+    float_x:        f32;
+    float_y:        f32;
+    float_w:        f32;
+    float_h:        f32;
+    z_order:        u32;
+    rect:           PaneRect;
+    content_rect:   PaneRect;
+    alive:          bool;
 }
 
 WindowManager :: struct {
-    split_ratio:       f32;  // Left editor ratio [0.25 .. 0.85], default 0.58
-    dragging_splitter: bool;
+    // Dock ratios
+    left_ratio:        f32; // [0.12 .. 0.42], default 0.21
+    right_ratio:       f32; // [0.15 .. 0.65], default 0.38
+    bottom_ratio:      f32; // [0.15 .. 0.58], default 0.30
 
+    // Splitter drag & hover state
+    active_splitter:   SplitterKind;
+    hovered_splitter:  SplitterKind;
+    has_left:          bool;
+    has_right:         bool;
+    has_bottom:        bool;
+    left_split_x:      f32;
+    right_split_x:     f32;
+    bottom_split_y:    f32;
+    center_col_x:      f32;
+    center_col_w:      f32;
+    work_rect:         PaneRect;
+
+    // Title-bar drag-and-drop state
+    drag_window_id:    u32;
+    drag_active:       bool;
+    drag_start_x:      f32;
+    drag_start_y:      f32;
+    drag_offset_x:     f32;
+    drag_offset_y:     f32;
+    drop_kind:         DropKind;
+    drop_target_wid:   u32;
+    drop_preview:      PaneRect;
+
+    // Floating window resize grip state
+    resize_window_id:  u32;
+    resize_start_x:    f32;
+    resize_start_y:    f32;
+    resize_orig_w:     f32;
+    resize_orig_h:     f32;
+
+    // Focus & z-order
     focused_window_id: u32;  // 0 = main code editor, >0 = plugin window_id
     next_window_id:    u32;
+    next_z_order:      u32;
 
     editor_rect:       PaneRect;
     editor_content:    PaneRect;
     panes:             [..] PluginPane;
+
+    // Cached layout restored from `odit-layout.json`
+    saved_panes:       [..] SavedPaneLayout;
+    has_saved_layout:  bool;
+    autosave:          bool;
 
     // Status toast notification
     toast_text:        str;
@@ -58,37 +156,205 @@ status_bar_h :: () -> f32 { return 26.0f * settings.g_settings.ui_scale; }
 header_h     :: () -> f32 { return 28.0f * settings.g_settings.ui_scale; }
 SPLITTER_W   :: 5.0f
 PANE_GAP     :: 4.0f
+DOCK_EDGE_PX :: 58.0f
+RESIZE_GRIP  :: 16.0f
 
 wm_init :: (wm: &WindowManager) {
-    wm.split_ratio       = settings.g_settings.split_ratio;
-    wm.dragging_splitter = false;
+    wm.left_ratio        = 0.21f;
+    wm.right_ratio       = 1.0f - settings.g_settings.split_ratio;
+    if wm.right_ratio < 0.15f do wm.right_ratio = 0.38f;
+    if wm.right_ratio > 0.65f do wm.right_ratio = 0.65f;
+    wm.bottom_ratio      = 0.30f;
+
+    wm.active_splitter   = .None;
+    wm.hovered_splitter  = .None;
+    wm.drag_window_id    = 0;
+    wm.drag_active       = false;
+    wm.drop_kind         = .None;
+    wm.drop_target_wid   = 0;
+    wm.resize_window_id  = 0;
+
     wm.focused_window_id = 0;
     wm.next_window_id    = 1;
+    wm.next_z_order      = 1;
     wm.panes             = make([..] PluginPane);
+    wm.saved_panes       = make([..] SavedPaneLayout);
+    wm.has_saved_layout  = false;
+    wm.autosave          = true;
     wm.toast_text        = "";
-    wm.toast_timer       = 0.0;
+    wm.toast_timer       = 0.0f;
 }
 
 wm_notify :: (wm: &WindowManager, severity: u32, msg: str) {
-    if wm.toast_text.count > 0 {
-        // Free previous owned copy if needed; kept simple with heap copy
-    }
     wm.toast_text     = str.copy(msg);
     wm.toast_severity = severity;
-    wm.toast_timer    = 3.5;
+    wm.toast_timer    = 3.5f;
 }
 
-wm_add_pane :: (wm: &WindowManager, plugin_handle: u32, plugin_id: str, title: str, event_mask: u32) -> u32 {
+wm_is_busy :: (wm: &WindowManager) -> bool {
+    return wm.active_splitter != .None || wm.drag_active || wm.resize_window_id != 0;
+}
+
+#local
+clamp_ratios :: (wm: &WindowManager) {
+    if wm.left_ratio   < 0.12f do wm.left_ratio   = 0.12f;
+    if wm.left_ratio   > 0.42f do wm.left_ratio   = 0.42f;
+    if wm.right_ratio  < 0.15f do wm.right_ratio  = 0.15f;
+    if wm.right_ratio  > 0.65f do wm.right_ratio  = 0.65f;
+    if wm.bottom_ratio < 0.15f do wm.bottom_ratio = 0.15f;
+    if wm.bottom_ratio > 0.58f do wm.bottom_ratio = 0.58f;
+}
+
+#local
+to_valid_zone :: (raw: u32) -> DockZone {
+    return switch raw {
+        case 1 => .LeftSide;
+        case 2 => .Bottom;
+        case 3 => .Floating;
+        case _ => .RightGrid;
+    };
+}
+
+#local
+find_saved_pane :: (wm: &WindowManager, plugin_id: str) -> &SavedPaneLayout {
+    for &sp in wm.saved_panes {
+        if str.equal(sp.plugin_id, plugin_id) do return sp;
+    }
+    return null;
+}
+
+wm_load_layout :: (wm: &WindowManager, path: str = LAYOUT_FILE) -> bool {
+    if !os.file_exists(path) do return false;
+    contents := os.get_contents(path);
+    if contents.count == 0 do return false;
+    defer delete(&contents);
+
+    switch json.decode_as(contents, SavedWorkspaceLayout) {
+        case .Ok as loaded {
+            if loaded.left_ratio   > 0.05f do wm.left_ratio   = loaded.left_ratio;
+            if loaded.right_ratio  > 0.05f do wm.right_ratio  = loaded.right_ratio;
+            if loaded.bottom_ratio > 0.05f do wm.bottom_ratio = loaded.bottom_ratio;
+            clamp_ratios(wm);
+
+            Array.clear(&wm.saved_panes);
+            for &sp in loaded.panes {
+                wm.saved_panes << .{
+                    plugin_id = str.copy(sp.plugin_id),
+                    wasm_path = str.copy(sp.wasm_path),
+                    dock_zone = sp.dock_zone,
+                    float_x   = sp.float_x,
+                    float_y   = sp.float_y,
+                    float_w   = sp.float_w,
+                    float_h   = sp.float_h,
+                };
+            }
+            wm.has_saved_layout = true;
+            return true;
+        }
+        case .Err {
+            printf("[odit] Warning: could not parse {}, using default layout\n", path);
+            return false;
+        }
+    }
+}
+
+wm_save_layout :: (wm: &WindowManager, path: str = LAYOUT_FILE) -> bool {
+    if !wm.autosave && str.equal(path, LAYOUT_FILE) do return true;
+    clamp_ratios(wm);
+    out := make(dyn_str, 512, context.temp_allocator);
+    Array.concat(&out, core.tprintf("""{{
+    "left_ratio": {},
+    "right_ratio": {},
+    "bottom_ratio": {},
+    "panes": [
+""", wm.left_ratio, wm.right_ratio, wm.bottom_ratio));
+
+    for i in 0 .. wm.panes.count {
+        p := &wm.panes[i];
+        comma := "," if (i + 1 < wm.panes.count) else "";
+        Array.concat(&out, core.tprintf(
+            "        {{\"plugin_id\":\"{}\",\"wasm_path\":\"{}\",\"dock_zone\":{},\"float_x\":{},\"float_y\":{},\"float_w\":{},\"float_h\":{}}}{}\n",
+            p.plugin_id, p.wasm_path, cast(u32) p.dock_zone,
+            p.float_x, p.float_y, p.float_w, p.float_h, comma
+        ));
+    }
+    Array.concat(&out, "    ]\n}\n");
+
+    // Also update in-memory saved cache so re-opening closed plugins remembers their spot
+    Array.clear(&wm.saved_panes);
+    for &p in wm.panes {
+        wm.saved_panes << .{
+            plugin_id = str.copy(p.plugin_id),
+            wasm_path = str.copy(p.wasm_path),
+            dock_zone = cast(u32) p.dock_zone,
+            float_x   = p.float_x,
+            float_y   = p.float_y,
+            float_w   = p.float_w,
+            float_h   = p.float_h,
+        };
+    }
+    return os.File.write_contents(path, out);
+}
+
+wm_reset_layout :: (wm: &WindowManager) {
+    wm.left_ratio   = 0.21f;
+    wm.right_ratio  = 0.38f;
+    wm.bottom_ratio = 0.30f;
+    for &p in wm.panes {
+        p.dock_zone      = .RightGrid;
+        p.last_dock_zone = .RightGrid;
+    }
+    wm_save_layout(wm);
+    wm_notify(wm, 1, "Workspace layout reset");
+}
+
+wm_add_pane :: (
+    wm: &WindowManager,
+    plugin_handle: u32,
+    plugin_id: str,
+    title: str,
+    event_mask: u32,
+    wasm_path: str = "",
+    default_slot: u32 = 0,
+    default_w: f32 = 440.0f,
+    default_h: f32 = 380.0f
+) -> u32 {
     wid := wm.next_window_id;
     wm.next_window_id += 1;
 
+    zone := to_valid_zone(default_slot);
+    fx: f32 = 160.0f + cast(f32) ((wid - 1) % 6) * 32.0f;
+    fy: f32 = 90.0f  + cast(f32) ((wid - 1) % 6) * 28.0f;
+    fw: f32 = default_w if default_w >= 260.0f else 440.0f;
+    fh: f32 = default_h if default_h >= 180.0f else 380.0f;
+
+    if sp := find_saved_pane(wm, plugin_id); sp != null {
+        zone = to_valid_zone(sp.dock_zone);
+        if sp.float_w >= 260.0f do fw = sp.float_w;
+        if sp.float_h >= 180.0f do fh = sp.float_h;
+        if sp.float_x > 0.0f    do fx = sp.float_x;
+        if sp.float_y > 0.0f    do fy = sp.float_y;
+    }
+
+    last_dock := zone if zone != .Floating else .RightGrid;
+    z := wm.next_z_order;
+    wm.next_z_order += 1;
+
     wm.panes << .{
-        window_id     = wid,
-        plugin_handle = plugin_handle,
-        plugin_id     = str.copy(plugin_id),
-        title         = str.copy(title),
-        event_mask    = event_mask,
-        alive         = true,
+        window_id      = wid,
+        plugin_handle  = plugin_handle,
+        plugin_id      = str.copy(plugin_id),
+        wasm_path      = str.copy(wasm_path),
+        title          = str.copy(title),
+        event_mask     = event_mask,
+        dock_zone      = zone,
+        last_dock_zone = last_dock,
+        float_x        = fx,
+        float_y        = fy,
+        float_w        = fw,
+        float_h        = fh,
+        z_order        = z,
+        alive          = true,
     };
     return wid;
 }
@@ -107,6 +373,88 @@ wm_find_pane_by_handle :: (wm: &WindowManager, handle: u32) -> &PluginPane {
     return null;
 }
 
+wm_bring_to_front :: (wm: &WindowManager, window_id: u32) {
+    if p := wm_find_pane(wm, window_id); p != null {
+        p.z_order = wm.next_z_order;
+        wm.next_z_order += 1;
+    }
+}
+
+wm_toggle_float :: (wm: &WindowManager, window_id: u32) -> bool {
+    p := wm_find_pane(wm, window_id);
+    if p == null do return false;
+
+    if p.dock_zone == .Floating {
+        p.dock_zone = p.last_dock_zone if p.last_dock_zone != .Floating else .RightGrid;
+        wm_notify(wm, 1, core.tprintf("Docked '{}'", p.title));
+    } else {
+        p.last_dock_zone = p.dock_zone;
+        p.dock_zone = .Floating;
+        // Initialize floating bounds near the pane's current docked geometry
+        fw := p.rect.w if p.rect.w >= 320.0f else p.float_w;
+        fh := p.rect.h if p.rect.h >= 240.0f else p.float_h;
+        if fw > 720.0f do fw = 540.0f;
+        if fh > 580.0f do fh = 440.0f;
+        if fw < 320.0f do fw = 420.0f;
+        if fh < 220.0f do fh = 360.0f;
+        p.float_w = fw;
+        p.float_h = fh;
+        if p.rect.w > 0.0f {
+            p.float_x = p.rect.x - 24.0f;
+            p.float_y = p.rect.y + 18.0f;
+        }
+        wm_bring_to_front(wm, window_id);
+        wm_notify(wm, 1, core.tprintf("Floated '{}' (drag title bar to move or dock)", p.title));
+    }
+    wm_save_layout(wm);
+    return true;
+}
+
+wm_set_pane_dock :: (wm: &WindowManager, window_id: u32, zone: DockZone) -> bool {
+    p := wm_find_pane(wm, window_id);
+    if p == null do return false;
+    if zone == .Floating {
+        if p.dock_zone != .Floating do return wm_toggle_float(wm, window_id);
+        return true;
+    }
+    p.dock_zone      = zone;
+    p.last_dock_zone = zone;
+    zname := switch zone {
+        case .LeftSide  => "Left";
+        case .Bottom    => "Bottom";
+        case _          => "Right";
+    };
+    wm_notify(wm, 1, core.tprintf("Docked '{}' -> {}", p.title, zname));
+    wm_save_layout(wm);
+    return true;
+}
+
+wm_swap_panes :: (wm: &WindowManager, wid_a: u32, wid_b: u32) -> bool {
+    if wid_a == wid_b do return false;
+    idx_a := -1;
+    idx_b := -1;
+    for i in 0 .. wm.panes.count {
+        if wm.panes[i].window_id == wid_a do idx_a = i;
+        if wm.panes[i].window_id == wid_b do idx_b = i;
+    }
+    if idx_a < 0 || idx_b < 0 do return false;
+
+    // Swap their dock zones AND array order so grid/stack positions swap cleanly!
+    tmp_zone := wm.panes[idx_a].dock_zone;
+    wm.panes[idx_a].dock_zone = wm.panes[idx_b].dock_zone;
+    wm.panes[idx_b].dock_zone = tmp_zone;
+    if wm.panes[idx_a].dock_zone != .Floating do wm.panes[idx_a].last_dock_zone = wm.panes[idx_a].dock_zone;
+    if wm.panes[idx_b].dock_zone != .Floating do wm.panes[idx_b].last_dock_zone = wm.panes[idx_b].dock_zone;
+
+    tmp_pane := wm.panes[idx_a];
+    wm.panes[idx_a] = wm.panes[idx_b];
+    wm.panes[idx_b] = tmp_pane;
+
+    wm_notify(wm, 1, core.tprintf("Swapped '{}' <-> '{}'", wm.panes[idx_b].title, wm.panes[idx_a].title));
+    wm_save_layout(wm);
+    return true;
+}
+
 wm_cycle_focus :: (wm: &WindowManager) {
     if wm.panes.count == 0 {
         wm.focused_window_id = 0;
@@ -114,12 +462,14 @@ wm_cycle_focus :: (wm: &WindowManager) {
     }
     if wm.focused_window_id == 0 {
         wm.focused_window_id = wm.panes[0].window_id;
+        wm_bring_to_front(wm, wm.focused_window_id);
         return;
     }
     for i in 0 .. wm.panes.count {
         if wm.panes[i].window_id == wm.focused_window_id {
             if i + 1 < wm.panes.count {
                 wm.focused_window_id = wm.panes[i + 1].window_id;
+                wm_bring_to_front(wm, wm.focused_window_id);
             } else {
                 wm.focused_window_id = 0;
             }
@@ -129,13 +479,62 @@ wm_cycle_focus :: (wm: &WindowManager) {
     wm.focused_window_id = 0;
 }
 
-/// Computes layout rects, handles splitter dragging and click-to-focus.
-/// Returns `closed_window_id` (>0) if user clicked a pane's close button.
-wm_update_layout :: (wm: &WindowManager, screen_w, screen_h, dt: f32, block_mouse: bool) -> u32 {
-    if wm.toast_timer > 0.0 {
-        wm.toast_timer -= dt;
-        if wm.toast_timer < 0.0 do wm.toast_timer = 0.0;
+/// Returns pane indices in ascending `z_order` for floating panes (draw order: back-to-front).
+wm_floating_indices_sorted :: (wm: &WindowManager, allocator := context.temp_allocator) -> [..] i32 {
+    idxs := make([..] i32, 8, allocator);
+    for i in 0 .. wm.panes.count {
+        if wm.panes[i].alive && wm.panes[i].dock_zone == .Floating {
+            idxs << i;
+        }
     }
+    for i in 1 .. idxs.count {
+        key := idxs[i];
+        kz  := wm.panes[key].z_order;
+        j := i - 1;
+        while j >= 0 && wm.panes[idxs[j]].z_order > kz {
+            idxs[j + 1] = idxs[j];
+            j -= 1;
+        }
+        idxs[j + 1] = key;
+    }
+    return idxs;
+}
+
+/// Returns true if `(px, py)` lies inside any floating plugin window.
+wm_point_over_floating :: (wm: &WindowManager, px, py: f32) -> bool {
+    for &p in wm.panes {
+        if p.alive && p.dock_zone == .Floating && hit_rect(px, py, p.rect) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Returns the topmost `window_id` whose `content_rect` contains `(px, py)` (0 = editor/none).
+wm_content_pane_at :: (wm: &WindowManager, px, py: f32) -> u32 {
+    // Floating windows occlude everything beneath them (check top-most z_order first)
+    floats := wm_floating_indices_sorted(wm, context.temp_allocator);
+    fi := floats.count - 1;
+    while fi >= 0 {
+        p := &wm.panes[floats[fi]];
+        if hit_rect(px, py, p.rect) {
+            if hit_rect(px, py, p.content_rect) do return p.window_id;
+            return 0xFFFFFFFF; // On floating header/border: still blocks panes underneath!
+        }
+        fi -= 1;
+    }
+
+    for &p in wm.panes {
+        if p.alive && p.dock_zone != .Floating && hit_rect(px, py, p.content_rect) {
+            return p.window_id;
+        }
+    }
+    return 0;
+}
+
+/// Pure geometry pass: computes `editor_rect` and every pane's `rect` + `content_rect`.
+wm_compute_rects :: (wm: &WindowManager, screen_w, screen_h: f32) {
+    clamp_ratios(wm);
 
     tb_h := top_bar_h();
     sb_h := status_bar_h();
@@ -145,94 +544,459 @@ wm_update_layout :: (wm: &WindowManager, screen_w, screen_h, dt: f32, block_mous
     work_y: f32 = tb_h + PANE_GAP;
     work_w: f32 = screen_w - PANE_GAP * 2.0f;
     work_h: f32 = screen_h - tb_h - sb_h - PANE_GAP * 2.0f;
-    if work_w < 200.0f do work_w = 200.0f;
-    if work_h < 120.0f do work_h = 120.0f;
+    if work_w < 240.0f do work_w = 240.0f;
+    if work_h < 140.0f do work_h = 140.0f;
+    wm.work_rect = .{ work_x, work_y, work_w, work_h };
 
-    has_plugins := wm.panes.count > 0;
-    mpos := raylib.GetMousePosition();
-    pressed := !block_mouse && raylib.IsMouseButtonPressed(.LEFT);
-    down    := !block_mouse && raylib.IsMouseButtonDown(.LEFT);
+    left_idxs   := make([..] i32, 4, context.temp_allocator);
+    right_idxs  := make([..] i32, 8, context.temp_allocator);
+    bottom_idxs := make([..] i32, 4, context.temp_allocator);
 
-    if has_plugins {
-        split_x := work_x + work_w * wm.split_ratio;
-        on_splitter := mpos.x >= (split_x - 4.0f) && mpos.x <= (split_x + SPLITTER_W + 4.0f) &&
-                       mpos.y >= work_y && mpos.y <= (work_y + work_h);
-
-        if on_splitter && pressed {
-            wm.dragging_splitter = true;
+    for i in 0 .. wm.panes.count {
+        if !wm.panes[i].alive do continue;
+        switch wm.panes[i].dock_zone {
+            case .LeftSide  do left_idxs   << i;
+            case .RightGrid do right_idxs  << i;
+            case .Bottom    do bottom_idxs << i;
+            case .Floating  {}
         }
-        if !down && wm.dragging_splitter {
-            wm.dragging_splitter = false;
-            settings.g_settings.split_ratio = wm.split_ratio;
-            settings.settings_save();
-        }
-        if wm.dragging_splitter {
-            wm.split_ratio = (mpos.x - work_x) / work_w;
-            if wm.split_ratio < 0.25f do wm.split_ratio = 0.25f;
-            if wm.split_ratio > 0.85f do wm.split_ratio = 0.85f;
-            split_x = work_x + work_w * wm.split_ratio;
-        }
+    }
 
-        ed_w := split_x - work_x;
-        wm.editor_rect    = .{ work_x, work_y, ed_w, work_h };
-        wm.editor_content = .{ work_x + 1.0f, work_y + hd_h, ed_w - 2.0f, work_h - hd_h - 1.0f };
+    wm.has_left   = left_idxs.count > 0;
+    wm.has_right  = right_idxs.count > 0;
+    wm.has_bottom = bottom_idxs.count > 0;
 
-        // Tile active plugin windows on the right side
-        right_x := split_x + SPLITTER_W;
-        right_w := (work_x + work_w) - right_x;
-        n := wm.panes.count;
+    left_w:  f32 = (work_w * wm.left_ratio)  if wm.has_left  else 0.0f;
+    right_w: f32 = (work_w * wm.right_ratio) if wm.has_right else 0.0f;
+
+    min_center: f32 = 240.0f;
+    splits_w: f32 = (SPLITTER_W if wm.has_left else 0.0f) + (SPLITTER_W if wm.has_right else 0.0f);
+    if left_w + right_w > work_w - min_center - splits_w {
+        avail := work_w - min_center - splits_w;
+        if avail < 0.0f do avail = 0.0f;
+        tot := left_w + right_w;
+        if tot > 0.0f {
+            left_w  = avail * (left_w / tot);
+            right_w = avail * (right_w / tot);
+        }
+    }
+
+    center_x := work_x + ((left_w + SPLITTER_W) if wm.has_left else 0.0f);
+    center_w := work_w - ((left_w + SPLITTER_W) if wm.has_left else 0.0f)
+                       - ((right_w + SPLITTER_W) if wm.has_right else 0.0f);
+    if center_w < 160.0f do center_w = 160.0f;
+
+    wm.center_col_x  = center_x;
+    wm.center_col_w  = center_w;
+    wm.left_split_x  = work_x + left_w;
+    wm.right_split_x = center_x + center_w;
+
+    // 1. LeftSide dock (stacked vertically)
+    if wm.has_left {
+        n := left_idxs.count;
+        ch := (work_h - PANE_GAP * cast(f32) (n - 1)) / cast(f32) n;
+        for k in 0 .. n {
+            idx := left_idxs[k];
+            py := work_y + cast(f32) k * (ch + PANE_GAP);
+            wm.panes[idx].rect         = .{ work_x, py, left_w, ch };
+            wm.panes[idx].content_rect = .{ work_x + 1.0f, py + hd_h, left_w - 2.0f, ch - hd_h - 1.0f };
+        }
+    }
+
+    // 2. RightGrid dock (1-col for 1..2 panes, 2-col grid for 3+ panes)
+    if wm.has_right {
+        rx := wm.right_split_x + SPLITTER_W;
+        rw := (work_x + work_w) - rx;
+        n  := right_idxs.count;
         cols: i32 = 1 if n <= 2 else 2;
         rows: i32 = (n + cols - 1) / cols;
+        cell_w := (rw - PANE_GAP * cast(f32) (cols - 1)) / cast(f32) cols;
+        cell_h := (work_h - PANE_GAP * cast(f32) (rows - 1)) / cast(f32) rows;
 
-        cell_w := (right_w - PANE_GAP * cast(f32) (cols - 1)) / cast(f32) cols;
-        cell_h := (work_h  - PANE_GAP * cast(f32) (rows - 1)) / cast(f32) rows;
-
-        for idx in 0 .. n {
-            c := idx % cols;
-            r := idx / cols;
-            px := right_x + cast(f32) c * (cell_w + PANE_GAP);
-            py := work_y  + cast(f32) r * (cell_h + PANE_GAP);
-
-            // If odd pane count in last row of 2-col grid, stretch full width
+        for k in 0 .. n {
+            idx := right_idxs[k];
+            c := k % cols;
+            r := k / cols;
+            px := rx + cast(f32) c * (cell_w + PANE_GAP);
+            py := work_y + cast(f32) r * (cell_h + PANE_GAP);
             pw := cell_w;
-            if cols == 2 && idx == n - 1 && (n % 2) == 1 {
-                pw = right_w;
+            if cols == 2 && k == n - 1 && (n % 2) == 1 {
+                pw = rw;
             }
-
-            wm.panes[idx].rect = .{ px, py, pw, cell_h };
+            wm.panes[idx].rect         = .{ px, py, pw, cell_h };
             wm.panes[idx].content_rect = .{ px + 1.0f, py + hd_h, pw - 2.0f, cell_h - hd_h - 1.0f };
         }
-    } else {
-        wm.dragging_splitter = false;
-        wm.editor_rect    = .{ work_x, work_y, work_w, work_h };
-        wm.editor_content = .{ work_x + 1.0f, work_y + hd_h, work_w - 2.0f, work_h - hd_h - 1.0f };
     }
 
-    closed_wid: u32 = 0;
+    // 3. Center column: Core Code Editor (top) + Bottom dock (horizontal row)
+    if wm.has_bottom {
+        bottom_h := work_h * wm.bottom_ratio;
+        if bottom_h > work_h - 140.0f - SPLITTER_W do bottom_h = work_h - 140.0f - SPLITTER_W;
+        if bottom_h < 100.0f do bottom_h = 100.0f;
+        ed_h := work_h - bottom_h - SPLITTER_W;
+        wm.bottom_split_y = work_y + ed_h;
 
-    // Handle click-to-focus & close button hits
-    if pressed && !wm.dragging_splitter {
-        if hit_rect(mpos.x, mpos.y, wm.editor_rect) {
-            wm.focused_window_id = 0;
+        wm.editor_rect    = .{ center_x, work_y, center_w, ed_h };
+        wm.editor_content = .{ center_x + 1.0f, work_y + hd_h, center_w - 2.0f, ed_h - hd_h - 1.0f };
+
+        by := wm.bottom_split_y + SPLITTER_W;
+        n  := bottom_idxs.count;
+        cw := (center_w - PANE_GAP * cast(f32) (n - 1)) / cast(f32) n;
+        for k in 0 .. n {
+            idx := bottom_idxs[k];
+            px := center_x + cast(f32) k * (cw + PANE_GAP);
+            wm.panes[idx].rect         = .{ px, by, cw, bottom_h };
+            wm.panes[idx].content_rect = .{ px + 1.0f, by + hd_h, cw - 2.0f, bottom_h - hd_h - 1.0f };
+        }
+    } else {
+        wm.editor_rect    = .{ center_x, work_y, center_w, work_h };
+        wm.editor_content = .{ center_x + 1.0f, work_y + hd_h, center_w - 2.0f, work_h - hd_h - 1.0f };
+    }
+
+    // 4. Floating windows (clamped safely inside viewport)
+    for &p in wm.panes {
+        if !p.alive || p.dock_zone != .Floating do continue;
+        if p.float_w < 260.0f do p.float_w = 260.0f;
+        if p.float_h < 180.0f do p.float_h = 180.0f;
+        if p.float_w > work_w do p.float_w = work_w;
+        if p.float_h > work_h do p.float_h = work_h;
+
+        if p.float_x < work_x do p.float_x = work_x;
+        if p.float_y < work_y do p.float_y = work_y;
+        max_x := screen_w - 90.0f;
+        max_y := screen_h - sb_h - hd_h;
+        if p.float_x > max_x do p.float_x = max_x;
+        if p.float_y > max_y do p.float_y = max_y;
+
+        p.rect         = .{ p.float_x, p.float_y, p.float_w, p.float_h };
+        p.content_rect = .{ p.float_x + 1.0f, p.float_y + hd_h, p.float_w - 2.0f, p.float_h - hd_h - 1.0f };
+    }
+}
+
+#local
+compute_drop_target :: (wm: &WindowManager, drag_wid: u32, mx, my: f32) {
+    wm.drop_kind       = .None;
+    wm.drop_target_wid = 0;
+
+    p := wm_find_pane(wm, drag_wid);
+    if p == null do return;
+
+    wx := wm.work_rect.x;
+    wy := wm.work_rect.y;
+    ww := wm.work_rect.w;
+    wh := wm.work_rect.h;
+
+    // 1. Workspace outer edge magnetic dock zones
+    if mx <= wx + DOCK_EDGE_PX && my >= wy && my <= wy + wh {
+        wm.drop_kind    = .DockLeft;
+        wm.drop_preview = .{ wx, wy, ww * wm.left_ratio, wh };
+        return;
+    }
+    if mx >= wx + ww - DOCK_EDGE_PX && my >= wy && my <= wy + wh {
+        pw := ww * wm.right_ratio;
+        wm.drop_kind    = .DockRight;
+        wm.drop_preview = .{ wx + ww - pw, wy, pw, wh };
+        return;
+    }
+    if my >= wy + wh - DOCK_EDGE_PX && mx >= wx && mx <= wx + ww {
+        ph := wh * wm.bottom_ratio;
+        wm.drop_kind    = .DockBottom;
+        wm.drop_preview = .{ wm.center_col_x, wy + wh - ph, wm.center_col_w, ph };
+        return;
+    }
+
+    // 2. Hovering over another docked pane -> Swap slots
+    //    (For an already-floating window, only trigger swap over the docked pane's
+    //     title bar so you can freely position floating windows anywhere over the workspace!)
+    hd_h := header_h();
+    for &other in wm.panes {
+        if !other.alive || other.window_id == drag_wid || other.dock_zone == .Floating do continue;
+        target_hit := false;
+        if p.dock_zone == .Floating {
+            target_hit = hit_rect(mx, my, .{ other.rect.x, other.rect.y, other.rect.w, hd_h });
         } else {
-            for &p in wm.panes {
-                if hit_rect(mpos.x, mpos.y, p.rect) {
-                    // Check top-right close button (`x`)
-                    close_x := p.rect.x + p.rect.w - 24.0;
-                    close_y := p.rect.y + 3.0;
-                    if mpos.x >= close_x && mpos.x <= (close_x + 20.0) &&
-                       mpos.y >= close_y && mpos.y <= (close_y + 20.0) {
-                        closed_wid = p.window_id;
-                    } else {
-                        wm.focused_window_id = p.window_id;
-                    }
-                    break;
-                }
-            }
+            target_hit = hit_rect(mx, my, other.rect);
+        }
+        if target_hit {
+            wm.drop_kind       = .SwapPane;
+            wm.drop_target_wid = other.window_id;
+            wm.drop_preview    = other.rect;
+            return;
         }
     }
 
-    return closed_wid;
+    // 3. Dragging a docked pane into open center area -> Float
+    if p.dock_zone != .Floating {
+        fw := p.rect.w if (p.rect.w >= 320.0f && p.rect.w <= 640.0f) else 460.0f;
+        fh := p.rect.h if (p.rect.h >= 240.0f && p.rect.h <= 520.0f) else 380.0f;
+        wm.drop_kind    = .FloatFree;
+        wm.drop_preview = .{ mx - fw * 0.5f, my - 14.0f, fw, fh };
+    }
+}
+
+#local
+pane_header_buttons :: (rect: PaneRect) -> (close_r: PaneRect, float_r: PaneRect) {
+    s := settings.g_settings.ui_scale;
+    hd_h := header_h();
+    btn_s := 20.0f * s;
+    cy := rect.y + (hd_h - btn_s) * 0.5f;
+    close_x := rect.x + rect.w - btn_s - 4.0f;
+    float_x := close_x - btn_s - 3.0f;
+    return .{ close_x, cy, btn_s, btn_s }, .{ float_x, cy, btn_s, btn_s };
+}
+
+#local
+detect_splitter_hit :: (wm: &WindowManager, mx, my: f32) -> SplitterKind {
+    wy := wm.work_rect.y;
+    wh := wm.work_rect.h;
+    if wm.has_left && mx >= (wm.left_split_x - 4.0f) && mx <= (wm.left_split_x + SPLITTER_W + 4.0f) &&
+       my >= wy && my <= (wy + wh) {
+        return .Left;
+    }
+    if wm.has_right && mx >= (wm.right_split_x - 4.0f) && mx <= (wm.right_split_x + SPLITTER_W + 4.0f) &&
+       my >= wy && my <= (wy + wh) {
+        return .Right;
+    }
+    if wm.has_bottom && my >= (wm.bottom_split_y - 4.0f) && my <= (wm.bottom_split_y + SPLITTER_W + 4.0f) &&
+       mx >= wm.center_col_x && mx <= (wm.center_col_x + wm.center_col_w) {
+        return .Bottom;
+    }
+    return .None;
+}
+
+/// Computes layout rects, handles splitters, title-bar drag/dock/swap, floating
+/// window resize, focus, and close buttons.
+/// Returns `closed_window_id` (>0) if user clicked a pane's close button.
+wm_update_layout :: (wm: &WindowManager, screen_w, screen_h, dt: f32, block_mouse: bool) -> u32 {
+    if wm.toast_timer > 0.0f {
+        wm.toast_timer -= dt;
+        if wm.toast_timer < 0.0f do wm.toast_timer = 0.0f;
+    }
+
+    wm_compute_rects(wm, screen_w, screen_h);
+
+    mpos    := raylib.GetMousePosition();
+    pressed := !block_mouse && raylib.IsMouseButtonPressed(.LEFT);
+    down    := !block_mouse && raylib.IsMouseButtonDown(.LEFT);
+    hd_h    := header_h();
+
+    // Update hovered splitter (only when not covered by a floating window)
+    if !block_mouse && !wm_point_over_floating(wm, mpos.x, mpos.y) {
+        wm.hovered_splitter = detect_splitter_hit(wm, mpos.x, mpos.y);
+    } else {
+        wm.hovered_splitter = .None;
+    }
+
+    // Visual mouse cursor hint (Raylib MouseCursor: 0=Default, 5=EW, 6=NS, 7=NWSE, 9=All)
+    cursor_id: i32 = 0;
+    if wm.resize_window_id != 0 {
+        cursor_id = 7;
+    } elseif wm.drag_active {
+        cursor_id = 9;
+    } elseif wm.active_splitter == .Left || wm.active_splitter == .Right ||
+             wm.hovered_splitter == .Left || wm.hovered_splitter == .Right {
+        cursor_id = 5;
+    } elseif wm.active_splitter == .Bottom || wm.hovered_splitter == .Bottom {
+        cursor_id = 6;
+    } elseif !block_mouse {
+        // Check hover over top-most floating window's bottom-right resize grip
+        fl := wm_floating_indices_sorted(wm, context.temp_allocator);
+        fi_c := fl.count - 1;
+        while fi_c >= 0 {
+            fp := &wm.panes[fl[fi_c]];
+            if hit_rect(mpos.x, mpos.y, fp.rect) {
+                grip := PaneRect.{ fp.rect.x + fp.rect.w - RESIZE_GRIP, fp.rect.y + fp.rect.h - RESIZE_GRIP, RESIZE_GRIP, RESIZE_GRIP };
+                if hit_rect(mpos.x, mpos.y, grip) do cursor_id = 7;
+                break;
+            }
+            fi_c -= 1;
+        }
+    }
+    raylib.SetMouseCursor(cursor_id);
+
+    // 1. Continue active floating-window resize
+    if wm.resize_window_id != 0 {
+        if down {
+            if p := wm_find_pane(wm, wm.resize_window_id); p != null {
+                p.float_w = wm.resize_orig_w + (mpos.x - wm.resize_start_x);
+                p.float_h = wm.resize_orig_h + (mpos.y - wm.resize_start_y);
+                wm_compute_rects(wm, screen_w, screen_h);
+            }
+        } else {
+            wm.resize_window_id = 0;
+            wm_save_layout(wm);
+        }
+        return 0;
+    }
+
+    // 2. Continue active splitter drag
+    if wm.active_splitter != .None {
+        if down {
+            wx := wm.work_rect.x;
+            wy := wm.work_rect.y;
+            ww := wm.work_rect.w;
+            wh := wm.work_rect.h;
+            switch wm.active_splitter {
+                case .Left   do wm.left_ratio   = (mpos.x - wx) / ww;
+                case .Right  do wm.right_ratio  = ((wx + ww) - mpos.x) / ww;
+                case .Bottom do wm.bottom_ratio = ((wy + wh) - mpos.y) / wh;
+                case _ {}
+            }
+            wm_compute_rects(wm, screen_w, screen_h);
+        } else {
+            if wm.active_splitter == .Right {
+                settings.g_settings.split_ratio = 1.0f - wm.right_ratio;
+                settings.settings_save();
+            }
+            wm.active_splitter = .None;
+            wm_save_layout(wm);
+        }
+        return 0;
+    }
+
+    // 3. Continue active title-bar drag
+    if wm.drag_window_id != 0 {
+        if down {
+            dx := mpos.x - wm.drag_start_x;
+            dy := mpos.y - wm.drag_start_y;
+            if !wm.drag_active && (dx * dx + dy * dy) > 36.0f {
+                wm.drag_active = true;
+            }
+            if wm.drag_active {
+                if p := wm_find_pane(wm, wm.drag_window_id); p != null && p.dock_zone == .Floating {
+                    p.float_x = mpos.x - wm.drag_offset_x;
+                    p.float_y = mpos.y - wm.drag_offset_y;
+                    wm_compute_rects(wm, screen_w, screen_h);
+                }
+                compute_drop_target(wm, wm.drag_window_id, mpos.x, mpos.y);
+            }
+        } else {
+            if wm.drag_active {
+                drag_wid := wm.drag_window_id;
+                switch wm.drop_kind {
+                    case .DockLeft   do wm_set_pane_dock(wm, drag_wid, .LeftSide);
+                    case .DockRight  do wm_set_pane_dock(wm, drag_wid, .RightGrid);
+                    case .DockBottom do wm_set_pane_dock(wm, drag_wid, .Bottom);
+                    case .SwapPane   do wm_swap_panes(wm, drag_wid, wm.drop_target_wid);
+                    case .FloatFree {
+                        if p := wm_find_pane(wm, drag_wid); p != null {
+                            p.last_dock_zone = p.dock_zone if p.dock_zone != .Floating else .RightGrid;
+                            p.dock_zone = .Floating;
+                            p.float_x   = wm.drop_preview.x;
+                            p.float_y   = wm.drop_preview.y;
+                            p.float_w   = wm.drop_preview.w;
+                            p.float_h   = wm.drop_preview.h;
+                            wm_bring_to_front(wm, drag_wid);
+                            wm_notify(wm, 1, core.tprintf("Floated '{}'", p.title));
+                            wm_save_layout(wm);
+                        }
+                    }
+                    case .None {
+                        // Already-floating window finished moving
+                        wm_save_layout(wm);
+                    }
+                }
+                wm_compute_rects(wm, screen_w, screen_h);
+            }
+            wm.drag_window_id  = 0;
+            wm.drag_active     = false;
+            wm.drop_kind       = .None;
+            wm.drop_target_wid = 0;
+        }
+        return 0;
+    }
+
+    // 4. Fresh mouse press handling (Floating panes top-down -> Splitters -> Docked panes -> Editor)
+    if pressed {
+        // 4a. Floating panes in reverse z_order (top-most first)
+        floats := wm_floating_indices_sorted(wm, context.temp_allocator);
+        fi := floats.count - 1;
+        while fi >= 0 {
+            p := &wm.panes[floats[fi]];
+            if hit_rect(mpos.x, mpos.y, p.rect) {
+                wm.focused_window_id = p.window_id;
+                wm_bring_to_front(wm, p.window_id);
+
+                close_r, float_r := pane_header_buttons(p.rect);
+                if hit_rect(mpos.x, mpos.y, close_r) {
+                    return p.window_id;
+                }
+                if hit_rect(mpos.x, mpos.y, float_r) {
+                    wm_toggle_float(wm, p.window_id);
+                    wm_compute_rects(wm, screen_w, screen_h);
+                    return 0;
+                }
+
+                // Bottom-right resize grip
+                grip := PaneRect.{
+                    p.rect.x + p.rect.w - RESIZE_GRIP,
+                    p.rect.y + p.rect.h - RESIZE_GRIP,
+                    RESIZE_GRIP, RESIZE_GRIP,
+                };
+                if hit_rect(mpos.x, mpos.y, grip) {
+                    wm.resize_window_id = p.window_id;
+                    wm.resize_start_x   = mpos.x;
+                    wm.resize_start_y   = mpos.y;
+                    wm.resize_orig_w    = p.float_w;
+                    wm.resize_orig_h    = p.float_h;
+                    return 0;
+                }
+
+                // Title bar drag
+                if mpos.y >= p.rect.y && mpos.y <= (p.rect.y + hd_h) {
+                    wm.drag_window_id = p.window_id;
+                    wm.drag_active    = false;
+                    wm.drag_start_x   = mpos.x;
+                    wm.drag_start_y   = mpos.y;
+                    wm.drag_offset_x  = mpos.x - p.float_x;
+                    wm.drag_offset_y  = mpos.y - p.float_y;
+                }
+                return 0;
+            }
+            fi -= 1;
+        }
+
+        // 4b. Active splitters
+        if wm.hovered_splitter != .None {
+            wm.active_splitter = wm.hovered_splitter;
+            return 0;
+        }
+
+        // 4c. Docked plugin panes
+        for &p in wm.panes {
+            if !p.alive || p.dock_zone == .Floating do continue;
+            if hit_rect(mpos.x, mpos.y, p.rect) {
+                wm.focused_window_id = p.window_id;
+
+                close_r, float_r := pane_header_buttons(p.rect);
+                if hit_rect(mpos.x, mpos.y, close_r) {
+                    return p.window_id;
+                }
+                if hit_rect(mpos.x, mpos.y, float_r) {
+                    wm_toggle_float(wm, p.window_id);
+                    wm_compute_rects(wm, screen_w, screen_h);
+                    return 0;
+                }
+
+                if mpos.y >= p.rect.y && mpos.y <= (p.rect.y + hd_h) {
+                    wm.drag_window_id = p.window_id;
+                    wm.drag_active    = false;
+                    wm.drag_start_x   = mpos.x;
+                    wm.drag_start_y   = mpos.y;
+                    wm.drag_offset_x  = mpos.x - p.rect.x;
+                    wm.drag_offset_y  = mpos.y - p.rect.y;
+                }
+                return 0;
+            }
+        }
+
+        // 4d. Main code editor
+        if hit_rect(mpos.x, mpos.y, wm.editor_rect) {
+            wm.focused_window_id = 0;
+        }
+    }
+
+    return 0;
 }
 
 wm_draw_chrome :: (
@@ -291,11 +1055,27 @@ wm_draw_chrome :: (
     theme.draw_text(set_x + 10.0f * s, (tb_h - fs_sm) * 0.5f, "Settings Ctrl+,", fs_sm, theme.get_color(.TextPrimary));
     actions.open_settings = set_hover && raylib.IsMouseButtonPressed(.LEFT);
 
-    // Splitter line visual
-    if wm.panes.count > 0 {
-        sx := wm.editor_rect.x + wm.editor_rect.w + 2.0f;
-        col_s := theme.get_color(.BorderFocused) if wm.dragging_splitter else theme.get_color(.Border);
-        raylib.DrawLineEx(.{ sx, wm.editor_rect.y }, .{ sx, wm.editor_rect.y + wm.editor_rect.h }, 2.0f, theme.rgba_to_rl(col_s));
+    // Active splitter handle lines
+    wy := wm.work_rect.y;
+    wh := wm.work_rect.h;
+    if wm.has_left {
+        sx := wm.left_split_x + SPLITTER_W * 0.5f;
+        hi := wm.active_splitter == .Left || wm.hovered_splitter == .Left;
+        col_s := theme.get_color(.BorderFocused) if hi else theme.get_color(.Border);
+        raylib.DrawLineEx(.{ sx, wy }, .{ sx, wy + wh }, 3.0f if hi else 2.0f, theme.rgba_to_rl(col_s));
+    }
+    if wm.has_right {
+        sx := wm.right_split_x + SPLITTER_W * 0.5f;
+        hi := wm.active_splitter == .Right || wm.hovered_splitter == .Right;
+        col_s := theme.get_color(.BorderFocused) if hi else theme.get_color(.Border);
+        raylib.DrawLineEx(.{ sx, wy }, .{ sx, wy + wh }, 3.0f if hi else 2.0f, theme.rgba_to_rl(col_s));
+    }
+    if wm.has_bottom {
+        sy_sp := wm.bottom_split_y + SPLITTER_W * 0.5f;
+        hi := wm.active_splitter == .Bottom || wm.hovered_splitter == .Bottom;
+        col_s := theme.get_color(.BorderFocused) if hi else theme.get_color(.Border);
+        raylib.DrawLineEx(.{ wm.center_col_x, sy_sp }, .{ wm.center_col_x + wm.center_col_w, sy_sp },
+                          3.0f if hi else 2.0f, theme.rgba_to_rl(col_s));
     }
 
     // Bottom Status Bar
@@ -342,13 +1122,28 @@ wm_draw_chrome :: (
     return actions;
 }
 
-wm_draw_pane_frame :: (rect: PaneRect, title: str, focused: bool, closable: bool) {
+wm_draw_pane_frame :: (
+    rect: PaneRect,
+    title: str,
+    focused: bool,
+    closable: bool,
+    is_floating: bool = false,
+    is_dragging: bool = false
+) {
     s := settings.g_settings.ui_scale;
     hd_h := header_h();
     fs := 13.5f * s;
 
-    border := theme.get_color(.BorderFocused) if focused else theme.get_color(.Border);
-    theme.draw_rect(rect.x, rect.y, rect.w, rect.h, theme.get_color(.BgPanel), 4.0f, border, 1.5f if focused else 1.0f);
+    // Subtle elevation shadow for floating windows
+    if is_floating {
+        theme.draw_rect(rect.x + 6.0f, rect.y + 7.0f, rect.w, rect.h, 0x00000058, 6.0f);
+    }
+
+    border := theme.get_color(.Accent) if is_dragging else (
+        theme.get_color(.BorderFocused) if focused else theme.get_color(.Border)
+    );
+    bw: f32 = 2.0f if (focused || is_dragging || is_floating) else 1.0f;
+    theme.draw_rect(rect.x, rect.y, rect.w, rect.h, theme.get_color(.BgPanel), 5.0f if is_floating else 4.0f, border, bw);
     theme.draw_rect(rect.x + 1.0f, rect.y + 1.0f, rect.w - 2.0f, hd_h - 1.0f, theme.get_color(.BgHeader));
     raylib.DrawLine(
         cast(i32) (rect.x + 1.0f), cast(i32) (rect.y + hd_h),
@@ -356,22 +1151,100 @@ wm_draw_pane_frame :: (rect: PaneRect, title: str, focused: bool, closable: bool
         theme.get_rl(.Border)
     );
 
-    dot_col := theme.get_color(.BorderFocused) if focused else theme.get_color(.TextDisabled);
-    raylib.DrawCircle(cast(i32) (rect.x + 13.0f), cast(i32) (rect.y + hd_h * 0.5f), 3.5f * s, theme.rgba_to_rl(dot_col));
-    theme.draw_text(rect.x + 24.0f * s, rect.y + (hd_h - fs) * 0.5f, title, fs,
-        theme.get_color(.TextPrimary) if focused else theme.get_color(.TextSecondary));
-
     if closable {
-        btn_s := 20.0f * s;
-        cx := rect.x + rect.w - btn_s - 4.0f;
-        cy := rect.y + (hd_h - btn_s) * 0.5f;
-        mpos := raylib.GetMousePosition();
-        hov := mpos.x >= cx && mpos.x <= (cx + btn_s) && mpos.y >= cy && mpos.y <= (cy + btn_s);
-        if hov {
-            theme.draw_rect(cx, cy, btn_s, btn_s, theme.get_color(.BgHover), 3.0f);
+        // Subtle 6-dot drag grip on left of plugin title bar
+        grip_col := theme.rgba_to_rl(theme.get_color(.BorderFocused) if focused else theme.get_color(.TextDisabled));
+        gx := rect.x + 8.0f;
+        gy := rect.y + hd_h * 0.5f - 4.0f;
+        for row in 0 .. 3 {
+            raylib.DrawRectangle(cast(i32) gx,          cast(i32) (gy + cast(f32) row * 3.5f), 2, 2, grip_col);
+            raylib.DrawRectangle(cast(i32) (gx + 4.0f), cast(i32) (gy + cast(f32) row * 3.5f), 2, 2, grip_col);
         }
-        theme.draw_text(cx + btn_s * 0.28f, cy + (btn_s - fs) * 0.5f, "x", fs,
-            theme.get_color(.Error) if hov else theme.get_color(.TextSecondary));
+        theme.draw_text(rect.x + 20.0f * s, rect.y + (hd_h - fs) * 0.5f, title, fs,
+            theme.get_color(.TextPrimary) if focused else theme.get_color(.TextSecondary));
+
+        mpos := raylib.GetMousePosition();
+        close_r, float_r := pane_header_buttons(rect);
+
+        // Float / Dock toggle button
+        fhov := hit_rect(mpos.x, mpos.y, float_r);
+        if fhov {
+            theme.draw_rect(float_r.x, float_r.y, float_r.w, float_r.h, theme.get_color(.BgHover), 3.0f);
+        }
+        f_col := theme.get_color(.Accent) if fhov else theme.get_color(.TextSecondary);
+        if is_floating {
+            // Dock icon: small downward arrow / bar
+            theme.draw_text(float_r.x + float_r.w * 0.24f, float_r.y + (float_r.h - fs) * 0.5f, "v", fs, f_col);
+        } else {
+            // Float icon: small crisp rectangle outline
+            ix := float_r.x + float_r.w * 0.24f;
+            iy := float_r.y + float_r.h * 0.26f;
+            iw := float_r.w * 0.52f;
+            ih := float_r.h * 0.48f;
+            theme.draw_rect(ix, iy, iw, ih, 0x00000000, 1.5f, f_col, 1.4f);
+        }
+
+        // Close (`x`) button
+        chov := hit_rect(mpos.x, mpos.y, close_r);
+        if chov {
+            theme.draw_rect(close_r.x, close_r.y, close_r.w, close_r.h, theme.get_color(.BgHover), 3.0f);
+        }
+        theme.draw_text(close_r.x + close_r.w * 0.28f, close_r.y + (close_r.h - fs) * 0.5f, "x", fs,
+            theme.get_color(.Error) if chov else theme.get_color(.TextSecondary));
+    } else {
+        dot_col := theme.get_color(.BorderFocused) if focused else theme.get_color(.TextDisabled);
+        raylib.DrawCircle(cast(i32) (rect.x + 13.0f), cast(i32) (rect.y + hd_h * 0.5f), 3.5f * s, theme.rgba_to_rl(dot_col));
+        theme.draw_text(rect.x + 24.0f * s, rect.y + (hd_h - fs) * 0.5f, title, fs,
+            theme.get_color(.TextPrimary) if focused else theme.get_color(.TextSecondary));
+    }
+}
+
+/// Draws the bottom-right corner resize grip on a floating pane (call AFTER plugin content!).
+wm_draw_floating_grip :: (rect: PaneRect, focused: bool) {
+    col := theme.rgba_to_rl(theme.get_color(.BorderFocused) if focused else theme.get_color(.TextDisabled));
+    bx := rect.x + rect.w - 3.0f;
+    by := rect.y + rect.h - 3.0f;
+    raylib.DrawLineEx(.{ bx - 11.0f, by }, .{ bx, by - 11.0f }, 1.5f, col);
+    raylib.DrawLineEx(.{ bx - 7.0f,  by }, .{ bx, by - 7.0f  }, 1.5f, col);
+    raylib.DrawLineEx(.{ bx - 3.0f,  by }, .{ bx, by - 3.0f  }, 1.5f, col);
+}
+
+/// Draws live drag-and-drop dock/swap/float preview overlay on top of all windows.
+wm_draw_drag_overlay :: (wm: &WindowManager) {
+    if !wm.drag_active || wm.drop_kind == .None do return;
+
+    s := settings.g_settings.ui_scale;
+    fs := 13.5f * s;
+    r := wm.drop_preview;
+
+    accent := theme.get_color(.BorderFocused);
+    fill   := (accent & 0xFFFFFF00) | 0x36; // Translucent accent fill
+    theme.draw_rect(r.x, r.y, r.w, r.h, fill, 6.0f, accent, 2.5f);
+
+    label := "";
+    switch wm.drop_kind {
+        case .DockLeft   do label = "Dock Left Sidebar";
+        case .DockRight  do label = "Dock Right Grid";
+        case .DockBottom do label = "Dock Bottom Strip";
+        case .FloatFree  do label = "Release to Float Window";
+        case .SwapPane {
+            if tp := wm_find_pane(wm, wm.drop_target_wid); tp != null {
+                label = core.tprintf("Swap with {}", tp.title);
+            } else {
+                label = "Swap Window";
+            }
+        }
+        case _ {}
+    }
+
+    if label.count > 0 {
+        tw := theme.measure_text(label, fs);
+        pw := tw + 24.0f * s;
+        ph := 28.0f * s;
+        px := r.x + (r.w - pw) * 0.5f;
+        py := r.y + (r.h - ph) * 0.5f;
+        theme.draw_rect(px, py, pw, ph, theme.get_color(.BgHeader), 6.0f, accent, 1.5f);
+        theme.draw_text(px + 12.0f * s, py + (ph - fs) * 0.5f, label, fs, theme.get_color(.TextPrimary));
     }
 }
 

@@ -77,9 +77,9 @@ onyx build -r custom -DComponent_Build --wasm-mvp -o build/plugins/<name>.wasm p
 - `native/wasm_host.c` rejects any plugin that attempts to import from a module other than `"odit_host"`.
 
 ### 4. Window Manager & Immediate UI Renderer
-- **`src/wm/layout.onyx`**: Manages the top bar (`28px`), bottom status bar (`24px`), draggable vertical splitter (`split_ratio`), main left editor pane, and auto-tiled right grid of plugin panes (`1` column for 1–2 panes, `2` columns for 3+ panes).
-- **`src/ui/renderer.onyx`**: Translates plugin-local coordinates `(0, 0) .. (w, h)` to screen coordinates, maintains an intersected 16-deep Raylib scissor clip stack (`BeginScissorMode`), tracks focused plugin text inputs and scroll offsets, and renders all `ui_*` primitives and immediate widgets.
-- **Per-frame memory hygiene**: `src/main.onyx` calls `alloc.clear_temp_allocator()` at the start of every frame. All Raylib string conversions (`theme.to_temp_cstr`), formatting (`tprintf`), and plugin memory reads use `context.temp_allocator`.
+- **`src/wm/layout.onyx`**: Full draggable, dockable, and floating window manager managing the top bar, bottom status bar, center Core Code Editor, and four pane modes: **LeftSide** (vertical stack), **RightGrid** (1- or 2-col tiled grid), **Bottom** (horizontal strip), and **Floating** (z-ordered, shadow-elevated, corner-resizable overlays). Supports title-bar drag-and-drop with live dock/swap/float preview overlays, active splitters for every occupied dock zone, non-occluding hit-testing (`wm_content_pane_at`), and automatic persistence in `odit-layout.json`.
+- **`src/ui/renderer.onyx`**: Translates plugin-local coordinates `(0, 0) .. (w, h)` to screen coordinates, maintains an intersected 16-deep Raylib scissor clip stack (`BeginScissorMode`), tracks focused plugin text inputs and scroll offsets, and renders all `ui_*` primitives and immediate widgets. Supports a `headless` mode for automated `--self-test` render & interaction tests.
+- **Per-frame memory hygiene**: `src/main.onyx` calls `alloc.clear_temp_allocator()` at the start of every frame and every plugin calls `sdk.begin_frame()`. All Raylib string conversions (`theme.to_temp_cstr`), formatting (`tprintf`), and plugin memory reads use `context.temp_allocator`.
 
 ### 5. Core Code Editor (`src/editor/`)
 - **`buffer.onyx`**: Line-oriented `[..] [..] u8` buffer supporting fast edits, undo snapshots (up to 64 levels), `EditorCursor` synchronization, file load/save, and plugin-driven gutter markers (`GutterMarker`).

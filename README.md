@@ -63,7 +63,7 @@ nu build.nu run path.onyx
 | `Ctrl+Z` | Undo |
 | `Esc` | Return to **NORMAL** mode (or close Command Palette / Settings / unfocus plugin input) |
 | **Normal mode** | `h/j/k/l` or Arrows move, `w`/`b` word jump, `0`/`$` line start/end, `g`/`G` top/bottom, `i`/`a`/`o`/`O` enter **INSERT**, `x` delete char, `dd` delete line, `u` undo |
-| **Mouse** | Drag center vertical splitter to resize Editor vs. Plugin grid (persisted automatically); click pane header `x` to close a plugin |
+| **Mouse / Windows** | **Drag any plugin title bar** to reorder/swap panes, snap to **Left / Right / Bottom** dock edges, or drop in the center to **Float** freely; drag splitters or floating bottom-right corner grips to resize; click header `[ ]`/`v` to toggle Float/Dock or `x` to close (auto-saved to `odit-layout.json`) |
 
 ### Settings (`odit.json`)
 Settings are persisted automatically in `odit.json` and take effect live (including in WASM plugins):
