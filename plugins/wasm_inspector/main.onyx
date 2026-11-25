@@ -42,7 +42,7 @@ plugin_init :: (window_id: u32) -> i32 {
     g_funcs     = make([..] FuncItem);
     g_wat_lines = make([..] str);
 
-    g_active_file = str.copy(sdk.editor_active_path(context.temp_allocator));
+    g_active_file = sdk.copy_str(sdk.editor_active_path(context.temp_allocator));
     def_fn := "main";
     memory.copy(&g_func_buf[0], def_fn.data, def_fn.count);
     g_func_len = cast(u32) def_fn.count;
@@ -63,7 +63,8 @@ plugin_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len:
     ev := cast(abi.EventType) event_type;
     if ev == .ActiveFileChanged && payload_ptr != 0 && payload_len > 0 {
         p := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
-        g_active_file = str.copy(p);
+        sdk.free_str(g_active_file);
+        g_active_file = sdk.copy_str(p);
         g_needs_syms = true;
     } elseif ev == .SymbolsUpdated {
         g_needs_syms = true;
@@ -79,7 +80,7 @@ plugin_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len:
 
 #local
 refresh_functions :: () {
-    for &f in g_funcs do str.free(f.name);
+    for &f in g_funcs do sdk.free_str(f.name);
     Array.clear(&g_funcs);
 
     js := sdk.ast_symbols_json(g_active_file, context.temp_allocator);
@@ -91,7 +92,7 @@ refresh_functions :: () {
             name := sdk.json_get_str(obj, "name", context.temp_allocator);
             line := sdk.json_get_i32(obj, "line");
             if name.count > 0 {
-                g_funcs << .{ str.copy(name), line };
+                g_funcs << .{ sdk.copy_str(name), line };
             }
         }
     }
@@ -100,14 +101,14 @@ refresh_functions :: () {
 
 #local
 set_wat_text :: (wat: str) {
-    for &l in g_wat_lines do str.free(*l);
+    for &l in g_wat_lines do sdk.free_str(*l);
     Array.clear(&g_wat_lines);
     g_wat_scroll = 0.0f;
 
     start := 0;
     for i in 0 .. (wat.count + 1) {
         if i == wat.count || wat[i] == '\n' {
-            g_wat_lines << str.copy(wat[start .. i]);
+            g_wat_lines << sdk.copy_str(wat[start .. i]);
             start = i + 1;
         }
     }
@@ -118,10 +119,10 @@ inspect_current_func :: () {
     fname := str.{ &g_func_buf[0], cast(i32) g_func_len };
     if fname.count == 0 do fname = "main";
     ap := sdk.editor_active_path(context.temp_allocator);
-    if ap.count > 0 do g_active_file = str.copy(ap);
+    if ap.count > 0 do g_active_file = sdk.copy_str(ap);
 
     js := sdk.compiler_function_wat_json(g_active_file, fname, context.allocator);
-    defer str.free(js);
+    defer sdk.free_str(js);
 
     if js.count == 0 {
         set_wat_text(";; Host returned empty WAT response.");

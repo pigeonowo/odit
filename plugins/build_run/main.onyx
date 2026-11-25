@@ -325,15 +325,15 @@ parse_error_loc :: (line: str) -> (str, i32, i32) {
 #local
 append_log :: (kind: LogKind, line: str) {
     if g_logs.count >= 600 {
-        str.free(g_logs[0].text);
-        if g_logs[0].err_path.count > 0 do str.free(g_logs[0].err_path);
+        sdk.free_str(g_logs[0].text);
+        sdk.free_str(g_logs[0].err_path);
         Array.remove_at(&g_logs, 0);
     }
     ep, el, ec := parse_error_loc(line);
     g_logs << .{
         kind     = kind,
-        text     = str.copy(line),
-        err_path = str.copy(ep) if ep.count > 0 else "",
+        text     = sdk.copy_str(line),
+        err_path = sdk.copy_str(ep),
         err_line = el,
         err_col  = ec,
     };
@@ -343,8 +343,8 @@ append_log :: (kind: LogKind, line: str) {
 #local
 clear_logs :: () {
     for &l in g_logs {
-        str.free(l.text);
-        if l.err_path.count > 0 do str.free(l.err_path);
+        sdk.free_str(l.text);
+        sdk.free_str(l.err_path);
     }
     Array.clear(&g_logs);
     Array.clear(&g_partial_line);

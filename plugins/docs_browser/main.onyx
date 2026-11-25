@@ -73,11 +73,11 @@ set_query :: (q: str) {
 #local
 run_search :: () {
     for &r in g_rows {
-        str.free(r.name);
-        str.free(r.pkg);
-        str.free(r.kind);
-        str.free(r.signature);
-        str.free(r.summary);
+        sdk.free_str(r.name);
+        sdk.free_str(r.pkg);
+        sdk.free_str(r.kind);
+        sdk.free_str(r.signature);
+        sdk.free_str(r.summary);
     }
     Array.clear(&g_rows);
     g_selected = 0;
@@ -85,7 +85,7 @@ run_search :: () {
 
     q := str.{ &g_query_buf[0], cast(i32) g_query_len };
     js := sdk.docs_search_json(q, context.allocator);
-    defer str.free(js);
+    defer sdk.free_str(js);
 
     pos := 0;
     obj: str;
@@ -94,11 +94,11 @@ run_search :: () {
         if !matches_category(kind) do continue;
 
         g_rows << .{
-            name      = str.copy(sdk.json_get_str(obj, "name",      context.temp_allocator)),
-            pkg       = str.copy(sdk.json_get_str(obj, "pkg",       context.temp_allocator)),
-            kind      = str.copy(kind),
-            signature = str.copy(sdk.json_get_str(obj, "signature", context.temp_allocator)),
-            summary   = str.copy(sdk.json_get_str(obj, "summary",   context.temp_allocator)),
+            name      = sdk.copy_str(sdk.json_get_str(obj, "name",      context.temp_allocator)),
+            pkg       = sdk.copy_str(sdk.json_get_str(obj, "pkg",       context.temp_allocator)),
+            kind      = sdk.copy_str(kind),
+            signature = sdk.copy_str(sdk.json_get_str(obj, "signature", context.temp_allocator)),
+            summary   = sdk.copy_str(sdk.json_get_str(obj, "summary",   context.temp_allocator)),
         };
     }
     g_needs_query = false;

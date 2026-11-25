@@ -43,13 +43,13 @@ plugin_manifest :: (out_ptr: u32, out_cap: u32) -> i32 {
 plugin_init :: (window_id: u32) -> i32 {
     g_nodes    = make([..] TreeNode);
     g_expanded = make([..] str);
-    g_expanded << str.copy("src");
-    g_expanded << str.copy("plugins");
+    g_expanded << sdk.copy_str("src");
+    g_expanded << sdk.copy_str("plugins");
 
     sdk.register_command("file_explorer.refresh",  "File Explorer: Refresh Tree", "");
     sdk.register_command("file_explorer.collapse", "File Explorer: Collapse All Folders", "");
 
-    g_active_path = str.copy(sdk.editor_active_path(context.temp_allocator));
+    g_active_path = sdk.copy_str(sdk.editor_active_path(context.temp_allocator));
     g_needs_refresh = true;
     return 0;
 }
@@ -62,7 +62,8 @@ plugin_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len:
     ev := cast(abi.EventType) event_type;
     if ev == .ActiveFileChanged && payload_ptr != 0 && payload_len > 0 {
         p := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
-        g_active_path = str.copy(p);
+        sdk.free_str(g_active_path);
+        g_active_path = sdk.copy_str(p);
     } elseif ev == .WorkspaceChanged {
         g_needs_refresh = true;
     } elseif ev == .CommandInvoked && payload_ptr != 0 && payload_len > 0 {
@@ -71,7 +72,7 @@ plugin_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len:
             g_needs_refresh = true;
             sdk.notify(.Info, "Refreshed File Explorer");
         } elseif str_contains_ci(payload, "file_explorer.collapse") {
-            for &s in g_expanded do str.free(*s);
+            for &s in g_expanded do sdk.free_str(*s);
             Array.clear(&g_expanded);
             g_needs_refresh = true;
         }
@@ -90,13 +91,13 @@ is_expanded :: (dir_path: str) -> bool {
 toggle_expanded :: (dir_path: str) {
     for i in 0 .. g_expanded.count {
         if str.equal(g_expanded[i], dir_path) {
-            str.free(g_expanded[i]);
+            sdk.free_str(g_expanded[i]);
             Array.remove_at(&g_expanded, i);
             g_needs_refresh = true;
             return;
         }
     }
-    g_expanded << str.copy(dir_path);
+    g_expanded << sdk.copy_str(dir_path);
     g_needs_refresh = true;
 }
 
@@ -106,7 +107,7 @@ populate_dir :: (rel_dir: str, depth: i32) {
 
     // Copy JSON to heap for recursion safety (nested calls won't clobber parent slices)
     js := sdk.workspace_list_dir_json(rel_dir, context.allocator);
-    defer str.free(js);
+    defer sdk.free_str(js);
 
     pos := 0;
     obj: str;
@@ -117,9 +118,9 @@ populate_dir :: (rel_dir: str, depth: i32) {
 
         if name.count == 0 do continue;
 
-        owned_path := str.copy(path);
+        owned_path := sdk.copy_str(path);
         g_nodes << .{
-            name   = str.copy(name),
+            name   = sdk.copy_str(name),
             path   = owned_path,
             is_dir = is_dir,
             depth  = depth,
@@ -134,8 +135,8 @@ populate_dir :: (rel_dir: str, depth: i32) {
 #local
 rebuild_tree :: () {
     for &n in g_nodes {
-        str.free(n.name);
-        str.free(n.path);
+        sdk.free_str(n.name);
+        sdk.free_str(n.path);
     }
     Array.clear(&g_nodes);
     populate_dir("", 0);
@@ -170,7 +171,7 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
 
     sdk.input_text(1, pad, pad, inp_w, 26.0f, g_filter_buf, &g_filter_len, "Filter...");
     if sdk.button(2, pad + inp_w + 5.0f, pad, btn_w, 26.0f, "Fold", .Ghost) & .Clicked {
-        for &s in g_expanded do str.free(*s);
+        for &s in g_expanded do sdk.free_str(*s);
         Array.clear(&g_expanded);
         rebuild_tree();
     }
@@ -245,7 +246,8 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
         rebuild_tree();
     } elseif clicked_file.count > 0 {
         if sdk.editor_open(clicked_file, 1, 1) == 0 {
-            g_active_path = str.copy(clicked_file);
+            sdk.free_str(g_active_path);
+            g_active_path = sdk.copy_str(clicked_file);
         } else {
             sdk.notify(.Error, "Could not open file");
         }

@@ -771,6 +771,7 @@ ONYX_DEF(wasm_plugin_shutdown, (INT, INT), ()) {
 
 // wasm_plugin_event(handle: u32, window_id: u32, event_type: u32, payload_ptr: u32, payload_len: u32) -> void
 ONYX_DEF(wasm_plugin_event, (INT, INT, INT, INT, INT), ()) {
+    set_error("");
     PluginSlot *slot = get_slot((uint32_t)params->data[0].of.i32);
     if (!slot || !slot->fn_event) return NULL;
     wasm_val_t args[4] = {
@@ -788,6 +789,7 @@ ONYX_DEF(wasm_plugin_event, (INT, INT, INT, INT, INT), ()) {
 
 // wasm_plugin_render(handle: u32, window_id: u32, ctx_guest_ptr: u32) -> void
 ONYX_DEF(wasm_plugin_render, (INT, INT, INT), ()) {
+    set_error("");
     PluginSlot *slot = get_slot((uint32_t)params->data[0].of.i32);
     if (!slot || !slot->fn_render) return NULL;
     wasm_val_t args[2] = {

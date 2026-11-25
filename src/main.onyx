@@ -284,7 +284,8 @@ sync_diagnostic_gutter_markers :: () {
     editor.buffer_clear_gutter_markers(&g_app.ed.buf, cast(u32) abi.GutterMarkerKind.DiagnosticErr);
     editor.buffer_clear_gutter_markers(&g_app.ed.buf, cast(u32) abi.GutterMarkerKind.DiagnosticWarn);
     for &d in g_app.lsp_client.diagnostics {
-        kind := cast(u32) abi.GutterMarkerKind.DiagnosticErr if d.severity == 1 else cast(u32) abi.GutterMarkerKind.DiagnosticWarn;
+        kind := cast(u32) abi.GutterMarkerKind.DiagnosticWarn;
+        if d.severity == 1 do kind = cast(u32) abi.GutterMarkerKind.DiagnosticErr;
         col  := theme.get_color(.Error) if d.severity == 1 else theme.get_color(.Warning);
         editor.buffer_set_gutter_marker(&g_app.ed.buf, d.path, d.line, kind, col);
     }
@@ -421,6 +422,110 @@ run_headless_selftest :: () {
         if str.equal(c.id, "inspector.ping") {
             execute_command(c);
             printf("[odit] Toast after WASM command: '{}'\n", g_app.window_mgr.toast_text);
+        }
+    }
+
+    // Headless render + interaction regression tests (File Explorer clicks & Docs Browser typing)
+    ui.g_ui.headless = true;
+    printf("[odit] FrameContext size={}, MouseButton.Left={}, FRAME_FLAG_HOVERED={}\n",
+           sizeof abi.FrameContext, cast(u32) abi.MouseButton.Left, abi.FRAME_FLAG_HOVERED);
+
+    // 1) Render every plugin once and assert zero WASM traps
+    for &pane in g_app.window_mgr.panes {
+        if lp := find_loaded_plugin(pane.plugin_handle); lp != null {
+            ui.ui_begin_pane(pane.window_id, 0, 0, 420, 440, true, true);
+            fctx := abi.FrameContext.{
+                window_id = pane.window_id, width = 420, height = 440,
+                mouse_x = 10, mouse_y = 10, flags = abi.FRAME_FLAG_FOCUSED | abi.FRAME_FLAG_HOVERED,
+                delta_time = 0.016f,
+            };
+            plugin.plugin_render_with_ctx(lp, pane.window_id, &fctx);
+            ui.ui_end_pane();
+            err := plugin.host_last_error();
+            if err.count > 0 {
+                printf("[odit] FAIL: WASM trap rendering '{}': {}\n", pane.title, err);
+                os.exit(1);
+            }
+        }
+    }
+
+    // 2) Docs Browser: focus search input & type "format" across multiple frames (tests free(null) regression)
+    if dp := wm.wm_find_pane(&g_app.window_mgr, wid_doc); dp != null {
+        if lp := find_loaded_plugin(dp.plugin_handle); lp != null {
+            // Click search box at (50, 20)
+            ui.g_ui.mouse_x = 50; ui.g_ui.mouse_y = 20; ui.g_ui.mouse_pressed = true; ui.g_ui.typed_count = 0;
+            ui.ui_begin_pane(wid_doc, 0, 0, 420, 440, true, true);
+            fctx := abi.FrameContext.{
+                window_id = wid_doc, width = 420, height = 440,
+                mouse_x = 50, mouse_y = 20, mouse_pressed = cast(u32) abi.MouseButton.Left,
+                flags = abi.FRAME_FLAG_FOCUSED | abi.FRAME_FLAG_HOVERED, delta_time = 0.016f,
+            };
+            plugin.plugin_render_with_ctx(lp, wid_doc, &fctx);
+            ui.ui_end_pane();
+
+            // Type "format" one character per frame
+            test_q := "format";
+            for ch_i in 0 .. test_q.count {
+                ui.g_ui.mouse_pressed = false;
+                ui.g_ui.typed_chars[0] = cast(u32) test_q[ch_i];
+                ui.g_ui.typed_count = 1;
+                ui.ui_begin_pane(wid_doc, 0, 0, 420, 440, true, true);
+                fctx.mouse_pressed = 0;
+                plugin.plugin_render_with_ctx(lp, wid_doc, &fctx);
+                ui.ui_end_pane();
+                err := plugin.host_last_error();
+                if err.count > 0 {
+                    printf("[odit] FAIL: Docs Browser trapped while typing char {}: {}\n", ch_i, err);
+                    os.exit(1);
+                }
+            }
+            // Extra frame so g_needs_query executes after final char
+            ui.g_ui.typed_count = 0;
+            ui.ui_begin_pane(wid_doc, 0, 0, 420, 440, true, true);
+            plugin.plugin_render_with_ctx(lp, wid_doc, &fctx);
+            ui.ui_end_pane();
+            if err := plugin.host_last_error(); err.count > 0 {
+                printf("[odit] FAIL: Docs Browser trapped on post-type search: {}\n", err);
+                os.exit(1);
+            }
+            println("[odit] PASS: Docs Browser typing & live search produced 0 WASM traps!");
+        }
+    }
+
+    // 3) File Explorer: click folder row 0 (`abi`) to expand, then click row 1 (`abi/abi.onyx`) to open
+    if fp := wm.wm_find_pane(&g_app.window_mgr, wid_fe); fp != null {
+        if lp := find_loaded_plugin(fp.plugin_handle); lp != null {
+            // Click row 0 (list_y = 42.0, row_h = 26.0 -> y = 52.0 hits first folder `abi`)
+            ui.g_ui.mouse_x = 60; ui.g_ui.mouse_y = 52; ui.g_ui.mouse_pressed = true; ui.g_ui.typed_count = 0;
+            ui.ui_begin_pane(wid_fe, 0, 0, 360, 440, true, true);
+            fctx := abi.FrameContext.{
+                window_id = wid_fe, width = 360, height = 440,
+                mouse_x = 60, mouse_y = 52, mouse_pressed = cast(u32) abi.MouseButton.Left,
+                flags = abi.FRAME_FLAG_FOCUSED | abi.FRAME_FLAG_HOVERED, delta_time = 0.016f,
+            };
+            plugin.plugin_render_with_ctx(lp, wid_fe, &fctx);
+            ui.ui_end_pane();
+            if err := plugin.host_last_error(); err.count > 0 {
+                printf("[odit] FAIL: File Explorer trapped on folder click: {}\n", err);
+                os.exit(1);
+            }
+
+            // Click row 1 (y = 42 + 26 + 10 = 78 -> should now be `abi/abi.onyx`)
+            ui.g_ui.mouse_x = 60; ui.g_ui.mouse_y = 78; ui.g_ui.mouse_pressed = true;
+            ui.ui_begin_pane(wid_fe, 0, 0, 360, 440, true, true);
+            fctx.mouse_y = 78;
+            plugin.plugin_render_with_ctx(lp, wid_fe, &fctx);
+            ui.ui_end_pane();
+            if err := plugin.host_last_error(); err.count > 0 {
+                printf("[odit] FAIL: File Explorer trapped on file click: {}\n", err);
+                os.exit(1);
+            }
+            printf("[odit] Active file after File Explorer folder+file click: '{}'\n", g_app.ed.buf.path);
+            if !str.equal(g_app.ed.buf.path, "abi/abi.onyx") {
+                printf("[odit] FAIL: Expected active file 'abi/abi.onyx', got '{}'\n", g_app.ed.buf.path);
+                os.exit(1);
+            }
+            println("[odit] PASS: File Explorer folder expand & file open clicks succeeded!");
         }
     }
 
@@ -661,15 +766,25 @@ main :: (args: [] cstr) {
         ui.ui_begin_frame(dt, capture_plugin_keys);
 
         mpos := raylib.GetMousePosition();
-        mdown: u32 = (cast(u32) abi.MouseButton.Left if raylib.IsMouseButtonDown(.LEFT) else 0) |
-                     (cast(u32) abi.MouseButton.Right if raylib.IsMouseButtonDown(.RIGHT) else 0);
-        mpress: u32 = (cast(u32) abi.MouseButton.Left if raylib.IsMouseButtonPressed(.LEFT) else 0) |
-                      (cast(u32) abi.MouseButton.Right if raylib.IsMouseButtonPressed(.RIGHT) else 0);
-        mrel: u32 = (cast(u32) abi.MouseButton.Left if raylib.IsMouseButtonReleased(.LEFT) else 0) |
-                    (cast(u32) abi.MouseButton.Right if raylib.IsMouseButtonReleased(.RIGHT) else 0);
-        kmods: u32 = (cast(u32) abi.KeyMod.Shift if (raylib.IsKeyDown(.LEFT_SHIFT) || raylib.IsKeyDown(.RIGHT_SHIFT)) else 0) |
-                     (cast(u32) abi.KeyMod.Ctrl if ctrl else 0) |
-                     (cast(u32) abi.KeyMod.Alt if (raylib.IsKeyDown(.LEFT_ALT) || raylib.IsKeyDown(.RIGHT_ALT)) else 0);
+        mdown: u32 = 0;
+        if raylib.IsMouseButtonDown(.LEFT)   do mdown |= cast(u32) abi.MouseButton.Left;
+        if raylib.IsMouseButtonDown(.RIGHT)  do mdown |= cast(u32) abi.MouseButton.Right;
+        if raylib.IsMouseButtonDown(.MIDDLE) do mdown |= cast(u32) abi.MouseButton.Middle;
+
+        mpress: u32 = 0;
+        if raylib.IsMouseButtonPressed(.LEFT)   do mpress |= cast(u32) abi.MouseButton.Left;
+        if raylib.IsMouseButtonPressed(.RIGHT)  do mpress |= cast(u32) abi.MouseButton.Right;
+        if raylib.IsMouseButtonPressed(.MIDDLE) do mpress |= cast(u32) abi.MouseButton.Middle;
+
+        mrel: u32 = 0;
+        if raylib.IsMouseButtonReleased(.LEFT)   do mrel |= cast(u32) abi.MouseButton.Left;
+        if raylib.IsMouseButtonReleased(.RIGHT)  do mrel |= cast(u32) abi.MouseButton.Right;
+        if raylib.IsMouseButtonReleased(.MIDDLE) do mrel |= cast(u32) abi.MouseButton.Middle;
+
+        kmods: u32 = 0;
+        if raylib.IsKeyDown(.LEFT_SHIFT) || raylib.IsKeyDown(.RIGHT_SHIFT) do kmods |= cast(u32) abi.KeyMod.Shift;
+        if ctrl                                                            do kmods |= cast(u32) abi.KeyMod.Ctrl;
+        if raylib.IsKeyDown(.LEFT_ALT) || raylib.IsKeyDown(.RIGHT_ALT)     do kmods |= cast(u32) abi.KeyMod.Alt;
 
         for &pane in g_app.window_mgr.panes {
             p_focused := g_app.window_mgr.focused_window_id == pane.window_id && !overlay_open;

@@ -18,6 +18,20 @@ begin_frame :: () {
     alloc.clear_temp_allocator();
 }
 
+/// Null-safe string free for WASM plugins (Onyx's heap `raw_free(null)` reads
+/// address `0 - 8` and triggers a WASM out-of-bounds memory trap!).
+free_str :: (s: str) {
+    if s.data != null && s.count > 0 {
+        str.free(s);
+    }
+}
+
+/// Safe heap copy that returns empty `{ null, 0 }` for empty strings.
+copy_str :: (s: str) -> str {
+    if s.count == 0 do return "";
+    return str.copy(s);
+}
+
 // -----------------------------------------------------------------------------
 // Mandatory Guest ABI Exports
 // -----------------------------------------------------------------------------
@@ -225,10 +239,13 @@ workspace_write_file :: (rel_path: str, data: str) -> bool {
 
 workspace_list_dir_json :: (rel_path: str, allocator := context.temp_allocator) -> str {
     needed := abi.workspace_list_dir(cast(u32) rel_path.data, cast(u32) rel_path.count, 0, 0);
-    if needed <= 0 do return "[]";
+    if needed <= 0 do return "";
     buf := make([] u8, needed, allocator);
     got := abi.workspace_list_dir(cast(u32) rel_path.data, cast(u32) rel_path.count, cast(u32) buf.data, cast(u32) buf.count);
-    if got <= 0 do return "[]";
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
     return buf[0 .. got];
 }
 
@@ -242,10 +259,13 @@ proc_spawn :: (cmd: str, args_newline_sep: str, cwd: str = "") -> u32 {
 
 ast_symbols_json :: (rel_path: str = "", allocator := context.temp_allocator) -> str {
     needed := abi.ast_get_symbols(cast(u32) rel_path.data, cast(u32) rel_path.count, 0, 0);
-    if needed <= 0 do return "[]";
+    if needed <= 0 do return "";
     buf := make([] u8, needed, allocator);
     got := abi.ast_get_symbols(cast(u32) rel_path.data, cast(u32) rel_path.count, cast(u32) buf.data, cast(u32) buf.count);
-    if got <= 0 do return "[]";
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
     return buf[0 .. got];
 }
 
@@ -262,16 +282,22 @@ compiler_function_wat_json :: (file: str, func: str, allocator := context.temp_a
         cast(u32) func.data, cast(u32) func.count,
         cast(u32) buf.data, cast(u32) buf.count
     );
-    if got <= 0 do return "";
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
     return buf[0 .. got];
 }
 
 docs_search_json :: (query: str, allocator := context.temp_allocator) -> str {
     needed := abi.docs_search(cast(u32) query.data, cast(u32) query.count, 0, 0);
-    if needed <= 0 do return "[]";
+    if needed <= 0 do return "";
     buf := make([] u8, needed, allocator);
     got := abi.docs_search(cast(u32) query.data, cast(u32) query.count, cast(u32) buf.data, cast(u32) buf.count);
-    if got <= 0 do return "[]";
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
     return buf[0 .. got];
 }
 

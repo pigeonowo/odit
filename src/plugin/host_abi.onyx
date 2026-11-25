@@ -142,7 +142,11 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
 
         case 22 { // ui_measure_text(text_ptr, text_len, font_size, flags) -> f32
             txt := guest_read_str(handle, arg_u32(0), arg_u32(1));
-            ret_f32(theme.measure_text(txt, arg_f32(2) * settings.g_settings.ui_scale));
+            if ui.g_ui.headless {
+                ret_f32(cast(f32) txt.count * arg_f32(2) * 0.6f);
+            } else {
+                ret_f32(theme.measure_text(txt, arg_f32(2) * settings.g_settings.ui_scale));
+            }
         }
 
         case 23 { // ui_get_theme_color(role) -> u32
@@ -398,7 +402,9 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
                 line := arg_u32(2);
                 col  := arg_u32(3);
                 if path.count > 0 && line > 0 {
-                    lsp.lsp_request_references(g_host_ctx.lsp_client, path, cast(i32) line - 1, cast(i32) col - 1 if col > 0 else 0);
+                    c0: i32 = 0;
+                    if col > 0 do c0 = cast(i32) col - 1;
+                    lsp.lsp_request_references(g_host_ctx.lsp_client, path, cast(i32) line - 1, c0);
                 }
                 js := lsp.lsp_references_to_json(g_host_ctx.lsp_client);
                 ret_i32(guest_write_out(handle, js, arg_u32(4), arg_u32(5)));
