@@ -185,6 +185,10 @@ proc_read :: (handle: u32, stream_mask: abi.StreamMask, buf: [] u8) -> i32 {
     return abi.proc_read_output(handle, cast(u32) stream_mask, cast(u32) buf.data, cast(u32) buf.count);
 }
 
+proc_write :: (handle: u32, data: str) -> i32 {
+    return abi.proc_write_input(handle, cast(u32) data.data, cast(u32) data.count);
+}
+
 proc_kill :: (handle: u32) -> i32 {
     return abi.proc_kill(handle);
 }

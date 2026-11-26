@@ -120,10 +120,30 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
             lsp_c.hover_visible = false;
             lsp_c.comp_open = false;
         }
-        rel_y := (mpos.y - rect.y) + ed.scroll_y - 6.0;
-        rel_x := (mpos.x - (rect.x + ed.gutter_width + 8.0)) + ed.scroll_x;
+        rel_y := (mpos.y - rect.y) + ed.scroll_y - 6.0f;
+        rel_x := (mpos.x - (rect.x + ed.gutter_width + 8.0f)) + ed.scroll_x;
         clicked_line := cast(i32) (rel_y / ed.line_height);
-        clicked_col  := cast(i32) ((rel_x + ed.char_width * 0.5) / ed.char_width);
+        if clicked_line < 0 do clicked_line = 0;
+        if clicked_line >= ed.buf.lines.count do clicked_line = ed.buf.lines.count - 1;
+
+        clicked_col: i32 = 0;
+        if clicked_line >= 0 && clicked_line < ed.buf.lines.count && rel_x > 0.0f {
+            ln_b := &ed.buf.lines[clicked_line];
+            ln_s := str.{ ln_b.data, ln_b.count };
+            best_col: i32 = 0;
+            best_dist: f32 = rel_x;
+            for c in 1 .. (ln_s.count + 1) {
+                px := theme.measure_text(ln_s[0 .. c], ed.font_size);
+                d := px - rel_x;
+                if d < 0.0f do d = -d;
+                if d < best_dist {
+                    best_dist = d;
+                    best_col = c;
+                }
+                if px > rel_x + ed.char_width do break;
+            }
+            clicked_col = best_col;
+        }
         ed.buf.cursor_line = clicked_line;
         ed.buf.cursor_col  = clicked_col;
         buffer_clamp_cursor(&ed.buf);
@@ -481,20 +501,19 @@ editor_draw :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, lsp_c: &lsp.L
             theme.draw_text(rect.x + ed.gutter_width - ln_w - 8.0f, ly + (ed.line_height - ln_fs) * 0.45f, lnum, ln_fs, ln_col);
         }
 
-        // Syntax-highlighted source line
+        // Syntax-highlighted source line (each span positioned by exact prefix width so cursor never drifts!)
         line_bytes := &ed.buf.lines[li];
         line_str := str.{ line_bytes.data, line_bytes.count };
         line_end_x := code_x;
         if line_str.count > 0 {
             n_spans := lex_onyx_line(line_str, spans);
-            cx := code_x;
             for si in 0 .. n_spans {
                 sp := spans[si];
                 chunk := line_str[sp.start .. sp.end];
-                theme.draw_text(cx, ly + 1.0f, chunk, ed.font_size, token_color(sp.kind));
-                cx += theme.measure_text(chunk, ed.font_size);
+                sx := code_x + theme.measure_text(line_str[0 .. sp.start], ed.font_size);
+                theme.draw_text(sx, ly + 1.0f, chunk, ed.font_size, token_color(sp.kind));
             }
-            line_end_x = cx;
+            line_end_x = code_x + theme.measure_text(line_str, ed.font_size);
         }
 
         // Diagnostic underlines & inline message from Onyx LSP

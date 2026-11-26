@@ -255,6 +255,7 @@ static const HostOpSpec g_host_ops[] = {
     { "proc_kill",                   83 },
     { "compiler_build",              84 },
     { "compiler_get_function_wat",   85 },
+    { "proc_write_input",            86 },
 
     // E. Live Debugger (90..99)
     { "debug_toggle_breakpoint",     90 },

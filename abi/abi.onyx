@@ -487,6 +487,7 @@ DebugState :: struct {
         proc_spawn           :: (cmd_ptr: u32, cmd_len: u32, args_ptr: u32, args_len: u32, cwd_ptr: u32, cwd_len: u32) -> u32 ---
         proc_poll_status     :: (handle: u32, out_exit_code_ptr: u32) -> u32 ---
         proc_read_output     :: (handle: u32, stream_mask: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        proc_write_input     :: (handle: u32, data_ptr: u32, data_len: u32) -> i32 ---
         proc_kill            :: (handle: u32) -> i32 ---
 
         compiler_build            :: (entry_ptr: u32, entry_len: u32, target: u32, flags: u32) -> u32 ---

@@ -11,6 +11,9 @@ build_native() {
     echo "Building native Wasmer bridge -> bin/odit_wasm_host.so"
     gcc -O2 -fPIC -shared -Wall -Wno-missing-braces -Wno-unused-parameter \
         -I"$ONYX_PATH/include" native/wasm_host.c -o bin/odit_wasm_host.so -ldl
+    if [[ -f "$ONYX_PATH/lib/odit_wasm_host.so" ]]; then
+        cp -f bin/odit_wasm_host.so "$ONYX_PATH/lib/odit_wasm_host.so"
+    fi
 }
 
 sync_raylib() {

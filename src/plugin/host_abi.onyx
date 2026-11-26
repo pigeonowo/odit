@@ -548,6 +548,16 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
             ret_i32(guest_write_out(handle, js, arg_u32(4), arg_u32(5)));
         }
 
+        case 86 { // proc_write_input(proc_handle, data_ptr, data_len) -> i32
+            ph   := arg_u32(0);
+            data := guest_read_str(handle, arg_u32(1), arg_u32(2));
+            if data.count == 0 {
+                ret_i32(0);
+            } else {
+                ret_i32(native_proc_write(ph, data.data, data.count));
+            }
+        }
+
         // Phase 4 debugger services (return clean AbiError.NotReady until wired)
         case 90, 91, 92, 93, 94 {
             ret_i32(cast(i32) abi.AbiError.NotReady);

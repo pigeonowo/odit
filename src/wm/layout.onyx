@@ -1041,38 +1041,6 @@ wm_draw_chrome :: (
     theme.draw_text(8.0f + 7.0f * s, (tb_h - fs_md) * 0.5f, "ODIT", fs_md, 0x11111BFF);
     theme.draw_text(16.0f + badge_w, (tb_h - fs_md) * 0.5f, "Onyx Modular WASM IDE", fs_md, theme.get_color(.TextSecondary));
 
-    // Clickable Quick Open (Ctrl+O) & Command Palette (Ctrl+P) buttons in top bar
-    find_w := 142.0f * s;
-    pal_w  := 226.0f * s;
-    tot_w  := find_w + 8.0f + pal_w;
-    find_x := (screen_w - tot_w) * 0.5f;
-    pal_x  := find_x + find_w + 8.0f;
-
-    mpos := raylib.GetMousePosition();
-    find_hover := !block_clicks && mpos.x >= find_x && mpos.x <= (find_x + find_w) && mpos.y >= 4.0f && mpos.y <= (tb_h - 4.0f);
-    theme.draw_rect(find_x, 4.0f, find_w, tb_h - 8.0f,
-        theme.get_color(.BgHover) if find_hover else theme.get_color(.BgSurface),
-        4.0f, theme.get_color(.Border), 1.0f);
-    theme.draw_text(find_x + 10.0f * s, (tb_h - fs_sm) * 0.5f, "Open File Ctrl+O", fs_sm, theme.get_color(.TextPrimary));
-    actions.open_finder = find_hover && raylib.IsMouseButtonPressed(.LEFT);
-
-    pal_hover := !block_clicks && mpos.x >= pal_x && mpos.x <= (pal_x + pal_w) && mpos.y >= 4.0f && mpos.y <= (tb_h - 4.0f);
-    theme.draw_rect(pal_x, 4.0f, pal_w, tb_h - 8.0f,
-        theme.get_color(.BgHover) if pal_hover else theme.get_color(.BgSurface),
-        4.0f, theme.get_color(.Border), 1.0f);
-    theme.draw_text(pal_x + 10.0f * s, (tb_h - fs_sm) * 0.5f, "Command Palette  Ctrl+P", fs_sm, theme.get_color(.TextSecondary));
-    actions.open_palette = pal_hover && raylib.IsMouseButtonPressed(.LEFT);
-
-    // Clickable Settings button on top-right
-    set_w := 124.0f * s;
-    set_x := screen_w - set_w - 8.0f;
-    set_hover := !block_clicks && mpos.x >= set_x && mpos.x <= (set_x + set_w) && mpos.y >= 4.0f && mpos.y <= (tb_h - 4.0f);
-    theme.draw_rect(set_x, 4.0f, set_w, tb_h - 8.0f,
-        theme.get_color(.BgHover) if set_hover else theme.get_color(.BgSurface),
-        4.0f, theme.get_color(.Border), 1.0f);
-    theme.draw_text(set_x + 10.0f * s, (tb_h - fs_sm) * 0.5f, "Settings Ctrl+,", fs_sm, theme.get_color(.TextPrimary));
-    actions.open_settings = set_hover && raylib.IsMouseButtonPressed(.LEFT);
-
     // Active splitter handle lines
     wy := wm.work_rect.y;
     wh := wm.work_rect.h;

@@ -77,6 +77,8 @@ g_logs:         [..] LogLine;
 g_partial_line: [..] u8;
 g_scroll_y:     f32 = 0.0f;
 g_auto_scroll:  bool = true;
+g_stdin_buf:    [256] u8;
+g_stdin_len:    u32 = 0;
 
 MANIFEST_JSON :: """{"id":"odit.build_run","title":"Build & Run","version":"0.2.0","default_slot":0,"default_width":420,"default_height":380,"event_mask":99,"allow_multiple":false}"""
 
@@ -364,6 +366,31 @@ ingest_chunk :: (data: [] u8) {
             g_partial_line << ch;
         }
     }
+    if data.count > 0 do g_auto_scroll = true;
+}
+
+#local
+send_stdin_line :: () {
+    if g_proc_handle == 0 || g_proc_state != .Running do return;
+    inp := str.{ &g_stdin_buf[0], cast(i32) g_stdin_len };
+
+    // Write `inp + "\n"` to child process stdin
+    payload := make([..] u8, inp.count + 1, context.temp_allocator);
+    if inp.count > 0 do Array.concat(&payload, inp);
+    payload << '\n';
+    sdk.proc_write(g_proc_handle, str.{ payload.data, payload.count });
+
+    // Echo cleanly into the console (attaching to any pending prompt like "Guess: ")
+    echo := make([..] u8, g_partial_line.count + inp.count + 4, context.temp_allocator);
+    if g_partial_line.count > 0 {
+        Array.concat(&echo, str.{ g_partial_line.data, g_partial_line.count });
+        Array.clear(&g_partial_line);
+    } else {
+        Array.concat(&echo, "> ");
+    }
+    if inp.count > 0 do Array.concat(&echo, inp);
+    append_log(.Command, str.{ echo.data, echo.count });
+    g_stdin_len = 0;
 }
 
 #local
@@ -706,13 +733,17 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
 
     if cfg_changed do cfg_save();
 
+    // Reserve bottom strip for interactive stdin when a process is running
+    stdin_bar_h: f32 = 34.0f if running else 0.0f;
+
     // Output console box (clickable error locations!)
-    log_h := ctx.height - y - pad;
+    log_h := ctx.height - y - pad - stdin_bar_h;
     if log_h < 60.0f do log_h = 60.0f;
     sdk.draw_rect(pad, y, w, log_h, sdk.theme_color(.BgBase), 5.0f, sdk.theme_color(.Border), 1.0f);
 
     row_h: f32 = 20.0f;
-    content_h := cast(f32) g_logs.count * row_h + 12.0f;
+    total_rows := g_logs.count + (1 if g_partial_line.count > 0 else 0);
+    content_h := cast(f32) total_rows * row_h + 12.0f;
     if g_auto_scroll && content_h > log_h {
         g_scroll_y = content_h - log_h;
         g_auto_scroll = false;
@@ -754,7 +785,27 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
         ly += row_h;
     }
 
+    // Render live unflushed prompt (e.g. "Enter your guess: " printed without trailing newline)
+    if g_partial_line.count > 0 {
+        part := str.{ g_partial_line.data, g_partial_line.count };
+        sdk.draw_text(pad + 8.0f, ly + 2.0f, part, 12.0f, sdk.theme_color(.TextPrimary), .Mono);
+    }
+
     sdk.scroll_end();
+
+    // Interactive stdin input bar while child process is running
+    if running {
+        sy := y + log_h + 6.0f;
+        send_w: f32 = 66.0f;
+        inp_w := w - send_w - 6.0f;
+        if inp_w < 80.0f do inp_w = 80.0f;
+        if sdk.input_text(25, pad, sy, inp_w, 28.0f, g_stdin_buf, &g_stdin_len, "Send stdin (Enter)...") & .Submitted {
+            send_stdin_line();
+        }
+        if sdk.button(26, pad + inp_w + 6.0f, sy, send_w, 28.0f, "Send", .Primary) & .Clicked {
+            send_stdin_line();
+        }
+    }
 
     if jump_path.count > 0 {
         sdk.editor_open(jump_path, jump_line, jump_col);

@@ -27,6 +27,10 @@ export def "main native" [] {
     let inc = ((onyx-path) | path join "include")
     print "Building native Wasmer bridge -> bin/odit_wasm_host.so"
     ^gcc -O2 -fPIC -shared -Wall -Wno-missing-braces -Wno-unused-parameter $"-I($inc)" native/wasm_host.c -o bin/odit_wasm_host.so -ldl
+    let installed_so = ((onyx-path) | path join "lib" "odit_wasm_host.so")
+    if ($installed_so | path exists) {
+        cp -f bin/odit_wasm_host.so $installed_so
+    }
 }
 
 # Compile all WASM plugins in `plugins/*/main.onyx` to `build/plugins/*.wasm`

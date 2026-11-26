@@ -246,14 +246,14 @@ measure_text :: (text: str, font_size: f32) -> f32 {
     if text.count == 0 do return 0.0;
     cs := to_temp_cstr(text);
     sz: raylib.Vector2;
-    raylib.MeasureTextEx(g_theme.font_mono, cs, font_size, 0.5, &sz);
+    raylib.MeasureTextEx(g_theme.font_mono, cs, font_size, 0.0f, &sz);
     return sz.x;
 }
 
 draw_text :: (x, y: f32, text: str, font_size: f32, rgba: u32) {
     if text.count == 0 do return;
     cs := to_temp_cstr(text);
-    raylib.DrawTextEx(g_theme.font_mono, cs, .{ x, y }, font_size, 0.5, rgba_to_rl(rgba));
+    raylib.DrawTextEx(g_theme.font_mono, cs, .{ x, y }, font_size, 0.0f, rgba_to_rl(rgba));
 }
 
 draw_rect :: (x, y, w, h: f32, fill_rgba: u32, radius: f32 = 0.0, border_rgba: u32 = 0, border_w: f32 = 0.0) {
