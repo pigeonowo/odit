@@ -87,6 +87,29 @@ editor_ensure_cursor_visible :: (ed: &EditorView, view_h: f32) {
     if ed.scroll_y < 0.0 do ed.scroll_y = 0.0;
 }
 
+editor_ensure_cursor_visible_x :: (ed: &EditorView, view_w: f32) {
+    code_w := view_w - ed.gutter_width - 16.0f;
+    if code_w < 40.0f do code_w = 40.0f;
+    if ed.buf.cursor_line < 0 || ed.buf.cursor_line >= ed.buf.lines.count do return;
+
+    ln := &ed.buf.lines[ed.buf.cursor_line];
+    ls := str.{ ln.data, ln.count };
+    col := ed.buf.cursor_col if ed.buf.cursor_col <= ls.count else ls.count;
+    if col < 0 do col = 0;
+    cx := theme.measure_text(ls[0 .. col], ed.font_size);
+
+    pad_x := ed.char_width * 2.5f;
+    if pad_x > code_w * 0.35f do pad_x = code_w * 0.35f;
+
+    if cx < ed.scroll_x + pad_x {
+        ed.scroll_x = cx - pad_x;
+    }
+    if cx > ed.scroll_x + code_w - pad_x {
+        ed.scroll_x = cx - code_w + pad_x;
+    }
+    if ed.scroll_x < 0.0f do ed.scroll_x = 0.0f;
+}
+
 #local
 key_trig :: (k: raylib.KeyboardKey) -> bool {
     return raylib.IsKeyPressed(k) || raylib.IsKeyPressedRepeat(k);
@@ -102,15 +125,21 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
     mpos := raylib.GetMousePosition();
     hovered := wm.hit_rect(mpos.x, mpos.y, rect);
 
-    // Mouse wheel scroll
+    // Mouse wheel scroll (Shift+Wheel scrolls horizontally for narrow panes)
     if hovered {
         wheel := raylib.GetMouseWheelMove();
         if wheel != 0.0 {
-            ed.scroll_y -= wheel * ed.line_height * 3.0;
-            max_s := cast(f32) ed.buf.lines.count * ed.line_height - rect.h * 0.5;
-            if max_s < 0.0 do max_s = 0.0;
-            if ed.scroll_y < 0.0 do ed.scroll_y = 0.0;
-            if ed.scroll_y > max_s do ed.scroll_y = max_s;
+            shift := raylib.IsKeyDown(.LEFT_SHIFT) || raylib.IsKeyDown(.RIGHT_SHIFT);
+            if shift {
+                ed.scroll_x -= wheel * ed.char_width * 5.0f;
+                if ed.scroll_x < 0.0f do ed.scroll_x = 0.0f;
+            } else {
+                ed.scroll_y -= wheel * ed.line_height * 3.0;
+                max_s := cast(f32) ed.buf.lines.count * ed.line_height - rect.h * 0.5;
+                if max_s < 0.0 do max_s = 0.0;
+                if ed.scroll_y < 0.0 do ed.scroll_y = 0.0;
+                if ed.scroll_y > max_s do ed.scroll_y = max_s;
+            }
         }
     }
 
@@ -424,6 +453,7 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
     if ed.buf.cursor_line != ed.last_line || ed.buf.cursor_col != ed.last_col {
         ed.last_line = ed.buf.cursor_line;
         ed.last_col  = ed.buf.cursor_col;
+        editor_ensure_cursor_visible_x(ed, rect.w);
         ev.cursor_moved = true;
     }
 
@@ -470,35 +500,45 @@ editor_draw :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, lsp_c: &lsp.L
     last_vis  := first_vis + vis_count;
     if last_vis > ed.buf.lines.count do last_vis = ed.buf.lines.count;
 
+    code_clip_x := rect.x + ed.gutter_width + 1.0f;
+    code_clip_w := rect.w - ed.gutter_width - 1.0f;
+    if code_clip_w < 1.0f do code_clip_w = 1.0f;
+
     code_x := rect.x + ed.gutter_width + 8.0f - ed.scroll_x;
     spans: [128] TokenSpan;
 
     cur_screen_x := code_x;
     cur_screen_y := rect.y + 6.0f;
+    max_vis_line_w: f32 = 0.0f;
 
+    // Pass 1: Gutter markers & line numbers (never overwritten by horizontally scrolled code)
     for li in first_vis .. last_vis {
         ly := rect.y + 6.0f + cast(f32) li * ed.line_height - ed.scroll_y;
-
-        // Highlight active line
-        if settings.g_settings.highlight_current_line && li == ed.buf.cursor_line {
-            theme.draw_rect(rect.x + ed.gutter_width + 1.0f, ly - 1.0f, rect.w - ed.gutter_width - 1.0f, ed.line_height, theme.get_color(.BgHeader));
-        }
-
-        // Draw gutter markers (breakpoints / diagnostics / debug current)
         line_1 := cast(u32) (li + 1);
         for &m in ed.buf.gutter_markers {
             if m.line == line_1 && (m.path.count == 0 || str.equal(m.path, ed.buf.path)) {
                 raylib.DrawCircle(cast(i32) (rect.x + 11.0f), cast(i32) (ly + ed.line_height * 0.45f), 4.5f, theme.rgba_to_rl(m.rgba));
             }
         }
-
-        // Line number
         if settings.g_settings.show_line_numbers {
             lnum := core.tprintf("{}", line_1);
             ln_fs := ed.font_size * 0.85f;
             ln_w := theme.measure_text(lnum, ln_fs);
             ln_col := theme.get_color(.TextPrimary) if li == ed.buf.cursor_line else theme.get_color(.TextDisabled);
             theme.draw_text(rect.x + ed.gutter_width - ln_w - 8.0f, ly + (ed.line_height - ln_fs) * 0.45f, lnum, ln_fs, ln_col);
+        }
+    }
+
+    // Pass 2: Clipped code viewport (prevents horizontally scrolled text from bleeding into gutter)
+    raylib.BeginScissorMode(cast(i32) code_clip_x, cast(i32) rect.y, cast(i32) code_clip_w, cast(i32) rect.h);
+
+    for li in first_vis .. last_vis {
+        ly := rect.y + 6.0f + cast(f32) li * ed.line_height - ed.scroll_y;
+        line_1 := cast(u32) (li + 1);
+
+        // Highlight active line
+        if settings.g_settings.highlight_current_line && li == ed.buf.cursor_line {
+            theme.draw_rect(code_clip_x, ly - 1.0f, code_clip_w, ed.line_height, theme.get_color(.BgHeader));
         }
 
         // Syntax-highlighted source line (each span positioned by exact prefix width so cursor never drifts!)
@@ -513,7 +553,9 @@ editor_draw :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, lsp_c: &lsp.L
                 sx := code_x + theme.measure_text(line_str[0 .. sp.start], ed.font_size);
                 theme.draw_text(sx, ly + 1.0f, chunk, ed.font_size, token_color(sp.kind));
             }
-            line_end_x = code_x + theme.measure_text(line_str, ed.font_size);
+            lw := theme.measure_text(line_str, ed.font_size);
+            if lw > max_vis_line_w do max_vis_line_w = lw;
+            line_end_x = code_x + lw;
         }
 
         // Diagnostic underlines & inline message from Onyx LSP
@@ -556,6 +598,20 @@ editor_draw :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, lsp_c: &lsp.L
             }
         }
     }
+
+    // Subtle horizontal scrollbar indicator when visible lines overflow pane width
+    max_content_w := max_vis_line_w + 32.0f;
+    if max_content_w > code_clip_w && code_clip_w > 30.0f {
+        max_sx := max_content_w - code_clip_w;
+        if ed.scroll_x > max_sx do ed.scroll_x = max_sx;
+        bar_w := code_clip_w * (code_clip_w / max_content_w);
+        if bar_w < 28.0f do bar_w = 28.0f;
+        bar_x := code_clip_x + (ed.scroll_x / max_sx) * (code_clip_w - bar_w);
+        theme.draw_rect(bar_x, rect.y + rect.h - 6.0f, bar_w, 4.0f, 0x6C708699, 2.0f);
+    }
+
+    // Restore full pane scissor for floating hover/completion popups
+    raylib.BeginScissorMode(cast(i32) rect.x, cast(i32) rect.y, cast(i32) rect.w, cast(i32) rect.h);
 
     // Floating LSP Hover Tooltip (`K`)
     if lsp_c != null && lsp_c.hover_visible && lsp_c.hover_text.count > 0 {

@@ -57,10 +57,14 @@ case "$CMD" in
         build_host
         echo "Build complete!"
         ;;
+    unit)
+        onyx run tests/odit_test.onyx -- --verbose
+        ;;
     test)
         build_native
         build_plugins
         build_host
+        onyx run tests/odit_test.onyx -- --verbose
         onyx run src/main.onyx -- --self-test
         ;;
     run)

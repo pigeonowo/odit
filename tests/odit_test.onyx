@@ -1,0 +1,275 @@
+// =============================================================================
+// Onyx Editor ("odit") — Unit & Regression Test Suite (`onyx_testing_framework`)
+// =============================================================================
+// Run directly:
+//   onyx run tests/odit_test.onyx
+//   onyx run tests/odit_test.onyx -- --tag wm --verbose
+//   nu build.nu unit
+
+package main
+
+#load "./../lib/packages"
+#load "./../abi/abi.onyx"
+#load "./../src/settings.onyx"
+#load "./../src/theme.onyx"
+#load "./../src/services/workspace.onyx"
+#load "./../src/services/compiler_wat.onyx"
+#load "./../src/services/docs_index.onyx"
+#load "./../src/wm/layout.onyx"
+#load "./../src/editor/buffer.onyx"
+#load "./../src/editor/lexer.onyx"
+
+use core { os, alloc }
+use test
+use odit.abi
+use odit.settings
+use odit.wm
+use odit.editor
+use odit.services
+
+// -----------------------------------------------------------------------------
+// 1. ABI Layout & Bitmask Contracts
+// -----------------------------------------------------------------------------
+
+@test.tag.{"abi"}
+@test.it.{"ABI POD structs have fixed cross-WASM byte sizes"}
+(t: &test.T) {
+    t->expect_eq(sizeof abi.FrameContext,       48);
+    t->expect_eq(sizeof abi.EditorCursor,       28);
+    t->expect_eq(sizeof abi.KeyEvent,           16);
+    t->expect_eq(sizeof abi.ProcessEventHeader, 16);
+}
+
+@test.tag.{"abi"}
+@test.it.{"MouseButton and FrameContext flag bitmasks work reliably"}
+(t: &test.T) {
+    mask: u32 = 0;
+    mask |= cast(u32) abi.MouseButton.Left;
+    mask |= cast(u32) abi.MouseButton.Right;
+    t->expect_true((mask & cast(u32) abi.MouseButton.Left) != 0);
+    t->expect_true((mask & cast(u32) abi.MouseButton.Right) != 0);
+    t->expect_false((mask & cast(u32) abi.MouseButton.Middle) != 0);
+
+    flags: u32 = abi.FRAME_FLAG_FOCUSED | abi.FRAME_FLAG_HOVERED;
+    t->expect_eq(flags, cast(u32) 3);
+}
+
+// -----------------------------------------------------------------------------
+// 2. Core Editor Buffer & Onyx Lexer
+// -----------------------------------------------------------------------------
+
+@test.tag.{"editor"}
+@test.it.{"TextBuffer insert, newline, backspace, and undo round-trip"}
+(t: &test.T) {
+    buf: editor.TextBuffer;
+    editor.buffer_init(&buf);
+    editor.buffer_set_text(&buf, "hello");
+    t->expect_eq(buf.lines.count, 1);
+
+    editor.buffer_set_cursor_1based(&buf, 1, 6);
+    editor.buffer_push_undo(&buf);
+    editor.buffer_insert_char(&buf, '!');
+    editor.buffer_insert_newline(&buf);
+    editor.buffer_insert_char(&buf, 'x');
+    t->expect_eq(buf.lines.count, 2);
+    t->expect_true(buf.dirty);
+
+    txt := editor.buffer_to_string(&buf, context.temp_allocator);
+    t->expect_eq(txt, "hello!\nx");
+
+    editor.buffer_backspace(&buf);
+    editor.buffer_backspace(&buf);
+    t->expect_eq(buf.lines.count, 1);
+
+    // 3 undo snapshots were recorded: backspace line-join, insert_newline, and manual push
+    t->expect_true(editor.buffer_undo(&buf));
+    t->expect_eq(editor.buffer_to_string(&buf, context.temp_allocator), "hello!\n");
+    t->expect_true(editor.buffer_undo(&buf));
+    t->expect_eq(editor.buffer_to_string(&buf, context.temp_allocator), "hello!");
+    t->expect_true(editor.buffer_undo(&buf));
+    t->expect_eq(editor.buffer_to_string(&buf, context.temp_allocator), "hello");
+}
+
+@test.tag.{"editor"}
+@test.it.{"TextBuffer gutter markers can be added and cleared by kind"}
+(t: &test.T) {
+    buf: editor.TextBuffer;
+    editor.buffer_init(&buf);
+    editor.buffer_set_gutter_marker(&buf, "src/main.onyx", 10, cast(u32) abi.GutterMarkerKind.DiagnosticErr, 0xFF0000FF);
+    editor.buffer_set_gutter_marker(&buf, "src/main.onyx", 20, cast(u32) abi.GutterMarkerKind.Breakpoint,    0x00FF00FF);
+    t->expect_eq(buf.gutter_markers.count, 2);
+
+    editor.buffer_clear_gutter_markers(&buf, cast(u32) abi.GutterMarkerKind.DiagnosticErr);
+    t->expect_eq(buf.gutter_markers.count, 1);
+    t->expect_eq(buf.gutter_markers[0].line, cast(u32) 20);
+}
+
+@test.tag.{"editor"}
+@test.it.{"Onyx lexer highlights directives, keywords, strings, numbers, and comments"}
+(t: &test.T) {
+    line := "#load \"foo.onyx\" // comment";
+    spans: [64] editor.TokenSpan;
+    n := editor.lex_onyx_line(line, spans);
+    t->expect_true(n >= 3);
+
+    has_dir := false;
+    has_str := false;
+    has_cmt := false;
+    for i in 0 .. n {
+        if spans[i].kind == .Directive do has_dir = true;
+        if spans[i].kind == .String    do has_str = true;
+        if spans[i].kind == .Comment   do has_cmt = true;
+    }
+    t->expect_true(has_dir);
+    t->expect_true(has_str);
+    t->expect_true(has_cmt);
+}
+
+// -----------------------------------------------------------------------------
+// 3. Settings Clamping & Persistence
+// -----------------------------------------------------------------------------
+
+@test.tag.{"settings"}
+@test.it.{"Settings clamp enforces safe font, scale, and FPS bounds"}
+(t: &test.T) {
+    s := settings.settings_defaults();
+    s.editor_font_size = 999.0f;
+    s.ui_scale         = 0.1f;
+    s.tab_size         = 99;
+    s.target_fps       = 10;
+    settings.settings_clamp(&s);
+
+    t->expect_eq(s.editor_font_size, 36.0f);
+    t->expect_eq(s.ui_scale,         0.8f);
+    t->expect_eq(s.tab_size,         8);
+    t->expect_eq(s.target_fps,       30);
+}
+
+@test.tag.{"settings"}
+@test.it.{"Settings save and load round-trip preserves theme and font size"}
+(t: &test.T) {
+    os.Directory.create("build");
+    tmp_path := "build/.unit_settings.json";
+
+    settings.g_settings = settings.settings_defaults();
+    settings.g_settings.editor_font_size = 22.0f;
+    settings.g_settings.theme = "gruvbox";
+    t->expect_true(settings.settings_save(tmp_path));
+
+    settings.g_settings = settings.settings_defaults();
+    t->expect_true(settings.settings_load(tmp_path));
+    t->expect_eq(settings.g_settings.editor_font_size, 22.0f);
+    t->expect_eq(settings.g_settings.theme, "gruvbox");
+}
+
+// -----------------------------------------------------------------------------
+// 4. Draggable / Dockable / Floating Window Manager
+// -----------------------------------------------------------------------------
+
+@test.tag.{"wm"}
+@test.it.{"WindowManager default RightGrid gives editor and panes non-zero rects"}
+(t: &test.T) {
+    settings.g_settings = settings.settings_defaults();
+    mgr: wm.WindowManager;
+    wm.wm_init(&mgr);
+    mgr.autosave = false;
+
+    w1 := wm.wm_add_pane(&mgr, 1, "odit.file_explorer", "File Explorer", 0, "build/plugins/file_explorer.wasm");
+    w2 := wm.wm_add_pane(&mgr, 2, "odit.build_run",     "Build & Run",   0, "build/plugins/build_run.wasm");
+    wm.wm_compute_rects(&mgr, 1440.0f, 900.0f);
+
+    p1 := wm.wm_find_pane(&mgr, w1);
+    p2 := wm.wm_find_pane(&mgr, w2);
+    t->expect_true(mgr.editor_rect.w > 400.0f);
+    t->expect_true(p1.rect.w > 200.0f);
+    t->expect_true(p2.rect.w > 200.0f);
+    t->expect_true(mgr.editor_rect.x + mgr.editor_rect.w < p1.rect.x);
+
+    // Zero floating panes hit-test regression (prevents u32 count-1 underflow)
+    hit_ed := wm.wm_content_pane_at(&mgr, mgr.editor_content.x + 20.0f, mgr.editor_content.y + 20.0f);
+    t->expect_eq(hit_ed, cast(u32) 0);
+    hit_p1 := wm.wm_content_pane_at(&mgr, p1.content_rect.x + 10.0f, p1.content_rect.y + 10.0f);
+    t->expect_eq(hit_p1, w1);
+}
+
+@test.tag.{"wm"}
+@test.it.{"WindowManager Left/Bottom/Right docking, swapping, floating occlusion, and persistence"}
+(t: &test.T) {
+    os.Directory.create("build");
+    settings.g_settings = settings.settings_defaults();
+    mgr: wm.WindowManager;
+    wm.wm_init(&mgr);
+    mgr.autosave = false;
+
+    w_fe  := wm.wm_add_pane(&mgr, 1, "odit.file_explorer",  "File Explorer",  0, "build/plugins/file_explorer.wasm");
+    w_br  := wm.wm_add_pane(&mgr, 2, "odit.build_run",      "Build & Run",    0, "build/plugins/build_run.wasm");
+    w_wat := wm.wm_add_pane(&mgr, 3, "odit.wasm_inspector", "WASM Inspector", 0, "build/plugins/wasm_inspector.wasm");
+    w_doc := wm.wm_add_pane(&mgr, 4, "odit.docs_browser",   "Docs Browser",   0, "build/plugins/docs_browser.wasm");
+
+    wm.wm_set_pane_dock(&mgr, w_fe,  .LeftSide);
+    wm.wm_set_pane_dock(&mgr, w_br,  .Bottom);
+    wm.wm_set_pane_dock(&mgr, w_wat, .RightGrid);
+    wm.wm_toggle_float(&mgr, w_doc);
+    wm.wm_compute_rects(&mgr, 1440.0f, 900.0f);
+
+    p_fe  := wm.wm_find_pane(&mgr, w_fe);
+    p_br  := wm.wm_find_pane(&mgr, w_br);
+    p_wat := wm.wm_find_pane(&mgr, w_wat);
+    p_doc := wm.wm_find_pane(&mgr, w_doc);
+
+    t->expect_true(p_fe.rect.x < mgr.editor_rect.x);
+    t->expect_true(mgr.editor_rect.x + mgr.editor_rect.w < p_wat.rect.x);
+    t->expect_true(mgr.editor_rect.y + mgr.editor_rect.h < p_br.rect.y);
+    t->expect_eq(cast(u32) p_doc.dock_zone, cast(u32) wm.DockZone.Floating);
+
+    // Floating pane occludes hit-testing over its area
+    hit := wm.wm_content_pane_at(&mgr, p_doc.content_rect.x + 20.0f, p_doc.content_rect.y + 20.0f);
+    t->expect_eq(hit, w_doc);
+
+    // Swap LeftSide and Bottom panes
+    t->expect_true(wm.wm_swap_panes(&mgr, w_fe, w_br));
+    t->expect_eq(cast(u32) wm.wm_find_pane(&mgr, w_fe).dock_zone, cast(u32) wm.DockZone.Bottom);
+    t->expect_eq(cast(u32) wm.wm_find_pane(&mgr, w_br).dock_zone, cast(u32) wm.DockZone.LeftSide);
+
+    // Save & reload layout round-trip
+    tmp_layout := "build/.unit_layout.json";
+    t->expect_true(wm.wm_save_layout(&mgr, tmp_layout));
+    mgr2: wm.WindowManager;
+    wm.wm_init(&mgr2);
+    mgr2.autosave = false;
+    t->expect_true(wm.wm_load_layout(&mgr2, tmp_layout));
+    t->expect_eq(mgr2.saved_panes.count, 4);
+}
+
+// -----------------------------------------------------------------------------
+// 5. Workspace, Core Docs Index & WAT Disassembly Services
+// -----------------------------------------------------------------------------
+
+@test.tag.{"services"}
+@test.it.{"Workspace indexer discovers Onyx source files"}
+(t: &test.T) {
+    files := services.workspace_find_files(".", ".onyx", context.temp_allocator);
+    t->expect_true(files.count >= 10);
+}
+
+@test.tag.{"services"}
+@test.it.{"Docs index returns results for core procs and #directives"}
+(t: &test.T) {
+    fmt_js := services.docs_search_as_json("format", context.temp_allocator);
+    t->expect_true(fmt_js.count > 20);
+    t->expect_contains(fmt_js, "format");
+
+    dir_js := services.docs_search_as_json("#load", context.temp_allocator);
+    t->expect_contains(dir_js, "#load");
+}
+
+@test.tag.{"services"}
+@test.it.{"WAT disassembly extracts real WebAssembly text for settings_defaults"}
+(t: &test.T) {
+    wat_js := services.wat_get_function_json("src/settings.onyx", "settings_defaults", 1, context.temp_allocator);
+    t->expect_contains(wat_js, "(func $settings_defaults");
+}
+
+main :: () {
+    test.run();
+}

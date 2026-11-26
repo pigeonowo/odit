@@ -13,6 +13,7 @@ config {
 
 dependencies {
     raylib "0.0.8" git="http://github.com/onyx-lang/pkg-raylib" 
+    "http://github.com/pigeonowo/onyx_testing_framework" "0.2.0" git="http://github.com/pigeonowo/onyx_testing_framework" 
 }
 
 lsp {

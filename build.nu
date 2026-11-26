@@ -5,7 +5,8 @@
 # Usage:
 #   nu build.nu              # Build native bridge, all WASM plugins, and host
 #   nu build.nu run [file]   # Build everything and launch the IDE
-#   nu build.nu test         # Build everything and run headless ABI self-test
+#   nu build.nu test         # Build everything and run unit + headless ABI self-tests
+#   nu build.nu unit         # Run onyx_testing_framework unit suite (tests/odit_test.onyx)
 #   nu build.nu native       # Build only bin/odit_wasm_host.so
 #   nu build.nu plugins      # Build all plugins/*/main.onyx -> build/plugins/*.wasm
 #   nu build.nu host         # Build only build/odit.wasm
@@ -97,9 +98,19 @@ export def "main run" [file: string = "src/main.onyx"] {
     }
 }
 
-# Build everything and run the headless WASM plugin ABI self-test
+# Run unit test suite powered by `onyx_testing_framework`
+export def "main unit" [] {
+    let onyx = (onyx-bin)
+    print "Running onyx_testing_framework unit tests (tests/odit_test.onyx)..."
+    with-env { ONYX_PATH: (onyx-path) } {
+        ^$onyx run tests/odit_test.onyx -- --verbose
+    }
+}
+
+# Build everything and run both unit tests and headless WASM plugin ABI self-test
 export def "main test" [] {
     main
+    main unit
     let onyx = (onyx-bin)
     print "Running headless WASM plugin ABI self-test..."
     with-env { ONYX_PATH: (onyx-path) } {

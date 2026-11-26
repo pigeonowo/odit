@@ -27,6 +27,8 @@ g_func_len:     u32 = 0;
 g_wat_lines:    [..] str;
 g_wat_func_idx: i32 = -1;
 g_wat_scroll:   f32 = 0.0f;
+g_wat_scroll_x: f32 = 0.0f;
+g_wat_max_w:    f32 = 0.0f;
 g_list_scroll:  f32 = 0.0f;
 g_needs_syms:   bool = true;
 
@@ -103,12 +105,17 @@ refresh_functions :: () {
 set_wat_text :: (wat: str) {
     for &l in g_wat_lines do sdk.free_str(*l);
     Array.clear(&g_wat_lines);
-    g_wat_scroll = 0.0f;
+    g_wat_scroll   = 0.0f;
+    g_wat_scroll_x = 0.0f;
+    g_wat_max_w    = 0.0f;
 
     start := 0;
     for i in 0 .. (wat.count + 1) {
         if i == wat.count || wat[i] == '\n' {
-            g_wat_lines << sdk.copy_str(wat[start .. i]);
+            ln := sdk.copy_str(wat[start .. i]);
+            g_wat_lines << ln;
+            lw := sdk.measure_text(ln, 12.0f, .Mono);
+            if lw > g_wat_max_w do g_wat_max_w = lw;
             start = i + 1;
         }
     }
@@ -233,27 +240,57 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
     }
     y += list_h + 8.0f;
 
-    // Header badge for WAT view
+    // Header badge for WAT view + horizontal pan controls (`<` / `>`) for narrow panes
     pw := sdk.pill(pad, y, "WAT", sdk.theme_color(.Success), 0x11111BFF);
     fname_disp := str.{ &g_func_buf[0], cast(i32) g_func_len };
     sdk.draw_text(pad + pw + 8.0f, y + 3.0f, fname_disp, 13.0f, sdk.theme_color(.TextPrimary), .Mono);
+
+    pan_btn_w: f32 = 24.0f;
+    if sdk.button(30, pad + w - pan_btn_w * 2.0f - 4.0f, y, pan_btn_w, 22.0f, "<", .Ghost) & .Clicked {
+        g_wat_scroll_x -= 80.0f;
+        if g_wat_scroll_x < 0.0f do g_wat_scroll_x = 0.0f;
+    }
+    if sdk.button(31, pad + w - pan_btn_w, y, pan_btn_w, 22.0f, ">", .Ghost) & .Clicked {
+        g_wat_scroll_x += 80.0f;
+    }
     y += 26.0f;
 
-    // Disassembled WAT Code View
+    // Disassembled WAT Code View (supports Shift+Wheel and < / > horizontal scrolling)
     wat_h := ctx.height - y - pad;
     if wat_h < 60.0f do wat_h = 60.0f;
     sdk.draw_rect(pad, y, w, wat_h, sdk.theme_color(.BgBase), 5.0f, sdk.theme_color(.Border), 1.0f);
 
+    view_w := w - 16.0f;
+    if view_w < 40.0f do view_w = 40.0f;
+    max_sx := (g_wat_max_w + 24.0f) - view_w;
+    if max_sx < 0.0f do max_sx = 0.0f;
+
+    in_wat := (ctx.flags & abi.FRAME_FLAG_HOVERED) != 0 &&
+              ctx.mouse_y >= y && ctx.mouse_y <= (y + wat_h);
+    if in_wat && (ctx.key_mods & cast(u32) abi.KeyMod.Shift) != 0 && ctx.wheel_y != 0.0f {
+        g_wat_scroll_x -= ctx.wheel_y * 42.0f;
+    }
+    if g_wat_scroll_x < 0.0f do g_wat_scroll_x = 0.0f;
+    if g_wat_scroll_x > max_sx do g_wat_scroll_x = max_sx;
+
     w_row_h: f32 = 18.0f;
-    w_ch := cast(f32) g_wat_lines.count * w_row_h + 12.0f;
-    sdk.scroll_begin(20, pad + 4.0f, y + 4.0f, w - 8.0f, wat_h - 8.0f, w_ch, &g_wat_scroll);
+    w_ch := cast(f32) g_wat_lines.count * w_row_h + 16.0f;
+    sdk.scroll_begin(20, pad + 4.0f, y + 4.0f, w - 8.0f, wat_h - 10.0f, w_ch, &g_wat_scroll);
 
     wy := y + 6.0f;
     for &ln in g_wat_lines {
-        sdk.draw_text(pad + 8.0f, wy, *ln, 12.0f, wat_line_color(*ln), .Mono);
+        sdk.draw_text(pad + 8.0f - g_wat_scroll_x, wy, *ln, 12.0f, wat_line_color(*ln), .Mono);
         wy += w_row_h;
     }
     sdk.scroll_end();
+
+    // Subtle horizontal scrollbar thumb inside bottom of WAT box
+    if max_sx > 0.0f && view_w > 24.0f {
+        bar_w := view_w * (view_w / (g_wat_max_w + 24.0f));
+        if bar_w < 24.0f do bar_w = 24.0f;
+        bar_x := pad + 6.0f + (g_wat_scroll_x / max_sx) * (view_w - bar_w);
+        sdk.draw_rect(bar_x, y + wat_h - 6.0f, bar_w, 4.0f, 0x6C708699, 2.0f);
+    }
 }
 
 #local
