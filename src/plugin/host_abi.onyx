@@ -329,7 +329,7 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
                 ret_u32(0);
             } else {
                 buf := make([] u8, cast(i32) dlen, context.temp_allocator);
-                if wasm_plugin_mem_read(handle, dptr, buf.data, dlen) == 0 {
+                if wasm_plugin_mem_read(handle, dptr, buf.data, dlen) == cast(i32) dlen {
                     ret_u32(ui.ui_audio_load_memory(buf, ext));
                 } else {
                     ret_u32(0);

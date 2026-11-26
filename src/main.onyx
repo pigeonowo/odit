@@ -21,6 +21,7 @@
 #load "./ui/palette.onyx"
 #load "./ui/file_finder.onyx"
 #load "./ui/settings_view.onyx"
+#load "./ui/find_overlay.onyx"
 #load "./editor/buffer.onyx"
 #load "./editor/lexer.onyx"
 #load "./editor/gif_cache.onyx"
@@ -50,6 +51,7 @@ AppState :: struct {
     palette:         ui.CommandPalette;
     file_finder:     ui.FileFinder;
     settings_view:   ui.SettingsView;
+    find_overlay:    ui.FindOverlay;
     loaded_plugins:  [..] plugin.LoadedPlugin;
     available_wasms: [..] str;
     startup_queue:   [..] str;
@@ -194,6 +196,8 @@ register_builtin_commands :: () {
     ui.palette_register(&g_app.palette, "settings.edit_json",   "Settings: Open odit.json in Editor",     "",         0);
     ui.palette_register(&g_app.palette, "settings.reload",      "Settings: Reload odit.json",             "",         0);
     ui.palette_register(&g_app.palette, "editor.save",          "Editor: Save Active File",               "Ctrl+S",   0);
+    ui.palette_register(&g_app.palette, "editor.find",          "Editor: Find Text in File",              "Ctrl+F",   0);
+    ui.palette_register(&g_app.palette, "editor.find_symbol",   "LSP: Go to Symbol in File",              "Ctrl+T",   0);
     ui.palette_register(&g_app.palette, "editor.toggle_modal",  "Editor: Toggle Modal Mode (Normal/Insert)", "",      0);
     ui.palette_register(&g_app.palette, "editor.undo",          "Editor: Undo",                           "Ctrl+Z",   0);
     ui.palette_register(&g_app.palette, "lsp.definition",       "LSP: Go to Definition",                  "F12 / gd", 0);
@@ -302,6 +306,10 @@ execute_command :: (cmd: &ui.CommandEntry) {
             "Modal editing enabled" if settings.g_settings.modal_editing else "Always-Insert mode enabled");
     } elseif str.equal(cmd.id, "editor.undo") {
         editor.buffer_undo(&g_app.ed.buf);
+    } elseif str.equal(cmd.id, "editor.find") {
+        ui.find_open(&g_app.find_overlay, .Text);
+    } elseif str.equal(cmd.id, "editor.find_symbol") {
+        ui.find_open(&g_app.find_overlay, .Symbols);
     } elseif str.equal(cmd.id, "lsp.definition") {
         lsp.lsp_request_definition(&g_app.lsp_client, g_app.ed.buf.path, g_app.ed.buf.cursor_line, g_app.ed.buf.cursor_col);
     } elseif str.equal(cmd.id, "lsp.hover") {
@@ -921,6 +929,7 @@ main :: (args: [] cstr) {
 
     ui.palette_init(&g_app.palette);
     ui.finder_init(&g_app.file_finder);
+    ui.find_init(&g_app.find_overlay);
     editor.editor_init(&g_app.ed);
 
     if !editor.buffer_load_file(&g_app.ed.buf, initial_file) {
@@ -1005,16 +1014,29 @@ main :: (args: [] cstr) {
         if ctrl && raylib.IsKeyPressed(.P) {
             g_app.settings_view.open = false;
             ui.finder_close(&g_app.file_finder);
+            ui.find_close(&g_app.find_overlay);
             if g_app.palette.open do ui.palette_close(&g_app.palette);
             else do ui.palette_open(&g_app.palette);
         } elseif ctrl && raylib.IsKeyPressed(.O) {
             g_app.settings_view.open = false;
             ui.palette_close(&g_app.palette);
+            ui.find_close(&g_app.find_overlay);
             if g_app.file_finder.open do ui.finder_close(&g_app.file_finder);
             else do ui.finder_open(&g_app.file_finder, g_app.workspace_root);
+        } elseif ctrl && raylib.IsKeyPressed(.F) {
+            g_app.settings_view.open = false;
+            ui.palette_close(&g_app.palette);
+            ui.finder_close(&g_app.file_finder);
+            ui.find_open(&g_app.find_overlay, .Text);
+        } elseif ctrl && raylib.IsKeyPressed(.T) {
+            g_app.settings_view.open = false;
+            ui.palette_close(&g_app.palette);
+            ui.finder_close(&g_app.file_finder);
+            ui.find_open(&g_app.find_overlay, .Symbols);
         } elseif ctrl && raylib.IsKeyPressed(.COMMA) {
             ui.palette_close(&g_app.palette);
             ui.finder_close(&g_app.file_finder);
+            ui.find_close(&g_app.find_overlay);
             g_app.settings_view.open = !g_app.settings_view.open;
         } elseif raylib.IsKeyPressed(.F8) {
             jump_next_diagnostic();
@@ -1051,7 +1073,7 @@ main :: (args: [] cstr) {
             wm.wm_cycle_focus(&g_app.window_mgr);
         }
 
-        overlay_open := g_app.palette.open || g_app.file_finder.open || g_app.settings_view.open;
+        overlay_open := g_app.palette.open || g_app.file_finder.open || g_app.settings_view.open || g_app.find_overlay.open;
 
         // Update draggable/dockable/floating window manager layout
         closed_wid := wm.wm_update_layout(&g_app.window_mgr, screen_w, screen_h, dt, overlay_open);
@@ -1208,6 +1230,19 @@ main :: (args: [] cstr) {
             if open_file_in_editor(chosen_file, 1, 1) {
                 wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Opened {}", chosen_file));
             }
+        }
+
+        // Draw Editor Find & LSP Symbol Search overlay (`Ctrl+F` / `Ctrl+T`)
+        f_res := ui.find_update_and_draw(&g_app.find_overlay, &g_app.ed.buf, &g_app.lsp_client, screen_w, screen_h);
+        if f_res.jumped {
+            editor.buffer_set_cursor_1based(&g_app.ed.buf, f_res.line_1, f_res.col_1);
+            if f_res.sel_len > 0 {
+                editor.buffer_start_selection(&g_app.ed.buf);
+                g_app.ed.buf.cursor_col += f_res.sel_len;
+                editor.buffer_clamp_cursor(&g_app.ed.buf);
+            }
+            editor.editor_ensure_cursor_visible(&g_app.ed, g_app.window_mgr.editor_content.h);
+            editor.editor_ensure_cursor_visible_x(&g_app.ed, g_app.window_mgr.editor_content.w);
         }
 
         // Broadcast ActiveFileChanged if a WASM plugin opened a file via `editor_open_file`

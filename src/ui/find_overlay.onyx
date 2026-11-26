@@ -1,0 +1,425 @@
+package odit.ui
+
+// =============================================================================
+// Onyx Editor ("odit") — Editor Find (`Ctrl+F`) & LSP Symbol Search (`Ctrl+T`)
+// =============================================================================
+// Unified search overlay supporting:
+//   - Text Find (`Ctrl+F`): live case-insensitive search across the active
+//     buffer with match count, Prev/Next navigation (`Enter`/`Shift+Enter`),
+//     match snippet list, and inline match highlighting in the editor.
+//   - LSP Symbol Search (`Ctrl+T` or `@` prefix in `Ctrl+F`): fuzzy search over
+//     Onyx LSP `documentSymbol` entries (procedures, structs, enums, unions,
+//     globals, macros) with instant jump-to-definition.
+
+use core { package, Array }
+use raylib
+use odit.abi
+use odit.theme
+use odit.settings
+use odit.editor
+use odit.lsp
+
+FindMode :: enum {
+    Text;
+    Symbols;
+}
+
+FindMatch :: struct {
+    line:    i32; // 0-based
+    col:     i32; // 0-based
+    length:  i32;
+    label:   str; // snippet or symbol name
+    detail:  str; // symbol kind/detail or line number
+    kind:    u32; // SymbolKind (for Symbols mode)
+}
+
+FindOverlay :: struct {
+    open:          bool;
+    mode:          FindMode;
+    query_buf:     [128] u8;
+    query_len:     i32;
+    selected:      i32;
+    matches:       [..] FindMatch;
+    dirty:         bool;
+    last_buf_ver:  u32;
+    last_sym_cnt:  i32;
+}
+
+FindResult :: struct {
+    jumped:  bool;
+    line_1:  i32;
+    col_1:   i32;
+    sel_len: i32;
+}
+
+find_init :: (f: &FindOverlay) {
+    f.open         = false;
+    f.mode         = .Text;
+    f.query_len    = 0;
+    f.selected     = 0;
+    f.matches      = make([..] FindMatch);
+    f.dirty        = true;
+    f.last_buf_ver = 0;
+    f.last_sym_cnt = -1;
+}
+
+find_open :: (f: &FindOverlay, mode: FindMode) {
+    f.open     = true;
+    f.mode     = mode;
+    f.selected = 0;
+    f.dirty    = true;
+    // Drain queued char presses so `f`/`t` doesn't leak into input
+    while raylib.GetCharPressed() > 0 {}
+}
+
+find_close :: (f: &FindOverlay) {
+    f.open = false;
+}
+
+find_query_str :: (f: &FindOverlay) -> str {
+    if f.query_len <= 0 do return "";
+    return str.{ &f.query_buf[0], f.query_len };
+}
+
+#local
+to_lower_b :: (c: u8) -> u8 {
+    return (c + 32) if (c >= 'A' && c <= 'Z') else c;
+}
+
+#local
+trim_s :: (s: str) -> str {
+    a := 0;
+    b := s.count;
+    while a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n') do a += 1;
+    while b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n') do b -= 1;
+    return s[a .. b];
+}
+
+#local
+fuzzy_match_ci :: (text: str, query: str) -> bool {
+    if query.count == 0 do return true;
+    qi := 0;
+    for i in 0 .. text.count {
+        if to_lower_b(text[i]) == to_lower_b(query[qi]) {
+            qi += 1;
+            if qi == query.count do return true;
+        }
+    }
+    return false;
+}
+
+#local
+sym_kind_badge :: (k: u32) -> (lbl: str, col: u32) {
+    switch cast(abi.SymbolKind) k {
+        case .Procedure do return "FN", theme.get_color(.Info);
+        case .Struct    do return "ST", theme.get_color(.Warning);
+        case .Enum      do return "EN", theme.get_color(.Success);
+        case .Union     do return "UN", theme.get_color(.Accent);
+        case .Macro     do return "MC", theme.get_color(.Error);
+        case .Global    do return "GL", theme.get_color(.TextSecondary);
+        case .Field     do return "FL", theme.get_color(.TextSecondary);
+        case _          do return "SY", theme.get_color(.Accent);
+    }
+}
+
+/// Recomputes text matches or LSP symbol matches for the current query.
+find_refresh_matches :: (f: &FindOverlay, buf: &editor.TextBuffer, lsp_c: &lsp.LspClient) {
+    for &m in f.matches {
+        if m.label.count > 0  do str.free(m.label);
+        if m.detail.count > 0 do str.free(m.detail);
+    }
+    Array.clear(&f.matches);
+
+    raw_q := find_query_str(f);
+    eff_mode := f.mode;
+    q := raw_q;
+    if raw_q.count > 0 && raw_q[0] == '@' {
+        eff_mode = .Symbols;
+        q = raw_q[1 .. raw_q.count];
+    }
+
+    if eff_mode == .Text {
+        if q.count == 0 {
+            f.selected = 0;
+            return;
+        }
+        for li in 0 .. buf.lines.count {
+            ln := &buf.lines[li];
+            ls := str.{ ln.data, ln.count };
+            if ls.count < q.count do continue;
+            pos := 0;
+            while pos <= ls.count - q.count {
+                ok := true;
+                for k in 0 .. q.count {
+                    if to_lower_b(ls[pos + k]) != to_lower_b(q[k]) { ok = false; break; }
+                }
+                if ok {
+                    snip := trim_s(ls);
+                    if snip.count > 64 do snip = snip[0 .. 64];
+                    f.matches << .{
+                        line   = li,
+                        col    = pos,
+                        length = q.count,
+                        label  = str.copy(snip),
+                        detail = str.copy(core.tprintf("L{}:{}", li + 1, pos + 1)),
+                        kind   = 0,
+                    };
+                    if f.matches.count >= 256 do break;
+                    pos += q.count;
+                } else {
+                    pos += 1;
+                }
+            }
+            if f.matches.count >= 256 do break;
+        }
+    } else {
+        // Symbols mode: prefer live Onyx LSP documentSymbol entries
+        if lsp_c != null && lsp_c.symbols.count > 0 {
+            for &sym in lsp_c.symbols {
+                if fuzzy_match_ci(sym.name, q) {
+                    ln0 := cast(i32) sym.line - 1;
+                    if ln0 < 0 do ln0 = 0;
+                    c0 := cast(i32) sym.column - 1;
+                    if c0 < 0 do c0 = 0;
+                    f.matches << .{
+                        line   = ln0,
+                        col    = c0,
+                        length = sym.name.count,
+                        label  = str.copy(sym.name),
+                        detail = str.copy(core.tprintf("L{}", sym.line)),
+                        kind   = sym.kind,
+                    };
+                }
+            }
+        } else {
+            // Fast local fallback parser for `name :: (` / `struct` / `enum` / `union` when LSP is still warming up
+            for li in 0 .. buf.lines.count {
+                ln := &buf.lines[li];
+                ls := trim_s(str.{ ln.data, ln.count });
+                if ls.count < 4 || str.starts_with(ls, "//") do continue;
+                cp := -1;
+                for k in 0 .. (ls.count - 1) {
+                    if ls[k] == ':' && ls[k + 1] == ':' { cp = k; break; }
+                    if ls[k] == '"' || ls[k] == '(' do break;
+                }
+                if cp > 0 {
+                    name := trim_s(ls[0 .. cp]);
+                    rest := trim_s(ls[(cp + 2) .. ls.count]);
+                    if name.count > 0 && fuzzy_match_ci(name, q) {
+                        sk := cast(u32) abi.SymbolKind.Global;
+                        if str.starts_with(rest, "(") || str.starts_with(rest, "macro") do sk = cast(u32) abi.SymbolKind.Procedure;
+                        elseif str.starts_with(rest, "struct") do sk = cast(u32) abi.SymbolKind.Struct;
+                        elseif str.starts_with(rest, "enum")   do sk = cast(u32) abi.SymbolKind.Enum;
+                        elseif str.starts_with(rest, "union")  do sk = cast(u32) abi.SymbolKind.Union;
+                        f.matches << .{
+                            line   = li,
+                            col    = 0,
+                            length = name.count,
+                            label  = str.copy(name),
+                            detail = str.copy(core.tprintf("L{}", li + 1)),
+                            kind   = sk,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    if f.matches.count == 0 {
+        f.selected = 0;
+    } elseif f.selected >= f.matches.count {
+        f.selected = 0;
+    }
+}
+
+find_update_and_draw :: (f: &FindOverlay, buf: &editor.TextBuffer, lsp_c: &lsp.LspClient, screen_w, screen_h: f32) -> FindResult {
+    res: FindResult;
+    if !f.open do return res;
+
+    if raylib.IsKeyPressed(.ESCAPE) {
+        f.open = false;
+        return res;
+    }
+
+    ctrl := raylib.IsKeyDown(.LEFT_CONTROL) || raylib.IsKeyDown(.RIGHT_CONTROL);
+    shift := raylib.IsKeyDown(.LEFT_SHIFT) || raylib.IsKeyDown(.RIGHT_SHIFT);
+
+    // Handle typing & paste
+    while true {
+        ch := raylib.GetCharPressed();
+        if ch <= 0 do break;
+        if !ctrl && ch >= 32 && ch < 127 && f.query_len < 126 {
+            f.query_buf[f.query_len] = cast(u8) ch;
+            f.query_len += 1;
+            f.dirty = true;
+        }
+    }
+    if (raylib.IsKeyPressed(.BACKSPACE) || raylib.IsKeyPressedRepeat(.BACKSPACE)) && f.query_len > 0 {
+        f.query_len -= 1;
+        f.dirty = true;
+    }
+    if ctrl && raylib.IsKeyPressed(.V) {
+        cp := raylib.GetClipboardText();
+        if cp.data != 0 {
+            n := core.cptr.extract_str(cp, .[]);
+            if n > 0 {
+                tmp := make([] u8, cast(i32) n, context.temp_allocator);
+                core.cptr.extract_str(cp, tmp);
+                for ci in 0 .. tmp.count {
+                    c := tmp[ci];
+                    if c >= 32 && c < 127 && f.query_len < 126 {
+                        f.query_buf[f.query_len] = c;
+                        f.query_len += 1;
+                        f.dirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    sym_cnt := lsp_c.symbols.count if lsp_c != null else 0;
+    if f.dirty || f.last_buf_ver != buf.version || f.last_sym_cnt != sym_cnt {
+        f.dirty        = false;
+        f.last_buf_ver = buf.version;
+        f.last_sym_cnt = sym_cnt;
+        find_refresh_matches(f, buf, lsp_c);
+    }
+
+    // Navigation: Up/Down or Enter / Shift+Enter
+    if f.matches.count > 0 {
+        if raylib.IsKeyPressed(.DOWN) || raylib.IsKeyPressedRepeat(.DOWN) {
+            f.selected = (f.selected + 1) % f.matches.count;
+            m := &f.matches[f.selected];
+            res = .{ jumped = true, line_1 = m.line + 1, col_1 = m.col + 1, sel_len = m.length };
+        }
+        if raylib.IsKeyPressed(.UP) || raylib.IsKeyPressedRepeat(.UP) {
+            f.selected = (f.selected - 1 + f.matches.count) % f.matches.count;
+            m := &f.matches[f.selected];
+            res = .{ jumped = true, line_1 = m.line + 1, col_1 = m.col + 1, sel_len = m.length };
+        }
+        if raylib.IsKeyPressed(.ENTER) || raylib.IsKeyPressed(.KP_ENTER) {
+            if f.mode == .Symbols || (f.query_len > 0 && f.query_buf[0] == '@') {
+                m := &f.matches[f.selected];
+                res = .{ jumped = true, line_1 = m.line + 1, col_1 = m.col + 1, sel_len = m.length };
+                f.open = false;
+                return res;
+            } else {
+                if shift do f.selected = (f.selected - 1 + f.matches.count) % f.matches.count;
+                else     do f.selected = (f.selected + 1) % f.matches.count;
+                m := &f.matches[f.selected];
+                res = .{ jumped = true, line_1 = m.line + 1, col_1 = m.col + 1, sel_len = m.length };
+            }
+        }
+    }
+
+    // Layout floating panel at top-center/right
+    s := settings.g_settings.ui_scale;
+    pw := 460.0f * s;
+    if pw > screen_w - 40.0f do pw = screen_w - 40.0f;
+    row_h := 26.0f * s;
+    vis_rows := f.matches.count if f.matches.count < 10 else 10;
+    ph := 76.0f * s + cast(f32) vis_rows * row_h + (28.0f * s if vis_rows == 0 else 8.0f);
+    px := (screen_w - pw) * 0.5f;
+    py := 46.0f * s;
+
+    theme.draw_rect(px, py, pw, ph, theme.get_color(.BgPanel), 8.0f, theme.get_color(.BorderFocused), 1.5f);
+
+    mpos := raylib.GetMousePosition();
+    clicked := raylib.IsMouseButtonPressed(.LEFT);
+    fs := 13.0f * s;
+    fs_sm := 11.5f * s;
+
+    // Mode tabs: [ Text ]  [ @ Symbols ] + Match count
+    tx := px + 10.0f;
+    ty := py + 8.0f;
+    tab_h := 22.0f * s;
+
+    q_str := find_query_str(f);
+    is_sym_mode := f.mode == .Symbols || (q_str.count > 0 && q_str[0] == '@');
+
+    t1_w := 64.0f * s;
+    t1_hov := mpos.x >= tx && mpos.x <= tx + t1_w && mpos.y >= ty && mpos.y <= ty + tab_h;
+    theme.draw_rect(tx, ty, t1_w, tab_h, theme.get_color(.Accent) if !is_sym_mode else theme.get_color(.BgSurface), 4.0f);
+    theme.draw_text(tx + 12.0f * s, ty + 4.0f * s, "Text", fs_sm, 0x11111BFF if !is_sym_mode else theme.get_color(.TextSecondary));
+    if t1_hov && clicked {
+        f.mode = .Text;
+        if f.query_len > 0 && f.query_buf[0] == '@' {
+            for k in 1 .. f.query_len do f.query_buf[k - 1] = f.query_buf[k];
+            f.query_len -= 1;
+        }
+        f.dirty = true;
+    }
+
+    t2_x := tx + t1_w + 6.0f;
+    t2_w := 92.0f * s;
+    t2_hov := mpos.x >= t2_x && mpos.x <= t2_x + t2_w && mpos.y >= ty && mpos.y <= ty + tab_h;
+    theme.draw_rect(t2_x, ty, t2_w, tab_h, theme.get_color(.Accent) if is_sym_mode else theme.get_color(.BgSurface), 4.0f);
+    theme.draw_text(t2_x + 10.0f * s, ty + 4.0f * s, "@ Symbols", fs_sm, 0x11111BFF if is_sym_mode else theme.get_color(.TextSecondary));
+    if t2_hov && clicked {
+        f.mode = .Symbols;
+        f.dirty = true;
+    }
+
+    cnt_lbl := core.tprintf("{}/{}", f.selected + 1, f.matches.count) if f.matches.count > 0 else "0 matches";
+    cw := theme.measure_text(cnt_lbl, fs_sm);
+    theme.draw_text(px + pw - cw - 12.0f, ty + 4.0f * s, cnt_lbl, fs_sm, theme.get_color(.TextSecondary));
+
+    // Search input box
+    in_y := ty + tab_h + 6.0f;
+    in_h := 28.0f * s;
+    theme.draw_rect(tx, in_y, pw - 20.0f, in_h, theme.get_color(.BgBase), 5.0f, theme.get_color(.BorderFocused), 1.0f);
+    if q_str.count > 0 {
+        theme.draw_text(tx + 8.0f, in_y + (in_h - fs) * 0.5f, q_str, fs, theme.get_color(.TextPrimary));
+    } else {
+        ph_txt := "Search symbols (LSP)..." if is_sym_mode else "Find text in file (prefix @ for symbols)...";
+        theme.draw_text(tx + 8.0f, in_y + (in_h - fs) * 0.5f, ph_txt, fs, theme.get_color(.TextDisabled));
+    }
+
+    // Results list
+    ly := in_y + in_h + 6.0f;
+    if f.matches.count == 0 {
+        msg := "Type to search..." if (!is_sym_mode && q_str.count == 0) else "No matches found.";
+        theme.draw_text(tx + 6.0f, ly + 4.0f, msg, fs_sm, theme.get_color(.TextDisabled));
+        return res;
+    }
+
+    start_i := 0;
+    if f.selected >= vis_rows do start_i = f.selected - vis_rows + 1;
+
+    for r in 0 .. vis_rows {
+        idx := start_i + r;
+        if idx >= f.matches.count do break;
+        m := &f.matches[idx];
+        ry := ly + cast(f32) r * row_h;
+        hov := mpos.x >= tx && mpos.x <= px + pw - 10.0f && mpos.y >= ry && mpos.y < ry + row_h;
+
+        if idx == f.selected {
+            theme.draw_rect(tx, ry, pw - 20.0f, row_h - 1.0f, theme.get_color(.BgSelection), 4.0f);
+        } elseif hov {
+            theme.draw_rect(tx, ry, pw - 20.0f, row_h - 1.0f, theme.get_color(.BgHover), 4.0f);
+        }
+
+        if hov && clicked {
+            f.selected = idx;
+            res = .{ jumped = true, line_1 = m.line + 1, col_1 = m.col + 1, sel_len = m.length };
+            if is_sym_mode do f.open = false;
+        }
+
+        lx := tx + 8.0f;
+        if is_sym_mode {
+            blbl, bcol := sym_kind_badge(m.kind);
+            theme.draw_rect(lx, ry + 4.0f * s, 26.0f * s, row_h - 8.0f * s, 0x313244FF, 3.0f);
+            theme.draw_text(lx + 4.0f * s, ry + 5.0f * s, blbl, fs_sm * 0.9f, bcol);
+            lx += 32.0f * s;
+        }
+
+        dw := theme.measure_text(m.detail, fs_sm);
+        theme.draw_text(px + pw - 16.0f - dw, ry + (row_h - fs_sm) * 0.5f, m.detail, fs_sm, theme.get_color(.TextDisabled));
+
+        raylib.BeginScissorMode(cast(i32) lx, cast(i32) ry, cast(i32) (px + pw - 24.0f - dw - lx), cast(i32) row_h);
+        theme.draw_text(lx, ry + (row_h - fs) * 0.5f, m.label, fs, theme.get_color(.TextPrimary));
+        raylib.EndScissorMode();
+    }
+
+    return res;
+}

@@ -91,6 +91,7 @@ In installed mode:
 | :--- | :--- |
 | `Ctrl+P` | Open / close the fuzzy **Command Palette** (host actions, window docking, discovered `.wasm` plugins, and plugin-registered commands) |
 | `Ctrl+O` | Open / close the **Fuzzy File Finder** to jump to any workspace file |
+| `Ctrl+F` / `Ctrl+T` | **Find Text** in active file (prefix `@` for symbols) / **Go to Symbol** (LSP `documentSymbol` fuzzy search) |
 | `Ctrl+,` | Open / close the interactive **Settings Panel** |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Increase / decrease / reset editor font size (`10px – 36px`, auto-saved) |
 | `F12` / `gd` | **LSP: Go to Definition** |
