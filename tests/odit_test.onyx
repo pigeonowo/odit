@@ -15,6 +15,7 @@ package main
 #load "./../src/services/workspace.onyx"
 #load "./../src/services/compiler_wat.onyx"
 #load "./../src/services/debugger.onyx"
+#load "./../src/services/debugger_eval.onyx"
 #load "./../src/services/docs_index.onyx"
 #load "./../src/wm/layout.onyx"
 #load "./../src/editor/buffer.onyx"
@@ -353,6 +354,44 @@ use odit.services
     t->expect_eq(procs[2].name, "@aoc.part2");
     t->expect_eq(procs[2].wat_hint, "src_day1_onyx_9");
     t->expect_true(procs[2].is_tagged);
+}
+
+@test.tag.{"debugger"}
+@test.it.{"Debugger evaluates live Onyx local values, local calls, and WAT stack slots"}
+(t: &test.T) {
+    lines := str.[
+        "main :: () {",
+        "    a := 89",
+        "    b := 1293",
+        "    c := add(a, b)",
+        "    d := c * c",
+        "    aoc.run()",
+        "}",
+        "add :: (a: i32, b: i32) -> i32 {",
+        "    return a + b",
+        "}",
+    ];
+    procs := services.parse_procs_in_source(lines, "src/day1.onyx", context.temp_allocator);
+    vars, _ := services.eval_proc_body(lines, procs, &procs[0], 6);
+    t->expect_eq(vars.count, 4);
+    t->expect_eq(vars[0].name, "a");
+    t->expect_eq(vars[0].val.int_val, cast(i64) 89);
+    t->expect_eq(vars[1].name, "b");
+    t->expect_eq(vars[1].val.int_val, cast(i64) 1293);
+    t->expect_eq(vars[2].name, "c");
+    t->expect_eq(vars[2].val.int_val, cast(i64) 1382);
+    t->expect_eq(vars[3].name, "d");
+    t->expect_eq(vars[3].val.int_val, cast(i64) 1909924);
+
+    // Also verify WAT local slot simulation
+    wat := "(func $part1\n  i32.const 1\n  local.set 4\n  i32.const 2\n  local.set 5\n  local.get 4\n  local.get 5\n  i32.add\n  local.set 6)";
+    slots, defined := services.eval_wat_locals(wat, 8, .[]);
+    t->expect_true(defined[4]);
+    t->expect_true(defined[5]);
+    t->expect_true(defined[6]);
+    t->expect_eq(slots[4], cast(i64) 1);
+    t->expect_eq(slots[5], cast(i64) 2);
+    t->expect_eq(slots[6], cast(i64) 3);
 }
 
 main :: () {

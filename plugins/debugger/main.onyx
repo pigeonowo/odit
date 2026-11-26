@@ -408,7 +408,7 @@ render :: (self: &DebuggerPlugin, window_id: u32, ctx: &abi.FrameContext) {
     // -------------------------------------------------------------------------
     // 2. Side-by-Side Split View: Onyx Source (Left) | Mapped WAT (Right)
     // -------------------------------------------------------------------------
-    bottom_h: f32 = 82.0f;
+    bottom_h: f32 = 96.0f;
     split_y:  f32 = 72.0f;
     split_h:  f32 = h - split_y - bottom_h - 6.0f;
     if split_h < 80.0f do split_h = 80.0f;
@@ -573,15 +573,18 @@ render :: (self: &DebuggerPlugin, window_id: u32, ctx: &abi.FrameContext) {
         ly: f32 = bot_y + 28.0f;
         max_x := w - pad - 8.0f;
         for &v in self.locals {
-            chip := tprintf("{}: {}", v.name, v.type);
+            has_val := v.value.count > 0 && !str.equal(v.value, "<uninit>");
+            chip := tprintf("{}: {} = {}", v.name, v.type, v.value) if has_val else tprintf("{}: {}", v.name, v.type);
             cw := sdk.measure_text(chip, 11.5f) + 18.0f;
-            if lx + cw > max_x {
+            if lx + cw > max_x && lx > pad + 8.0f {
                 lx = pad + 8.0f;
                 ly += 24.0f;
                 if ly > bot_y + bottom_h - 24.0f do break;
             }
-            bg_c := 0xCBA6F728 if str.equal(v.value, "param") else 0x89B4FA22;
-            fg_c := accent if str.equal(v.value, "param") else c_info;
+            is_wat_slot := str.starts_with(v.name, "local.");
+            is_ret      := str.equal(v.name, "return");
+            bg_c := 0xA6E3A128 if is_ret else (0x89B4FA22 if is_wat_slot else 0xCBA6F728);
+            fg_c := c_ok if is_ret else (c_info if is_wat_slot else (c_warn if has_val else accent));
             w_used := sdk.pill(lx, ly, chip, bg_c, fg_c);
             lx += w_used + 6.0f;
         }

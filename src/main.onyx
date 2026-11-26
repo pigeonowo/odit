@@ -13,6 +13,7 @@
 #load "./services/workspace.onyx"
 #load "./services/compiler_wat.onyx"
 #load "./services/debugger.onyx"
+#load "./services/debugger_eval.onyx"
 #load "./services/docs_index.onyx"
 #load "./wm/layout.onyx"
 #load "./lsp/client.onyx"

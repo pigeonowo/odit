@@ -1,0 +1,672 @@
+package odit.services
+
+// =============================================================================
+// Onyx Editor ("odit") — Live Debugger Local & WAT Value Evaluator
+// =============================================================================
+// Evaluates named Onyx parameters/locals up to the current execution line AND
+// simulates the WebAssembly value stack & `local.N` slots up to the current
+// `.wat` instruction so values update live on every `F10` (Step) and `F11` (WAT).
+
+use core { package, os, Array, tprintf }
+use odit.abi
+
+EvalKind :: enum {
+    Unknown;
+    Int;
+    Bool;
+    Str;
+}
+
+EvalVal :: struct {
+    kind:     EvalKind;
+    int_val:  i64;
+    bool_val: bool;
+    str_val:  str;
+}
+
+EvalVar :: struct {
+    name:     str;
+    type_str: str;
+    val:      EvalVal;
+}
+
+#package
+eval_val_to_str :: (v: EvalVal, allocator := context.temp_allocator) -> str {
+    switch v.kind {
+        case .Int  do return str.copy(tprintf("{}", v.int_val), allocator);
+        case .Bool do return str.copy("true" if v.bool_val else "false", allocator);
+        case .Str  do return str.copy(tprintf("\"{}\"", v.str_val), allocator);
+        case _     do return "";
+    }
+}
+
+#package
+eval_val_default_type :: (v: EvalVal) -> str {
+    switch v.kind {
+        case .Int  do return "i32";
+        case .Bool do return "bool";
+        case .Str  do return "str";
+        case _     do return "any";
+    }
+}
+
+#local
+strip_line_comment_and_semi :: (raw: str) -> str {
+    in_str := false;
+    end := raw.count;
+    for i in 0 .. raw.count {
+        c := raw[i];
+        if in_str {
+            if c == '\\' && i + 1 < raw.count { continue; }
+            if c == '"' do in_str = false;
+        } else {
+            if c == '"' do in_str = true;
+            elseif c == '/' && i + 1 < raw.count && raw[i + 1] == '/' {
+                end = i;
+                break;
+            }
+        }
+    }
+    t := trim_s(raw[0 .. end]);
+    while t.count > 0 && t[t.count - 1] == ';' {
+        t = trim_s(t[0 .. (t.count - 1)]);
+    }
+    return t;
+}
+
+#local
+ExprParser :: struct {
+    src:   str;
+    pos:   i32;
+    vars:  [] EvalVar;
+    lines: [] str;
+    procs: [] ParsedProc;
+    depth: i32;
+}
+
+#local
+ep_skip_ws :: (p: &ExprParser) {
+    while p.pos < p.src.count {
+        c := p.src[p.pos];
+        if c == ' ' || c == '\t' || c == '\r' || c == '\n' do p.pos += 1;
+        else do break;
+    }
+}
+
+#local
+ep_peek :: (p: &ExprParser) -> u8 {
+    ep_skip_ws(p);
+    if p.pos >= p.src.count do return 0;
+    return p.src[p.pos];
+}
+
+#local
+ep_match2 :: (p: &ExprParser, a: u8, b: u8) -> bool {
+    ep_skip_ws(p);
+    if p.pos + 1 < p.src.count && p.src[p.pos] == a && p.src[p.pos + 1] == b {
+        p.pos += 2;
+        return true;
+    }
+    return false;
+}
+
+#local
+ep_parse_expr :: (p: &ExprParser) -> EvalVal {
+    return ep_parse_cmp(p);
+}
+
+#local
+ep_parse_cmp :: (p: &ExprParser) -> EvalVal {
+    lhs := ep_parse_add(p);
+    while true {
+        ep_skip_ws(p);
+        if ep_match2(p, '=', '=') {
+            rhs := ep_parse_add(p);
+            if lhs.kind == .Int && rhs.kind == .Int       do lhs = .{ kind = .Bool, bool_val = lhs.int_val == rhs.int_val };
+            elseif lhs.kind == .Bool && rhs.kind == .Bool do lhs = .{ kind = .Bool, bool_val = lhs.bool_val == rhs.bool_val };
+            elseif lhs.kind == .Str && rhs.kind == .Str   do lhs = .{ kind = .Bool, bool_val = str.equal(lhs.str_val, rhs.str_val) };
+            else do lhs = .{ kind = .Unknown };
+        } elseif ep_match2(p, '!', '=') {
+            rhs := ep_parse_add(p);
+            if lhs.kind == .Int && rhs.kind == .Int       do lhs = .{ kind = .Bool, bool_val = lhs.int_val != rhs.int_val };
+            elseif lhs.kind == .Bool && rhs.kind == .Bool do lhs = .{ kind = .Bool, bool_val = lhs.bool_val != rhs.bool_val };
+            else do lhs = .{ kind = .Unknown };
+        } elseif ep_match2(p, '<', '=') {
+            rhs := ep_parse_add(p);
+            if lhs.kind == .Int && rhs.kind == .Int do lhs = .{ kind = .Bool, bool_val = lhs.int_val <= rhs.int_val };
+            else do lhs = .{ kind = .Unknown };
+        } elseif ep_match2(p, '>', '=') {
+            rhs := ep_parse_add(p);
+            if lhs.kind == .Int && rhs.kind == .Int do lhs = .{ kind = .Bool, bool_val = lhs.int_val >= rhs.int_val };
+            else do lhs = .{ kind = .Unknown };
+        } elseif p.pos < p.src.count && p.src[p.pos] == '<' && !(p.pos + 1 < p.src.count && p.src[p.pos + 1] == '<') {
+            p.pos += 1;
+            rhs := ep_parse_add(p);
+            if lhs.kind == .Int && rhs.kind == .Int do lhs = .{ kind = .Bool, bool_val = lhs.int_val < rhs.int_val };
+            else do lhs = .{ kind = .Unknown };
+        } elseif p.pos < p.src.count && p.src[p.pos] == '>' && !(p.pos + 1 < p.src.count && p.src[p.pos + 1] == '>') {
+            p.pos += 1;
+            rhs := ep_parse_add(p);
+            if lhs.kind == .Int && rhs.kind == .Int do lhs = .{ kind = .Bool, bool_val = lhs.int_val > rhs.int_val };
+            else do lhs = .{ kind = .Unknown };
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+#local
+ep_parse_add :: (p: &ExprParser) -> EvalVal {
+    lhs := ep_parse_mul(p);
+    while true {
+        ch := ep_peek(p);
+        if ch == '+' {
+            p.pos += 1;
+            rhs := ep_parse_mul(p);
+            if lhs.kind == .Int && rhs.kind == .Int do lhs.int_val += rhs.int_val;
+            else do lhs = .{ kind = .Unknown };
+        } elseif ch == '-' {
+            p.pos += 1;
+            rhs := ep_parse_mul(p);
+            if lhs.kind == .Int && rhs.kind == .Int do lhs.int_val -= rhs.int_val;
+            else do lhs = .{ kind = .Unknown };
+        } elseif ch == '|' && !(p.pos + 1 < p.src.count && p.src[p.pos + 1] == '|') {
+            p.pos += 1;
+            rhs := ep_parse_mul(p);
+            if lhs.kind == .Int && rhs.kind == .Int do lhs.int_val |= rhs.int_val;
+            else do lhs = .{ kind = .Unknown };
+        } elseif ch == '^' {
+            p.pos += 1;
+            rhs := ep_parse_mul(p);
+            if lhs.kind == .Int && rhs.kind == .Int do lhs.int_val ^= rhs.int_val;
+            else do lhs = .{ kind = .Unknown };
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+#local
+ep_parse_mul :: (p: &ExprParser) -> EvalVal {
+    lhs := ep_parse_unary(p);
+    while true {
+        ep_skip_ws(p);
+        if ep_match2(p, '<', '<') {
+            rhs := ep_parse_unary(p);
+            if lhs.kind == .Int && rhs.kind == .Int do lhs.int_val <<= rhs.int_val;
+            else do lhs = .{ kind = .Unknown };
+        } elseif ep_match2(p, '>', '>') {
+            rhs := ep_parse_unary(p);
+            if lhs.kind == .Int && rhs.kind == .Int do lhs.int_val >>= rhs.int_val;
+            else do lhs = .{ kind = .Unknown };
+        } else {
+            ch := ep_peek(p);
+            if ch == '*' {
+                p.pos += 1;
+                rhs := ep_parse_unary(p);
+                if lhs.kind == .Int && rhs.kind == .Int do lhs.int_val *= rhs.int_val;
+                else do lhs = .{ kind = .Unknown };
+            } elseif ch == '/' {
+                p.pos += 1;
+                rhs := ep_parse_unary(p);
+                if lhs.kind == .Int && rhs.kind == .Int && rhs.int_val != 0 do lhs.int_val /= rhs.int_val;
+                else do lhs = .{ kind = .Unknown };
+            } elseif ch == '%' {
+                p.pos += 1;
+                rhs := ep_parse_unary(p);
+                if lhs.kind == .Int && rhs.kind == .Int && rhs.int_val != 0 do lhs.int_val %= rhs.int_val;
+                else do lhs = .{ kind = .Unknown };
+            } elseif ch == '&' && !(p.pos + 1 < p.src.count && p.src[p.pos + 1] == '&') {
+                p.pos += 1;
+                rhs := ep_parse_unary(p);
+                if lhs.kind == .Int && rhs.kind == .Int do lhs.int_val &= rhs.int_val;
+                else do lhs = .{ kind = .Unknown };
+            } else {
+                break;
+            }
+        }
+    }
+    return lhs;
+}
+
+#local
+ep_parse_unary :: (p: &ExprParser) -> EvalVal {
+    ch := ep_peek(p);
+    if ch == '-' {
+        p.pos += 1;
+        v := ep_parse_unary(p);
+        if v.kind == .Int do v.int_val = -v.int_val;
+        return v;
+    }
+    if ch == '+' {
+        p.pos += 1;
+        return ep_parse_unary(p);
+    }
+    if ch == '!' {
+        p.pos += 1;
+        v := ep_parse_unary(p);
+        if v.kind == .Bool do v.bool_val = !v.bool_val;
+        return v;
+    }
+    if ch == '~' {
+        p.pos += 1;
+        v := ep_parse_unary(p);
+        if v.kind == .Int do v.int_val = ~v.int_val;
+        return v;
+    }
+    return ep_parse_primary(p);
+}
+
+#local
+ep_parse_primary :: (p: &ExprParser) -> EvalVal {
+    ch := ep_peek(p);
+    if ch == 0 do return .{ kind = .Unknown };
+
+    // Parenthesized expression
+    if ch == '(' {
+        p.pos += 1;
+        v := ep_parse_expr(p);
+        if ep_peek(p) == ')' do p.pos += 1;
+        return v;
+    }
+
+    // String literal
+    if ch == '"' {
+        p.pos += 1;
+        s0 := p.pos;
+        while p.pos < p.src.count && p.src[p.pos] != '"' {
+            if p.src[p.pos] == '\\' && p.pos + 1 < p.src.count do p.pos += 2;
+            else do p.pos += 1;
+        }
+        sv := p.src[s0 .. p.pos];
+        if p.pos < p.src.count do p.pos += 1;
+        return .{ kind = .Str, str_val = sv };
+    }
+
+    // Char literal
+    if ch == '\'' {
+        p.pos += 1;
+        val: i64 = 0;
+        if p.pos < p.src.count {
+            val = cast(i64) p.src[p.pos];
+            p.pos += 1;
+        }
+        while p.pos < p.src.count && p.src[p.pos] != '\'' do p.pos += 1;
+        if p.pos < p.src.count do p.pos += 1;
+        return .{ kind = .Int, int_val = val };
+    }
+
+    // Integer literal (decimal or hex)
+    if ch >= '0' && ch <= '9' {
+        val: i64 = 0;
+        if ch == '0' && p.pos + 1 < p.src.count && (p.src[p.pos + 1] == 'x' || p.src[p.pos + 1] == 'X') {
+            p.pos += 2;
+            while p.pos < p.src.count {
+                c := p.src[p.pos];
+                if c >= '0' && c <= '9'      do val = val * 16 + cast(i64)(c - '0');
+                elseif c >= 'a' && c <= 'f'  do val = val * 16 + cast(i64)(c - 'a' + 10);
+                elseif c >= 'A' && c <= 'F'  do val = val * 16 + cast(i64)(c - 'A' + 10);
+                elseif c == '_' {}
+                else do break;
+                p.pos += 1;
+            }
+        } else {
+            while p.pos < p.src.count {
+                c := p.src[p.pos];
+                if c >= '0' && c <= '9' do val = val * 10 + cast(i64)(c - '0');
+                elseif c == '_' {}
+                else do break;
+                p.pos += 1;
+            }
+        }
+        return .{ kind = .Int, int_val = val };
+    }
+
+    // Identifier, boolean literal, or local procedure call
+    if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' {
+        s0 := p.pos;
+        while p.pos < p.src.count && is_ident_ch(p.src[p.pos]) do p.pos += 1;
+        ident := p.src[s0 .. p.pos];
+
+        if str.equal(ident, "true")  do return .{ kind = .Bool, bool_val = true };
+        if str.equal(ident, "false") do return .{ kind = .Bool, bool_val = false };
+
+        // Check for local procedure call: `ident(arg1, arg2, ...)`
+        if ep_peek(p) == '(' {
+            p.pos += 1;
+            call_args := make([..] EvalVal, 4, context.temp_allocator);
+            while ep_peek(p) != ')' && ep_peek(p) != 0 {
+                call_args << ep_parse_expr(p);
+                if ep_peek(p) == ',' do p.pos += 1;
+                else do break;
+            }
+            if ep_peek(p) == ')' do p.pos += 1;
+
+            if p.depth < 6 {
+                for &pr in p.procs {
+                    if str.equal(pr.name, ident) {
+                        _, rv := eval_proc_body(p.lines, p.procs, pr, 0, call_args, p.depth + 1);
+                        return rv;
+                    }
+                }
+            }
+            return .{ kind = .Unknown };
+        }
+
+        // Lookup variable in current scope
+        for &v in p.vars {
+            if str.equal(v.name, ident) do return v.val;
+        }
+        return .{ kind = .Unknown };
+    }
+
+    return .{ kind = .Unknown };
+}
+
+#local
+eval_expr_str :: (expr: str, vars: [] EvalVar, lines: [] str, procs: [] ParsedProc, depth: i32) -> EvalVal {
+    p := ExprParser.{ src = expr, pos = 0, vars = vars, lines = lines, procs = procs, depth = depth };
+    return ep_parse_expr(&p);
+}
+
+#local
+set_or_add_var :: (vars: &[..] EvalVar, name: str, type_str: str, val: EvalVal) {
+    for &v in *vars {
+        if str.equal(v.name, name) {
+            v.val = val;
+            if type_str.count > 0 do v.type_str = type_str;
+            return;
+        }
+    }
+    ty := type_str if type_str.count > 0 else eval_val_default_type(val);
+    *vars << .{ name = name, type_str = ty, val = val };
+}
+
+#local
+parse_sig_params_into_vars :: (sig_line: str, init_params: [] EvalVal, vars: &[..] EvalVar) {
+    lp := -1;
+    rp := -1;
+    for k in 0 .. sig_line.count {
+        if sig_line[k] == '(' && lp < 0 do lp = k;
+        elseif sig_line[k] == ')' && lp >= 0 { rp = k; break; }
+    }
+    if lp < 0 || rp <= lp + 1 do return;
+
+    params_s := sig_line[(lp + 1) .. rp];
+    start := 0;
+    pidx := 0;
+    for k in 0 .. (params_s.count + 1) {
+        if k == params_s.count || params_s[k] == ',' {
+            seg := trim_s(params_s[start .. k]);
+            cpos := -1;
+            for m in 0 .. seg.count {
+                if seg[m] == ':' { cpos = m; break; }
+            }
+            if cpos > 0 {
+                pn := trim_s(seg[0 .. cpos]);
+                pt := trim_s(seg[(cpos + 1) .. seg.count]);
+                if pn.count > 0 {
+                    iv := init_params[pidx] if pidx < init_params.count else EvalVal.{ kind = .Unknown };
+                    set_or_add_var(vars, pn, pt if pt.count > 0 else "any", iv);
+                    pidx += 1;
+                }
+            }
+            start = k + 1;
+        }
+    }
+}
+
+/// Evaluates named Onyx parameters & locals inside `proc` up to `stop_before_line` (1-based; 0 = run full body).
+eval_proc_body :: (
+    lines: [] str,
+    procs: [] ParsedProc,
+    proc: &ParsedProc,
+    stop_before_line: u32,
+    init_params: [] EvalVal = .[],
+    depth: i32 = 0
+) -> (vars: [..] EvalVar, ret_val: EvalVal) {
+    vars = make([..] EvalVar, 16, context.temp_allocator);
+    ret_val = EvalVal.{ kind = .Unknown };
+
+    parse_sig_params_into_vars(proc.sig_line, init_params, &vars);
+
+    start_l := proc.start_line + 1;
+    if start_l > proc.end_line do return vars, ret_val;
+
+    for ln_1 in start_l .. (proc.end_line + 1) {
+        if stop_before_line > 0 && ln_1 >= stop_before_line {
+            // If paused directly ON a `return <expr>` line, preview the return expression value!
+            idx_r := cast(i32) ln_1 - 1;
+            if idx_r >= 0 && idx_r < lines.count {
+                st_r := strip_line_comment_and_semi(lines[idx_r]);
+                if str.starts_with(st_r, "return ") {
+                    ret_val = eval_expr_str(trim_s(st_r[7 .. st_r.count]), vars, lines, procs, depth);
+                }
+            }
+            break;
+        }
+
+        idx := cast(i32) ln_1 - 1;
+        if idx < 0 || idx >= lines.count do continue;
+        st := strip_line_comment_and_semi(lines[idx]);
+        if st.count == 0 do continue;
+
+        // `return <expr>`
+        if str.starts_with(st, "return ") {
+            ret_val = eval_expr_str(trim_s(st[7 .. st.count]), vars, lines, procs, depth);
+            break;
+        }
+
+        // Declaration: `name := expr`
+        walrus := -1;
+        for k in 0 .. (st.count - 1) {
+            if st[k] == ':' && st[k + 1] == '=' { walrus = k; break; }
+            if st[k] == '"' || st[k] == '(' do break;
+        }
+        if walrus > 0 {
+            lhs := trim_s(st[0 .. walrus]);
+            rhs := trim_s(st[(walrus + 2) .. st.count]);
+            if lhs.count > 0 && is_ident_ch(lhs[0]) {
+                v := eval_expr_str(rhs, vars, lines, procs, depth);
+                set_or_add_var(&vars, lhs, "", v);
+                continue;
+            }
+        }
+
+        // Typed declaration: `name: Type = expr` or `name: Type`
+        colon := -1;
+        for k in 0 .. st.count {
+            if st[k] == ':' && !(k + 1 < st.count && st[k + 1] == ':') { colon = k; break; }
+            if st[k] == '"' || st[k] == '(' || st[k] == '=' do break;
+        }
+        if colon > 0 {
+            lhs := trim_s(st[0 .. colon]);
+            rest := trim_s(st[(colon + 1) .. st.count]);
+            if lhs.count > 0 && is_ident_ch(lhs[0]) {
+                eq := -1;
+                for k in 0 .. rest.count {
+                    if rest[k] == '=' { eq = k; break; }
+                }
+                if eq > 0 {
+                    ty  := trim_s(rest[0 .. eq]);
+                    rhs := trim_s(rest[(eq + 1) .. rest.count]);
+                    v   := eval_expr_str(rhs, vars, lines, procs, depth);
+                    set_or_add_var(&vars, lhs, ty, v);
+                } else {
+                    set_or_add_var(&vars, lhs, rest, .{ kind = .Int, int_val = 0 });
+                }
+                continue;
+            }
+        }
+
+        // Assignment / compound assignment: `name = expr`, `name += expr`, etc.
+        eq_pos := -1;
+        op_ch: u8 = 0;
+        for k in 0 .. st.count {
+            if st[k] == '=' && !(k + 1 < st.count && st[k + 1] == '=') {
+                if k > 0 && (st[k - 1] == '+' || st[k - 1] == '-' || st[k - 1] == '*' || st[k - 1] == '/') {
+                    op_ch = st[k - 1];
+                    eq_pos = k - 1;
+                } elseif k > 0 && (st[k - 1] == '!' || st[k - 1] == '<' || st[k - 1] == '>') {
+                    continue;
+                } else {
+                    eq_pos = k;
+                }
+                break;
+            }
+            if st[k] == '"' || st[k] == '(' do break;
+        }
+        if eq_pos > 0 {
+            lhs := trim_s(st[0 .. eq_pos]);
+            rhs_start := eq_pos + (2 if op_ch != 0 else 1);
+            rhs := trim_s(st[rhs_start .. st.count]);
+            if lhs.count > 0 && is_ident_ch(lhs[0]) {
+                rv := eval_expr_str(rhs, vars, lines, procs, depth);
+                if op_ch != 0 {
+                    cur := eval_expr_str(lhs, vars, lines, procs, depth);
+                    if cur.kind == .Int && rv.kind == .Int {
+                        switch op_ch {
+                            case '+' do cur.int_val += rv.int_val;
+                            case '-' do cur.int_val -= rv.int_val;
+                            case '*' do cur.int_val *= rv.int_val;
+                            case '/' do if rv.int_val != 0 do cur.int_val /= rv.int_val;
+                        }
+                        set_or_add_var(&vars, lhs, "", cur);
+                    }
+                } else {
+                    set_or_add_var(&vars, lhs, "", rv);
+                }
+            }
+        }
+    }
+
+    return vars, ret_val;
+}
+
+/// Evaluates call arguments from a call expression line like `c := add(a, b)` in the caller's scope.
+eval_call_args_on_line :: (
+    call_line: str,
+    callee_name: str,
+    caller_vars: [] EvalVar,
+    lines: [] str,
+    procs: [] ParsedProc
+) -> [..] EvalVal {
+    out := make([..] EvalVal, 4, context.temp_allocator);
+    pat := tprintf("{}(", callee_name);
+    // Find `callee_name(` in call_line
+    idx := -1;
+    if call_line.count >= pat.count {
+        for i in 0 .. (call_line.count - pat.count + 1) {
+            ok := true;
+            for j in 0 .. pat.count {
+                if call_line[i + j] != pat[j] { ok = false; break; }
+            }
+            if ok { idx = i + pat.count; break; }
+        }
+    }
+    if idx < 0 do return out;
+
+    p := ExprParser.{ src = call_line, pos = idx, vars = caller_vars, lines = lines, procs = procs, depth = 0 };
+    while ep_peek(&p) != ')' && ep_peek(&p) != 0 {
+        out << ep_parse_expr(&p);
+        if ep_peek(&p) == ',' do p.pos += 1;
+        else do break;
+    }
+    return out;
+}
+
+#local
+parse_i64_tok :: (s: str) -> (val: i64, ok: bool) {
+    t := trim_s(s);
+    if t.count == 0 do return 0, false;
+    // Strip trailing `)` if on last WAT instruction line
+    while t.count > 0 && t[t.count - 1] == ')' do t = trim_s(t[0 .. (t.count - 1)]);
+    if t.count == 0 do return 0, false;
+    neg := false;
+    i := 0;
+    if t[0] == '-' { neg = true; i = 1; }
+    if i >= t.count || t[i] < '0' || t[i] > '9' do return 0, false;
+    v: i64 = 0;
+    while i < t.count && t[i] >= '0' && t[i] <= '9' {
+        v = v * 10 + cast(i64)(t[i] - '0');
+        i += 1;
+    }
+    return (-v if neg else v), true;
+}
+
+/// Simulates the WASM value stack and `local.N` slots up to `up_to_wat_line` (inclusive).
+eval_wat_locals :: (wat_text: str, up_to_wat_line: i32, init_params: [] EvalVal) -> (slots: [64] i64, defined: [64] bool) {
+    stack:   [64] i64;
+    sp: i32 = 0;
+
+    for i in 0 .. init_params.count {
+        if i < 64 && init_params[i].kind == .Int {
+            slots[i]   = init_params[i].int_val;
+            defined[i] = true;
+        }
+    }
+
+    if wat_text.count == 0 || up_to_wat_line < 0 do return slots, defined;
+    wlines := split_lines(wat_text, context.temp_allocator);
+    limit := up_to_wat_line + 1;
+    if limit > wlines.count do limit = wlines.count;
+
+    for wi in 0 .. limit {
+        t := trim_s(wlines[wi]);
+        if t.count == 0 || str.starts_with(t, "(func") || str.starts_with(t, "(local") || str.starts_with(t, ";;") do continue;
+        // Strip trailing `)` on last line
+        while t.count > 0 && t[t.count - 1] == ')' do t = trim_s(t[0 .. (t.count - 1)]);
+
+        if str.starts_with(t, "i32.const ") || str.starts_with(t, "i64.const ") {
+            v, ok := parse_i64_tok(t[10 .. t.count]);
+            if ok && sp < 64 { stack[sp] = v; sp += 1; }
+        } elseif str.starts_with(t, "local.get ") {
+            idx, ok := parse_i64_tok(t[10 .. t.count]);
+            if ok && idx >= 0 && idx < 64 && sp < 64 {
+                stack[sp] = slots[cast(i32) idx];
+                sp += 1;
+            }
+        } elseif str.starts_with(t, "local.set ") {
+            idx, ok := parse_i64_tok(t[10 .. t.count]);
+            if ok && idx >= 0 && idx < 64 && sp > 0 {
+                sp -= 1;
+                slots[cast(i32) idx]   = stack[sp];
+                defined[cast(i32) idx] = true;
+            }
+        } elseif str.starts_with(t, "local.tee ") {
+            idx, ok := parse_i64_tok(t[10 .. t.count]);
+            if ok && idx >= 0 && idx < 64 && sp > 0 {
+                slots[cast(i32) idx]   = stack[sp - 1];
+                defined[cast(i32) idx] = true;
+            }
+        } elseif str.equal(t, "drop") {
+            if sp > 0 do sp -= 1;
+        } elseif (str.equal(t, "i32.add") || str.equal(t, "i64.add")) && sp >= 2 {
+            stack[sp - 2] = stack[sp - 2] + stack[sp - 1]; sp -= 1;
+        } elseif (str.equal(t, "i32.sub") || str.equal(t, "i64.sub")) && sp >= 2 {
+            stack[sp - 2] = stack[sp - 2] - stack[sp - 1]; sp -= 1;
+        } elseif (str.equal(t, "i32.mul") || str.equal(t, "i64.mul")) && sp >= 2 {
+            stack[sp - 2] = stack[sp - 2] * stack[sp - 1]; sp -= 1;
+        } elseif (str.equal(t, "i32.div_s") || str.equal(t, "i64.div_s")) && sp >= 2 {
+            if stack[sp - 1] != 0 do stack[sp - 2] = stack[sp - 2] / stack[sp - 1];
+            sp -= 1;
+        } elseif (str.equal(t, "i32.rem_s") || str.equal(t, "i64.rem_s")) && sp >= 2 {
+            if stack[sp - 1] != 0 do stack[sp - 2] = stack[sp - 2] % stack[sp - 1];
+            sp -= 1;
+        } elseif (str.equal(t, "i32.and") || str.equal(t, "i64.and")) && sp >= 2 {
+            stack[sp - 2] = stack[sp - 2] & stack[sp - 1]; sp -= 1;
+        } elseif (str.equal(t, "i32.or") || str.equal(t, "i64.or")) && sp >= 2 {
+            stack[sp - 2] = stack[sp - 2] | stack[sp - 1]; sp -= 1;
+        } elseif (str.equal(t, "i32.xor") || str.equal(t, "i64.xor")) && sp >= 2 {
+            stack[sp - 2] = stack[sp - 2] ^ stack[sp - 1]; sp -= 1;
+        } elseif (str.equal(t, "i32.shl") || str.equal(t, "i64.shl")) && sp >= 2 {
+            stack[sp - 2] = stack[sp - 2] << stack[sp - 1]; sp -= 1;
+        } elseif (str.equal(t, "i32.shr_s") || str.equal(t, "i64.shr_s")) && sp >= 2 {
+            stack[sp - 2] = stack[sp - 2] >> stack[sp - 1]; sp -= 1;
+        }
+    }
+
+    return slots, defined;
+}
