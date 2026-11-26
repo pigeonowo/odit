@@ -256,9 +256,11 @@ contains_ci :: (haystack: str, needle: str) -> bool {
 #local
 score_doc :: (item: &DocItem, q: str) -> i32 {
     if q.count == 0 {
-        // Default view: prioritize directives & packages first
-        if str.equal(item.kind, "directive") do return 20;
-        if str.equal(item.kind, "package")   do return 15;
+        // Default view: prioritize project & dependency procs/types first
+        if str.equal(item.source, "project") do return 30;
+        if str.equal(item.source, "dep")     do return 20;
+        if str.equal(item.kind, "package")   do return 12;
+        if str.equal(item.kind, "directive") do return 8;
         return 5;
     }
     sc := 0;

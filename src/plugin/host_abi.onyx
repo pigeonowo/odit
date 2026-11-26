@@ -418,10 +418,17 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
             rel := guest_read_str(handle, arg_u32(0), arg_u32(1));
             line := arg_i32(2);
             col  := arg_i32(3);
-            if full := sanitize_rel_path(rel); full {
+            allow_core := false;
+            if rel.count > 0 && rel[0] == '/' && str.contains(rel, "/.onyx/core/") {
+                allow_core = true;
+            }
+            if allow_core || sanitize_rel_path(rel) {
                 if editor.buffer_load_file(&g_host_ctx.ed.buf, rel) {
-                    if line > 0 do editor.buffer_set_cursor_1based(&g_host_ctx.ed.buf, line, col if col > 0 else 1);
-                    if g_host_ctx.lsp_client != null {
+                    if line > 0 {
+                        editor.buffer_set_cursor_1based(&g_host_ctx.ed.buf, line, col if col > 0 else 1);
+                        editor.editor_ensure_cursor_visible(g_host_ctx.ed, g_host_ctx.window_mgr.editor_content.h);
+                    }
+                    if g_host_ctx.lsp_client != null && !allow_core {
                         txt := editor.buffer_to_string(&g_host_ctx.ed.buf, context.temp_allocator);
                         lsp.lsp_did_open(g_host_ctx.lsp_client, rel, txt);
                     }

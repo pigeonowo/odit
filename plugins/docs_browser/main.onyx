@@ -58,7 +58,7 @@ plugin_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len:
         payload := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
         if str_has(payload, "docs.directives") {
             set_query("#");
-            g_cat_filter = 1;
+            g_cat_filter = 4;
         } elseif str_has(payload, "docs.format") {
             set_query("format");
             g_cat_filter = 0;
@@ -128,10 +128,10 @@ matches_source :: (src: str) -> bool {
 #local
 matches_category :: (kind: str) -> bool {
     return switch g_cat_filter {
-        case 1 => str.equal(kind, "directive");
-        case 2 => str.equal(kind, "package");
-        case 3 => str.equal(kind, "proc") || str.equal(kind, "macro");
-        case 4 => str.equal(kind, "struct") || str.equal(kind, "enum") || str.equal(kind, "union") || str.equal(kind, "interface");
+        case 1 => str.equal(kind, "proc") || str.equal(kind, "macro");
+        case 2 => str.equal(kind, "struct") || str.equal(kind, "enum") || str.equal(kind, "union") || str.equal(kind, "interface");
+        case 3 => str.equal(kind, "package");
+        case 4 => str.equal(kind, "directive");
         case _ => true;
     };
 }
@@ -174,9 +174,9 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
     }
     y += 26.0f;
 
-    // Row 3: Category filter buttons
+    // Row 3: Category filter buttons (Procs, Types, Pkgs first; #Dir last)
     cw := (w - 16.0f) / 5.0f;
-    cats := str.[ "All", "#Dir", "Pkg", "Procs", "Types" ];
+    cats := str.[ "All", "Procs", "Types", "Pkgs", "#Dir" ];
     for ci in 0 .. 5 {
         if sdk.button(cast(u32) (10 + ci), pad + cast(f32) ci * (cw + 4.0f), y, cw, 22.0f, cats[ci],
                       .Active if g_cat_filter == ci else .Ghost) & .Clicked {
@@ -226,7 +226,12 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
             scol := sdk.theme_color(.Success) if str.equal(r.source, "project") else (sdk.theme_color(.Warning) if str.equal(r.source, "dep") else sdk.theme_color(.TextDisabled));
             sdk.draw_text(pad + w - 42.0f, ry + 6.0f, stag, 10.0f, scol);
 
-            if hov && lclick do g_selected = i;
+            if hov && lclick {
+                g_selected = i;
+                if r.file.count > 0 && r.line > 0 {
+                    sdk.editor_open(r.file, cast(i32) r.line, 1);
+                }
+            }
             ry += row_h;
         }
     }
