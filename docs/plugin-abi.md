@@ -63,6 +63,7 @@ When using the declarative decorators in [`sdk/plugin_sdk.onyx`](../sdk/plugin_s
 | `5` | `host_register_command(id..., label..., shortcut...) -> u32` | Live |
 | `6` | `host_execute_command(id..., arg...) -> i32` | Live |
 | `7` | `host_spawn_plugin(plugin_id...) -> u32` | Live |
+| `8` | `host_set_clipboard(text_ptr, text_len)` | Live |
 
 ### B. UI Drawing & Immediate Widgets (`20..49`)
 All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped to the pane.
@@ -98,7 +99,7 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
 ### E. Live Debugger (`90..99`)
 | Opcode | Function | Status |
 | :---: | :--- | :---: |
-| `90–94` | `debug_toggle_breakpoint`, `debug_get_breakpoints`, `debug_start`, `debug_command`, `debug_get_state` | Phase 4 |
+| `90–94` | `debug_toggle_breakpoint`, `debug_get_breakpoints`, `debug_start`, `debug_command`, `debug_get_state` | Live |
 
 ---
 

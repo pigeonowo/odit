@@ -105,6 +105,7 @@ Event :: union {
     DiagnosticsUpdated: str;
     SymbolsUpdated:     str;
     Command:            str; // Command ID extracted from JSON payload
+    DebugStateChanged:  str; // JSON DebugState snapshot
     WorkspaceChanged:   str;
     KeyInput:           abi.KeyEvent;
     Raw:                RawEvent;
@@ -119,6 +120,7 @@ decode_event :: (event_type: u32, payload_ptr: u32, payload_len: u32) -> Event {
         case .ActiveFileChanged  do return .{ ActiveFileChanged  = raw_str };
         case .DiagnosticsUpdated do return .{ DiagnosticsUpdated = raw_str };
         case .SymbolsUpdated     do return .{ SymbolsUpdated     = raw_str };
+        case .DebugStateChanged  do return .{ DebugStateChanged  = raw_str };
         case .WorkspaceChanged   do return .{ WorkspaceChanged   = raw_str };
         case .CommandInvoked {
             id := json_get_str(raw_str, "id", context.temp_allocator);
@@ -733,6 +735,46 @@ docs_search_json :: (query: str, allocator := context.temp_allocator) -> str {
 }
 
 // -----------------------------------------------------------------------------
+// D2. Live Debugger Helpers
+// -----------------------------------------------------------------------------
+
+debug_toggle_breakpoint :: (rel_path: str, line: u32) -> bool {
+    return abi.debug_toggle_breakpoint(cast(u32) rel_path.data, cast(u32) rel_path.count, line) != 0;
+}
+
+debug_get_breakpoints_json :: (rel_path: str = "", allocator := context.temp_allocator) -> str {
+    needed := abi.debug_get_breakpoints(cast(u32) rel_path.data, cast(u32) rel_path.count, 0, 0);
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.debug_get_breakpoints(cast(u32) rel_path.data, cast(u32) rel_path.count, cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
+    return buf[0 .. got];
+}
+
+debug_start :: (entry_path: str = "") -> i32 {
+    return abi.debug_start(cast(u32) entry_path.data, cast(u32) entry_path.count);
+}
+
+debug_command :: (cmd: abi.DebugCommand) -> i32 {
+    return abi.debug_command(cast(u32) cmd);
+}
+
+debug_get_state_json :: (allocator := context.temp_allocator) -> str {
+    needed := abi.debug_get_state(0, 0);
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.debug_get_state(cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
+    return buf[0 .. got];
+}
+
+// -----------------------------------------------------------------------------
 // E. Lightweight Zero-Dependency JSON Helpers for `-r custom` WASM Plugins
 // -----------------------------------------------------------------------------
 
@@ -851,4 +893,30 @@ json_get_i32 :: (obj: str, key: str) -> i32 {
         idx += 1;
     }
     return -val if neg else val;
+}
+
+/// Extracts the raw `[...]` array slice for a field inside a JSON object.
+json_get_array_slice :: (obj: str, key: str) -> str {
+    idx := json_find_field_value(obj, key);
+    if idx < 0 || idx >= obj.count || obj[idx] != '[' do return "";
+    start := idx;
+    depth := 0;
+    in_str := false;
+    i := idx;
+    while i < obj.count {
+        c := obj[i];
+        if in_str {
+            if c == '\\' && i + 1 < obj.count { i += 2; continue; }
+            if c == '"' do in_str = false;
+        } else {
+            if c == '"' do in_str = true;
+            elseif c == '[' do depth += 1;
+            elseif c == ']' {
+                depth -= 1;
+                if depth == 0 do return obj[start .. (i + 1)];
+            }
+        }
+        i += 1;
+    }
+    return "";
 }

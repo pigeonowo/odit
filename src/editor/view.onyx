@@ -36,12 +36,13 @@ EditorView :: struct {
 }
 
 EditorUpdateEvents :: struct {
-    buffer_modified: bool;
-    buffer_saved:    bool;
-    cursor_moved:    bool;
-    req_hover:       bool;
-    req_definition:  bool;
-    req_completion:  bool;
+    buffer_modified:        bool;
+    buffer_saved:           bool;
+    cursor_moved:           bool;
+    req_hover:              bool;
+    req_definition:         bool;
+    req_completion:         bool;
+    toggle_breakpoint_line: u32;
 }
 
 editor_sync_settings :: (ed: &EditorView) {
@@ -143,40 +144,44 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
         }
     }
 
-    // Mouse click to place cursor (dismiss hover/completion)
+    // Mouse click: toggle breakpoint if clicking in gutter, else place cursor
     if hovered && raylib.IsMouseButtonPressed(.LEFT) {
         if lsp_c != null {
             lsp_c.hover_visible = false;
             lsp_c.comp_open = false;
         }
         rel_y := (mpos.y - rect.y) + ed.scroll_y - 6.0f;
-        rel_x := (mpos.x - (rect.x + ed.gutter_width + 8.0f)) + ed.scroll_x;
         clicked_line := cast(i32) (rel_y / ed.line_height);
         if clicked_line < 0 do clicked_line = 0;
         if clicked_line >= ed.buf.lines.count do clicked_line = ed.buf.lines.count - 1;
 
-        clicked_col: i32 = 0;
-        if clicked_line >= 0 && clicked_line < ed.buf.lines.count && rel_x > 0.0f {
-            ln_b := &ed.buf.lines[clicked_line];
-            ln_s := str.{ ln_b.data, ln_b.count };
-            best_col: i32 = 0;
-            best_dist: f32 = rel_x;
-            for c in 1 .. (ln_s.count + 1) {
-                px := theme.measure_text(ln_s[0 .. c], ed.font_size);
-                d := px - rel_x;
-                if d < 0.0f do d = -d;
-                if d < best_dist {
-                    best_dist = d;
-                    best_col = c;
+        if mpos.x < rect.x + ed.gutter_width {
+            ev.toggle_breakpoint_line = cast(u32) (clicked_line + 1);
+        } else {
+            rel_x := (mpos.x - (rect.x + ed.gutter_width + 8.0f)) + ed.scroll_x;
+            clicked_col: i32 = 0;
+            if clicked_line >= 0 && clicked_line < ed.buf.lines.count && rel_x > 0.0f {
+                ln_b := &ed.buf.lines[clicked_line];
+                ln_s := str.{ ln_b.data, ln_b.count };
+                best_col: i32 = 0;
+                best_dist: f32 = rel_x;
+                for c in 1 .. (ln_s.count + 1) {
+                    px := theme.measure_text(ln_s[0 .. c], ed.font_size);
+                    d := px - rel_x;
+                    if d < 0.0f do d = -d;
+                    if d < best_dist {
+                        best_dist = d;
+                        best_col = c;
+                    }
+                    if px > rel_x + ed.char_width do break;
                 }
-                if px > rel_x + ed.char_width do break;
+                clicked_col = best_col;
             }
-            clicked_col = best_col;
+            ed.buf.cursor_line = clicked_line;
+            ed.buf.cursor_col  = clicked_col;
+            buffer_clamp_cursor(&ed.buf);
+            ed.blink_timer = 0.0;
         }
-        ed.buf.cursor_line = clicked_line;
-        ed.buf.cursor_col  = clicked_col;
-        buffer_clamp_cursor(&ed.buf);
-        ed.blink_timer = 0.0;
     }
 
     if !focused do return ev;

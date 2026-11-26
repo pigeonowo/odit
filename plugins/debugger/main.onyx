@@ -1,0 +1,545 @@
+// =============================================================================
+// ODIT Plugin: Live Onyx <-> WASM Debugger (`build/plugins/debugger.wasm`)
+// =============================================================================
+// Side-by-side Live Debugger plugin:
+//   - Left pane:  Onyx source lines with clickable breakpoint gutter (red dots)
+//                 and active execution line highlight
+//   - Right pane: Disassembled WebAssembly Text Format (`.wat`) for the active
+//                 function with Onyx-line <-> WAT-range mapping and single
+//                 WAT-instruction stepping (`F11` / `WAT` button)
+//   - Bottom bar: Parameters & WASM local slots inspection
+
+#load "../../abi/abi.onyx"
+#load "../../sdk/plugin_sdk.onyx"
+
+use core { package, Array, tprintf }
+use odit.abi
+use odit.sdk
+
+LocalVar :: struct {
+    name:  str;
+    type:  str;
+    value: str;
+}
+
+LineMapEntry :: struct {
+    onyx_line:      u32;
+    wat_start_line: u32;
+    wat_end_line:   u32;
+}
+
+@sdk.Plugin.{
+    id             = "odit.debugger",
+    title          = "Live Debugger",
+    version        = "0.1.0",
+    default_slot   = 0,
+    default_width  = 580.0f,
+    default_height = 440.0f,
+    event_mask     = 195, // ActiveFileChanged (1) | BufferModified (2) | CommandInvoked (64) | DebugStateChanged (128)
+    allow_multiple = false,
+}
+DebuggerPlugin :: struct {
+    status:           abi.DebugStatus;
+    source_path:      str;
+    current_line:     u32;
+    current_func:     str;
+    current_wat_line: i32;
+    last_error:       str;
+
+    src_lines:        [..] str;
+    wat_lines:        [..] str;
+    breakpoints:      [..] u32;
+    line_map:         [..] LineMapEntry;
+    locals:           [..] LocalVar;
+
+    src_scroll_y:     f32;
+    src_scroll_x:     f32;
+    wat_scroll_y:     f32;
+    wat_scroll_x:     f32;
+    needs_sync:       bool;
+    auto_scroll_req:  bool;
+}
+
+#local
+clear_str_list :: (list: &[..] str) {
+    for s in *list do sdk.free_str(s);
+    Array.clear(list);
+}
+
+#local
+split_into_lines :: (dst: &[..] str, text: str) {
+    clear_str_list(dst);
+    if text.count == 0 do return;
+    start := 0;
+    for i in 0 .. (text.count + 1) {
+        if i == text.count || text[i] == '\n' {
+            e := i;
+            if e > start && text[e - 1] == '\r' do e -= 1;
+            *dst << sdk.copy_str(text[start .. e]);
+            start = i + 1;
+        }
+    }
+}
+
+#local
+refresh_breakpoints :: (self: &DebuggerPlugin) {
+    Array.clear(&self.breakpoints);
+    if self.source_path.count == 0 do return;
+    js := sdk.debug_get_breakpoints_json(self.source_path, context.temp_allocator);
+    if js.count == 0 do return;
+    sdk.each_json_object(js, [obj] {
+        ln := sdk.json_get_i32(obj, "line");
+        if ln > 0 do self.breakpoints << cast(u32) ln;
+    });
+}
+
+#local
+has_bp :: (self: &DebuggerPlugin, line: u32) -> bool {
+    for b in self.breakpoints {
+        if b == line do return true;
+    }
+    return false;
+}
+
+#local
+reload_source_file :: (self: &DebuggerPlugin, path: str) {
+    if path.count == 0 do return;
+    src := sdk.workspace_read_file(path, context.temp_allocator);
+    split_into_lines(&self.src_lines, src);
+}
+
+#local
+apply_state_json :: (self: &DebuggerPlugin, js: str) {
+    if js.count == 0 do return;
+
+    self.status           = cast(abi.DebugStatus) sdk.json_get_i32(js, "status");
+    self.current_line     = cast(u32) sdk.json_get_i32(js, "current_line");
+    self.current_wat_line = sdk.json_get_i32(js, "current_wat_line");
+
+    sp := sdk.json_get_str(js, "source_path", context.temp_allocator);
+    if sp.count == 0 do sp = sdk.editor_active_path(context.temp_allocator);
+
+    path_changed := !str.equal(sp, self.source_path);
+    if path_changed {
+        sdk.free_str(self.source_path);
+        self.source_path = sdk.copy_str(sp);
+    }
+
+    fn := sdk.json_get_str(js, "current_func", context.temp_allocator);
+    sdk.free_str(self.current_func);
+    self.current_func = sdk.copy_str(fn);
+
+    le := sdk.json_get_str(js, "last_error", context.temp_allocator);
+    sdk.free_str(self.last_error);
+    self.last_error = sdk.copy_str(le);
+
+    wt := sdk.json_get_str(js, "wat_text", context.temp_allocator);
+    split_into_lines(&self.wat_lines, wt);
+
+    // Parse line_map array
+    Array.clear(&self.line_map);
+    lm_arr := sdk.json_get_array_slice(js, "line_map");
+    if lm_arr.count > 0 {
+        sdk.each_json_object(lm_arr, [obj] {
+            self.line_map << .{
+                onyx_line      = cast(u32) sdk.json_get_i32(obj, "onyx_line"),
+                wat_start_line = cast(u32) sdk.json_get_i32(obj, "wat_start_line"),
+                wat_end_line   = cast(u32) sdk.json_get_i32(obj, "wat_end_line"),
+            };
+        });
+    }
+
+    // Parse locals array
+    for &v in self.locals {
+        sdk.free_str(v.name);
+        sdk.free_str(v.type);
+        sdk.free_str(v.value);
+    }
+    Array.clear(&self.locals);
+    loc_arr := sdk.json_get_array_slice(js, "locals");
+    if loc_arr.count > 0 {
+        sdk.each_json_object(loc_arr, [obj] {
+            self.locals << .{
+                name  = sdk.copy_str(sdk.json_get_str(obj, "name", context.temp_allocator)),
+                type  = sdk.copy_str(sdk.json_get_str(obj, "type", context.temp_allocator)),
+                value = sdk.copy_str(sdk.json_get_str(obj, "value", context.temp_allocator)),
+            };
+        });
+    }
+
+    if path_changed || self.src_lines.count == 0 {
+        reload_source_file(self, self.source_path);
+    }
+    refresh_breakpoints(self);
+    self.auto_scroll_req = true;
+}
+
+#local
+sync_all :: (self: &DebuggerPlugin) {
+    js := sdk.debug_get_state_json(context.temp_allocator);
+    if js.count > 0 {
+        apply_state_json(self, js);
+    } else {
+        ap := sdk.editor_active_path(context.temp_allocator);
+        if ap.count > 0 && !str.equal(ap, self.source_path) {
+            sdk.free_str(self.source_path);
+            self.source_path = sdk.copy_str(ap);
+            reload_source_file(self, self.source_path);
+        }
+        refresh_breakpoints(self);
+    }
+}
+
+#local
+find_active_wat_range :: (self: &DebuggerPlugin) -> (start: i32, end: i32) {
+    if self.current_line == 0 do return -1, -1;
+    for &m in self.line_map {
+        if m.onyx_line == self.current_line {
+            return cast(i32) m.wat_start_line, cast(i32) m.wat_end_line;
+        }
+    }
+    return -1, -1;
+}
+
+#local
+wat_line_color :: (line: str) -> u32 {
+    i := 0;
+    while i < line.count && (line[i] == ' ' || line[i] == '\t') do i += 1;
+    t := line[i .. line.count];
+    if str.starts_with(t, ";;")                                  do return sdk.theme_color(.TextDisabled);
+    if str.starts_with(t, "(func") || str.starts_with(t, ")")    do return sdk.theme_color(.Accent);
+    if str.starts_with(t, "(local") || str.starts_with(t, "local.") || str.starts_with(t, "(param") do return sdk.theme_color(.Info);
+    if str.starts_with(t, "call") || str.starts_with(t, "return") || str.starts_with(t, "br") || str.starts_with(t, "if") || str.starts_with(t, "loop") || str.starts_with(t, "block") || str.starts_with(t, "end") {
+        return sdk.theme_color(.Success);
+    }
+    if str.starts_with(t, "i32.") || str.starts_with(t, "i64.") || str.starts_with(t, "f32.") || str.starts_with(t, "f64.") || str.starts_with(t, "memory.") {
+        return sdk.theme_color(.Warning);
+    }
+    return sdk.theme_color(.TextPrimary);
+}
+
+@sdk.PluginInit
+init :: (self: &DebuggerPlugin, window_id: u32) -> i32 {
+    self.src_lines   = make([..] str);
+    self.wat_lines   = make([..] str);
+    self.breakpoints = make([..] u32);
+    self.line_map    = make([..] LineMapEntry);
+    self.locals      = make([..] LocalVar);
+    self.current_wat_line = -1;
+    self.needs_sync  = true;
+
+    sdk.register_command("debugger.start",     "Debugger: Start / Continue",      "F5");
+    sdk.register_command("debugger.step_over", "Debugger: Step Over (Onyx Line)", "F10");
+    sdk.register_command("debugger.step_wat",  "Debugger: Step WAT Instruction",  "F11");
+    sdk.register_command("debugger.stop",      "Debugger: Stop Session",          "Shift+F5");
+    return 0;
+}
+
+@sdk.PluginEvent
+on_event :: (self: &DebuggerPlugin, window_id: u32, event: sdk.Event) {
+    switch event {
+        case .DebugStateChanged as js {
+            apply_state_json(self, js);
+        }
+        case .ActiveFileChanged as path {
+            if self.status != .Paused && path.count > 0 {
+                sdk.free_str(self.source_path);
+                self.source_path = sdk.copy_str(path);
+                reload_source_file(self, self.source_path);
+                refresh_breakpoints(self);
+            }
+        }
+        case .BufferModified as bm {
+            if str.equal(bm.path, self.source_path) {
+                reload_source_file(self, self.source_path);
+            }
+        }
+        case .Command as cmd {
+            if str.equal(cmd, "debugger.start") {
+                if self.status == .Paused do sdk.debug_command(.Continue);
+                else                      do sdk.debug_start(self.source_path);
+                self.needs_sync = true;
+            } elseif str.equal(cmd, "debugger.step_over") {
+                sdk.debug_command(.StepOver);
+                self.needs_sync = true;
+            } elseif str.equal(cmd, "debugger.step_wat") {
+                sdk.debug_command(.StepInstruction);
+                self.needs_sync = true;
+            } elseif str.equal(cmd, "debugger.stop") {
+                sdk.debug_command(.Stop);
+                self.needs_sync = true;
+            }
+        }
+        case _ {}
+    }
+}
+
+@sdk.PluginRender
+render :: (self: &DebuggerPlugin, window_id: u32, ctx: &abi.FrameContext) {
+    if self.needs_sync {
+        self.needs_sync = false;
+        sync_all(self);
+    }
+
+    bg_surface := sdk.theme_color(.BgSurface);
+    bg_header  := sdk.theme_color(.BgHeader);
+    bg_hover   := sdk.theme_color(.BgHover);
+    bg_sel     := sdk.theme_color(.BgSelection);
+    border     := sdk.theme_color(.Border);
+    txt_pri    := sdk.theme_color(.TextPrimary);
+    txt_sec    := sdk.theme_color(.TextSecondary);
+    txt_dis    := sdk.theme_color(.TextDisabled);
+    accent     := sdk.theme_color(.Accent);
+    c_ok       := sdk.theme_color(.Success);
+    c_warn     := sdk.theme_color(.Warning);
+    c_err      := sdk.theme_color(.Error);
+    c_info     := sdk.theme_color(.Info);
+
+    pad: f32 = 8.0f;
+    w := ctx.width;
+    h := ctx.height;
+
+    // -------------------------------------------------------------------------
+    // 1. Top Toolbar: Status Pill + Debug Control Buttons
+    // -------------------------------------------------------------------------
+    tb_y: f32 = 6.0f;
+    tb_h: f32 = 26.0f;
+    cx: f32 = pad;
+
+    st_lbl := "IDLE";
+    st_bg  := bg_surface;
+    st_fg  := txt_sec;
+    switch self.status {
+        case .Paused  { st_lbl = "PAUSED"; st_bg = 0xF9E2AF33; st_fg = c_warn; }
+        case .Running { st_lbl = "RUN";    st_bg = 0xA6E3A133; st_fg = c_ok;   }
+        case .Exited  { st_lbl = "EXITED"; st_bg = 0x89B4FA33; st_fg = c_info; }
+        case .Error   { st_lbl = "ERROR";  st_bg = 0xF38BA833; st_fg = c_err;  }
+        case _ {}
+    }
+    pw := sdk.pill(cx, tb_y + 3.0f, st_lbl, st_bg, st_fg);
+    cx += pw + 8.0f;
+
+    is_paused := self.status == .Paused;
+    start_lbl := "Cont" if is_paused else "Start";
+    sdk.on_click(100, cx, tb_y, 52.0f, tb_h, start_lbl, .Primary) {
+        if is_paused do sdk.debug_command(.Continue);
+        else         do sdk.debug_start(self.source_path);
+        self.needs_sync = true;
+    };
+    cx += 56.0f;
+
+    step_style := abi.ButtonFlags.{} if is_paused else abi.ButtonFlags.Disabled;
+    sdk.on_click(101, cx, tb_y, 46.0f, tb_h, "Step", step_style) {
+        if is_paused { sdk.debug_command(.StepOver); self.needs_sync = true; }
+    };
+    cx += 50.0f;
+
+    sdk.on_click(102, cx, tb_y, 46.0f, tb_h, "WAT", step_style) {
+        if is_paused { sdk.debug_command(.StepInstruction); self.needs_sync = true; }
+    };
+    cx += 50.0f;
+
+    sdk.on_click(103, cx, tb_y, 34.0f, tb_h, "In", step_style) {
+        if is_paused { sdk.debug_command(.StepInto); self.needs_sync = true; }
+    };
+    cx += 38.0f;
+
+    sdk.on_click(104, cx, tb_y, 38.0f, tb_h, "Out", step_style) {
+        if is_paused { sdk.debug_command(.StepOut); self.needs_sync = true; }
+    };
+    cx += 42.0f;
+
+    stop_style := abi.ButtonFlags.Danger if is_paused else abi.ButtonFlags.Disabled;
+    sdk.on_click(105, cx, tb_y, 44.0f, tb_h, "Stop", stop_style) {
+        if is_paused { sdk.debug_command(.Stop); self.needs_sync = true; }
+    };
+    cx += 50.0f;
+
+    if self.current_func.count > 0 && cx + 60.0f < w {
+        sdk.draw_text(cx + 4.0f, tb_y + 6.0f, tprintf("{}()", self.current_func), 12.5f, accent, .Bold);
+    }
+
+    sdk.draw_line(0.0f, 38.0f, w, 38.0f, 1.0f, border);
+
+    // -------------------------------------------------------------------------
+    // 2. Side-by-Side Split View: Onyx Source (Left) | Mapped WAT (Right)
+    // -------------------------------------------------------------------------
+    bottom_h: f32 = 82.0f;
+    split_y:  f32 = 42.0f;
+    split_h:  f32 = h - split_y - bottom_h - 6.0f;
+    if split_h < 80.0f do split_h = 80.0f;
+
+    gap: f32 = 6.0f;
+    half_w: f32 = (w - pad * 2.0f - gap) * 0.5f;
+    if half_w < 80.0f do half_w = 80.0f;
+
+    left_x:  f32 = pad;
+    right_x: f32 = pad + half_w + gap;
+    hdr_h:   f32 = 22.0f;
+    body_y:  f32 = split_y + hdr_h;
+    body_h:  f32 = split_h - hdr_h;
+    if body_h < 40.0f do body_h = 40.0f;
+
+    row_h: f32 = 18.0f;
+
+    // Auto-scroll both panes to keep active Onyx line and active WAT instruction in view
+    if self.auto_scroll_req {
+        self.auto_scroll_req = false;
+        if self.current_line > 0 {
+            ty := cast(f32) (self.current_line - 1) * row_h - body_h * 0.35f;
+            if ty < 0.0f do ty = 0.0f;
+            self.src_scroll_y = ty;
+        }
+        if self.current_wat_line >= 0 {
+            wy := cast(f32) self.current_wat_line * row_h - body_h * 0.35f;
+            if wy < 0.0f do wy = 0.0f;
+            self.wat_scroll_y = wy;
+        }
+    }
+
+    // Shift+Wheel horizontal scroll on hovered half
+    if (ctx.flags & abi.FRAME_FLAG_HOVERED) != 0 && ctx.wheel_y != 0.0f && (ctx.key_mods & cast(u32) abi.KeyMod.Shift) != 0 {
+        if ctx.mouse_x < right_x {
+            self.src_scroll_x -= ctx.wheel_y * 36.0f;
+            if self.src_scroll_x < 0.0f do self.src_scroll_x = 0.0f;
+        } else {
+            self.wat_scroll_x -= ctx.wheel_y * 36.0f;
+            if self.wat_scroll_x < 0.0f do self.wat_scroll_x = 0.0f;
+        }
+    }
+
+    // ---- LEFT PANE: Onyx Source + Clickable Breakpoint Gutter ----
+    sdk.draw_rect(left_x, split_y, half_w, split_h, bg_surface, 4.0f, border, 1.0f);
+    sdk.draw_rect(left_x, split_y, half_w, hdr_h, bg_header, 4.0f);
+    src_hdr := tprintf("Onyx: {}", self.source_path if self.source_path.count > 0 else "(none)");
+    sdk.clipped(left_x + 6.0f, split_y, half_w - 12.0f, hdr_h) {
+        sdk.draw_text(left_x + 6.0f, split_y + 4.0f, src_hdr, 11.5f, txt_sec, .Bold);
+    };
+
+    src_content_h := cast(f32) self.src_lines.count * row_h + 12.0f;
+    sdk.scroll_area(200, left_x + 1.0f, body_y, half_w - 2.0f, body_h - 1.0f, src_content_h, &self.src_scroll_y) {
+        gutter_w: f32 = 42.0f;
+        first_i := cast(i32) (self.src_scroll_y / row_h);
+        if first_i < 0 do first_i = 0;
+        last_i := first_i + cast(i32) (body_h / row_h) + 3;
+        if last_i > self.src_lines.count do last_i = self.src_lines.count;
+
+        for li in first_i .. last_i {
+            line_1 := cast(u32) (li + 1);
+            ry := body_y + cast(f32) li * row_h;
+            is_cur := is_paused && line_1 == self.current_line;
+            is_bp  := has_bp(self, line_1);
+
+            hov, clk := sdk.row_hit(ctx, left_x + 1.0f, ry, half_w - 2.0f, row_h, self.src_scroll_y);
+            if clk && self.source_path.count > 0 {
+                sdk.debug_toggle_breakpoint(self.source_path, line_1);
+                refresh_breakpoints(self);
+            }
+
+            if is_cur {
+                sdk.draw_rect(left_x + 1.0f, ry, half_w - 2.0f, row_h, 0xF9E2AF28);
+            } elseif hov {
+                sdk.draw_rect(left_x + 1.0f, ry, half_w - 2.0f, row_h, bg_hover);
+            }
+
+            // Breakpoint red dot or current-line marker
+            if is_bp {
+                sdk.draw_circle(left_x + 10.0f, ry + row_h * 0.5f, 4.0f, c_err);
+            }
+            if is_cur {
+                sdk.draw_text(left_x + 16.0f, ry + 2.0f, ">", 12.0f, c_warn, .Bold);
+            }
+
+            // Line number
+            lnum := tprintf("{}", line_1);
+            sdk.draw_text(left_x + 22.0f, ry + 3.0f, lnum, 11.0f, txt_pri if is_cur else txt_dis, .Mono);
+
+            // Source text (horizontally scrollable & clipped past gutter)
+            sdk.clipped(left_x + gutter_w, ry, half_w - gutter_w - 4.0f, row_h) {
+                sdk.draw_text(left_x + gutter_w + 4.0f - self.src_scroll_x, ry + 2.0f, self.src_lines[li], 12.0f, txt_pri, .Mono);
+            };
+        }
+    };
+
+    // ---- RIGHT PANE: Mapped WASM (.wat) Instructions ----
+    sdk.draw_rect(right_x, split_y, half_w, split_h, bg_surface, 4.0f, border, 1.0f);
+    sdk.draw_rect(right_x, split_y, half_w, hdr_h, bg_header, 4.0f);
+    wat_hdr := tprintf("WASM (.wat) {}", tprintf("L{}", self.current_wat_line + 1) if self.current_wat_line >= 0 else "");
+    sdk.clipped(right_x + 6.0f, split_y, half_w - 12.0f, hdr_h) {
+        sdk.draw_text(right_x + 6.0f, split_y + 4.0f, wat_hdr, 11.5f, c_info, .Bold);
+    };
+
+    wat_range_s, wat_range_e := find_active_wat_range(self);
+
+    if self.wat_lines.count == 0 {
+        sdk.draw_text(right_x + 10.0f, body_y + 12.0f, "Click a line on the left to set a", 12.0f, txt_sec);
+        sdk.draw_text(right_x + 10.0f, body_y + 30.0f, "breakpoint, then press Start (F5).", 12.0f, txt_sec);
+    } else {
+        wat_content_h := cast(f32) self.wat_lines.count * row_h + 12.0f;
+        sdk.scroll_area(201, right_x + 1.0f, body_y, half_w - 2.0f, body_h - 1.0f, wat_content_h, &self.wat_scroll_y) {
+            first_w := cast(i32) (self.wat_scroll_y / row_h);
+            if first_w < 0 do first_w = 0;
+            last_w := first_w + cast(i32) (body_h / row_h) + 3;
+            if last_w > self.wat_lines.count do last_w = self.wat_lines.count;
+
+            for wi in first_w .. last_w {
+                ry := body_y + cast(f32) wi * row_h;
+                is_cur_w   := is_paused && wi == self.current_wat_line;
+                in_mapped  := is_paused && wat_range_s >= 0 && wi >= wat_range_s && wi <= wat_range_e;
+
+                if is_cur_w {
+                    sdk.draw_rect(right_x + 1.0f, ry, half_w - 2.0f, row_h, 0x89B4FA38);
+                } elseif in_mapped {
+                    sdk.draw_rect(right_x + 1.0f, ry, half_w - 2.0f, row_h, bg_sel);
+                }
+
+                if is_cur_w {
+                    sdk.draw_text(right_x + 5.0f, ry + 2.0f, ">", 12.0f, c_info, .Bold);
+                }
+
+                sdk.clipped(right_x + 16.0f, ry, half_w - 20.0f, row_h) {
+                    col := wat_line_color(self.wat_lines[wi]);
+                    sdk.draw_text(right_x + 18.0f - self.wat_scroll_x, ry + 2.0f, self.wat_lines[wi], 12.0f, col, .Mono);
+                };
+            }
+        };
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Bottom Strip: Locals / Params & Breakpoints Summary
+    // -------------------------------------------------------------------------
+    bot_y := split_y + split_h + 6.0f;
+    sdk.draw_rect(pad, bot_y, w - pad * 2.0f, bottom_h - 4.0f, bg_surface, 4.0f, border, 1.0f);
+
+    hdr_str := tprintf("Locals & Params ({})  |  Breakpoints: {}  |  F9:BP  F5:Start/Cont  F10:Step  F11:WAT",
+                       self.locals.count, self.breakpoints.count);
+    sdk.clipped(pad + 6.0f, bot_y, w - pad * 2.0f - 12.0f, 20.0f) {
+        sdk.draw_text(pad + 8.0f, bot_y + 5.0f, hdr_str, 11.0f, txt_sec, .Bold);
+    };
+    sdk.draw_line(pad + 6.0f, bot_y + 22.0f, w - pad - 6.0f, bot_y + 22.0f, 1.0f, border);
+
+    if self.last_error.count > 0 {
+        sdk.clipped(pad + 8.0f, bot_y + 26.0f, w - pad * 2.0f - 16.0f, bottom_h - 32.0f) {
+            sdk.draw_text(pad + 8.0f, bot_y + 28.0f, self.last_error, 12.0f, c_err, .Mono);
+        };
+    } elseif self.locals.count == 0 {
+        sdk.draw_text(pad + 8.0f, bot_y + 30.0f, "No active stack frame. Set a breakpoint (click line or F9) and press Start (F5).", 11.5f, txt_dis);
+    } else {
+        lx: f32 = pad + 8.0f;
+        ly: f32 = bot_y + 28.0f;
+        max_x := w - pad - 8.0f;
+        for &v in self.locals {
+            chip := tprintf("{}: {}", v.name, v.type);
+            cw := sdk.measure_text(chip, 11.5f) + 18.0f;
+            if lx + cw > max_x {
+                lx = pad + 8.0f;
+                ly += 24.0f;
+                if ly > bot_y + bottom_h - 24.0f do break;
+            }
+            bg_c := 0xCBA6F728 if str.equal(v.value, "param") else 0x89B4FA22;
+            fg_c := accent if str.equal(v.value, "param") else c_info;
+            w_used := sdk.pill(lx, ly, chip, bg_c, fg_c);
+            lx += w_used + 6.0f;
+        }
+    }
+}

@@ -12,6 +12,7 @@
 #load "./theme.onyx"
 #load "./services/workspace.onyx"
 #load "./services/compiler_wat.onyx"
+#load "./services/debugger.onyx"
 #load "./services/docs_index.onyx"
 #load "./wm/layout.onyx"
 #load "./lsp/client.onyx"
@@ -205,6 +206,11 @@ register_builtin_commands :: () {
     ui.palette_register(&g_app.palette, "wm.reset_layout",      "Window: Reset Workspace Layout",         "",         0);
     ui.palette_register(&g_app.palette, "wm.close_focused",     "Window: Close Focused Plugin Pane",      "",         0);
     ui.palette_register(&g_app.palette, "plugin.reload_all",    "Plugins: Reload All .wasm Plugins",      "",         0);
+    ui.palette_register(&g_app.palette, "debug.start",          "Debug: Start / Continue Session",        "F5",       0);
+    ui.palette_register(&g_app.palette, "debug.toggle_bp",      "Debug: Toggle Breakpoint on Line",       "F9",       0);
+    ui.palette_register(&g_app.palette, "debug.step_over",      "Debug: Step Over (Onyx Line)",           "F10",      0);
+    ui.palette_register(&g_app.palette, "debug.step_wat",       "Debug: Step WAT Instruction",            "F11",      0);
+    ui.palette_register(&g_app.palette, "debug.stop",           "Debug: Stop Session",                    "Shift+F5", 0);
 }
 
 apply_live_settings :: () {
@@ -327,6 +333,25 @@ execute_command :: (cmd: &ui.CommandEntry) {
         }
     } elseif str.equal(cmd.id, "plugin.reload_all") {
         reload_all_plugins();
+    } elseif str.equal(cmd.id, "debug.start") {
+        if services.g_dbg.status == .Paused {
+            services.dbg_command(.Continue, g_app.ed.buf.version);
+        } else {
+            rc := services.dbg_start("", g_app.ed.buf.path, cast(u32) (g_app.ed.buf.cursor_line + 1), g_app.ed.buf.version);
+            if rc != 0 do wm.wm_notify(&g_app.window_mgr, 3, services.g_dbg.last_error);
+            else       do wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Debugger paused in {}()", services.g_dbg.current_func));
+        }
+    } elseif str.equal(cmd.id, "debug.toggle_bp") {
+        ln := cast(u32) (g_app.ed.buf.cursor_line + 1);
+        added := services.dbg_toggle_breakpoint(g_app.ed.buf.path, ln);
+        wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("{} breakpoint at {}:{}", "Set" if added != 0 else "Removed", g_app.ed.buf.path, ln));
+    } elseif str.equal(cmd.id, "debug.step_over") {
+        services.dbg_command(.StepOver, g_app.ed.buf.version);
+    } elseif str.equal(cmd.id, "debug.step_wat") {
+        services.dbg_command(.StepInstruction, g_app.ed.buf.version);
+    } elseif str.equal(cmd.id, "debug.stop") {
+        services.dbg_command(.Stop, g_app.ed.buf.version);
+        wm.wm_notify(&g_app.window_mgr, 1, "Debugger stopped");
     } elseif str.starts_with(cmd.id, "plugin.spawn.") {
         fname := cmd.id["plugin.spawn.".count .. cmd.id.count];
         wasm_path := core.tprintf("{}/{}", g_app.plugins_dir, fname);
@@ -354,6 +379,17 @@ sync_diagnostic_gutter_markers :: () {
         if d.severity == 1 do kind = cast(u32) abi.GutterMarkerKind.DiagnosticErr;
         col  := theme.get_color(.Error) if d.severity == 1 else theme.get_color(.Warning);
         editor.buffer_set_gutter_marker(&g_app.ed.buf, d.path, d.line, kind, col);
+    }
+}
+
+sync_debug_gutter_markers :: () {
+    editor.buffer_clear_gutter_markers(&g_app.ed.buf, cast(u32) abi.GutterMarkerKind.Breakpoint);
+    editor.buffer_clear_gutter_markers(&g_app.ed.buf, cast(u32) abi.GutterMarkerKind.DebugCurrent);
+    for &bp in services.g_dbg.breakpoints {
+        editor.buffer_set_gutter_marker(&g_app.ed.buf, bp.path, bp.line, cast(u32) abi.GutterMarkerKind.Breakpoint, theme.get_color(.Error));
+    }
+    if services.g_dbg.status == .Paused && services.g_dbg.current_line > 0 {
+        editor.buffer_set_gutter_marker(&g_app.ed.buf, services.g_dbg.source_path, services.g_dbg.current_line, cast(u32) abi.GutterMarkerKind.DebugCurrent, theme.get_color(.Warning));
     }
 }
 
@@ -411,6 +447,7 @@ run_headless_selftest :: () {
     ui.palette_init(&g_app.palette);
     editor.buffer_init(&g_app.ed.buf);
     editor.buffer_load_file(&g_app.ed.buf, "src/settings.onyx");
+    services.dbg_init();
 
     lsp.lsp_init(&g_app.lsp_client);
     lsp_started := lsp.lsp_start(&g_app.lsp_client);
@@ -680,6 +717,39 @@ run_headless_selftest :: () {
     }
     println("[odit] PASS: Advent of Code WASM plugin spawned, persisted state & rendered with 0 traps!");
 
+    // 6) Live Debugger plugin: spawn, toggle BP, start session, step WAT, and render with 0 traps
+    wid_dbg := spawn_plugin_from_wasm("build/plugins/debugger.wasm");
+    if wid_dbg == 0 {
+        println("[odit] FAIL: could not spawn build/plugins/debugger.wasm");
+        os.exit(1);
+    }
+    services.dbg_toggle_breakpoint("src/settings.onyx", 28);
+    if services.dbg_start("src/settings.onyx", "src/settings.onyx", 28, 1) != 0 {
+        printf("[odit] FAIL: debugger failed to start: {}\n", services.g_dbg.last_error);
+        os.exit(1);
+    }
+    dbg_js := services.dbg_get_state_json(context.temp_allocator);
+    broadcast_event(.DebugStateChanged, .DebugStateChanged, dbg_js);
+    if dp := wm.wm_find_pane(&g_app.window_mgr, wid_dbg); dp != null {
+        if lp := find_loaded_plugin(dp.plugin_handle); lp != null {
+            ui.ui_begin_pane(wid_dbg, 0, 0, 580, 440, true, true);
+            fctx := abi.FrameContext.{
+                window_id = wid_dbg, width = 580, height = 440,
+                mouse_x = 10, mouse_y = 10, flags = abi.FRAME_FLAG_FOCUSED | abi.FRAME_FLAG_HOVERED,
+                delta_time = 0.016f,
+            };
+            plugin.plugin_render_with_ctx(lp, wid_dbg, &fctx);
+            ui.ui_end_pane();
+            if err := plugin.host_last_error(); err.count > 0 {
+                printf("[odit] FAIL: Live Debugger plugin trapped on render: {}\n", err);
+                os.exit(1);
+            }
+        }
+    }
+    services.dbg_command(.Stop, 1);
+    println("[odit] PASS: Live Debugger WASM plugin started, mapped WAT & rendered with 0 traps!");
+
+    close_plugin_window(wid_dbg);
     close_plugin_window(wid_aoc);
     close_plugin_window(wid_w);
     close_plugin_window(wid_doc);
@@ -687,7 +757,7 @@ run_headless_selftest :: () {
     close_plugin_window(wid_br);
     close_plugin_window(wid_fe);
     lsp.lsp_shutdown(&g_app.lsp_client);
-    println("[odit] PASS: All 5 WASM plugins + Onyx LSP + WAT Disassembly + Core Docs self-test succeeded!");
+    println("[odit] PASS: All 7 WASM plugins + Onyx LSP + WAT Disassembly + Live Debugger self-test succeeded!");
 }
 
 render_plugin_pane :: (
@@ -820,6 +890,7 @@ main :: (args: [] cstr) {
     lsp.lsp_init(&g_app.lsp_client);
     defer lsp.lsp_shutdown(&g_app.lsp_client);
     lsp.lsp_start(&g_app.lsp_client);
+    services.dbg_init();
 
     plugin.host_abi_bind(g_app.workspace_root, &g_app.window_mgr, &g_app.ed, &g_app.palette, &g_app.lsp_client);
     register_builtin_commands();
@@ -901,6 +972,26 @@ main :: (args: [] cstr) {
             g_app.settings_view.open = !g_app.settings_view.open;
         } elseif raylib.IsKeyPressed(.F8) {
             jump_next_diagnostic();
+        } elseif raylib.IsKeyPressed(.F9) {
+            ln := cast(u32) (g_app.ed.buf.cursor_line + 1);
+            added := services.dbg_toggle_breakpoint(g_app.ed.buf.path, ln);
+            wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("{} breakpoint at {}:{}", "Set" if added != 0 else "Removed", g_app.ed.buf.path, ln));
+        } elseif raylib.IsKeyPressed(.F5) {
+            shift := raylib.IsKeyDown(.LEFT_SHIFT) || raylib.IsKeyDown(.RIGHT_SHIFT);
+            if shift {
+                services.dbg_command(.Stop, g_app.ed.buf.version);
+                wm.wm_notify(&g_app.window_mgr, 1, "Debugger stopped");
+            } elseif services.g_dbg.status == .Paused {
+                services.dbg_command(.Continue, g_app.ed.buf.version);
+            } else {
+                rc := services.dbg_start("", g_app.ed.buf.path, cast(u32) (g_app.ed.buf.cursor_line + 1), g_app.ed.buf.version);
+                if rc != 0 do wm.wm_notify(&g_app.window_mgr, 3, services.g_dbg.last_error);
+                else       do wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Debugger paused in {}()", services.g_dbg.current_func));
+            }
+        } elseif raylib.IsKeyPressed(.F10) && services.g_dbg.status == .Paused {
+            services.dbg_command(.StepOver, g_app.ed.buf.version);
+        } elseif raylib.IsKeyPressed(.F11) && services.g_dbg.status == .Paused {
+            services.dbg_command(.StepInstruction, g_app.ed.buf.version);
         } elseif ctrl && (raylib.IsKeyPressed(.EQUAL) || raylib.IsKeyPressed(.KP_ADD)) {
             adjust_font_size(2.0f);
         } elseif ctrl && (raylib.IsKeyPressed(.MINUS) || raylib.IsKeyPressed(.KP_SUBTRACT)) {
@@ -932,6 +1023,10 @@ main :: (args: [] cstr) {
 
         // Update core code editor
         ed_ev := editor.editor_update(&g_app.ed, g_app.window_mgr.editor_content, editor_focused, dt, editor_mouse_blocked, &g_app.lsp_client);
+        if ed_ev.toggle_breakpoint_line > 0 {
+            added := services.dbg_toggle_breakpoint(g_app.ed.buf.path, ed_ev.toggle_breakpoint_line);
+            wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("{} breakpoint at line {}", "Set" if added != 0 else "Removed", ed_ev.toggle_breakpoint_line));
+        }
         if ed_ev.req_hover {
             lsp.lsp_request_hover(&g_app.lsp_client, g_app.ed.buf.path, g_app.ed.buf.cursor_line, g_app.ed.buf.cursor_col);
         }
@@ -1074,6 +1169,25 @@ main :: (args: [] cstr) {
             plugin.g_host_ctx.file_opened_dirty = false;
             broadcast_event(.ActiveFileChanged, .ActiveFileChanged, g_app.ed.buf.path);
             wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Opened {}", g_app.ed.buf.path));
+        }
+
+        // Sync Live Debugger gutter markers & broadcast DebugStateChanged to plugins
+        if services.g_dbg.markers_dirty {
+            services.g_dbg.markers_dirty = false;
+            sync_debug_gutter_markers();
+        }
+        if services.g_dbg.dirty {
+            services.g_dbg.dirty = false;
+            if services.g_dbg.status == .Paused && services.g_dbg.current_line > 0 && services.g_dbg.source_path.count > 0 {
+                if !str.equal(services.g_dbg.source_path, g_app.ed.buf.path) {
+                    open_file_in_editor(services.g_dbg.source_path, cast(i32) services.g_dbg.current_line, 1);
+                } else {
+                    editor.buffer_set_cursor_1based(&g_app.ed.buf, cast(i32) services.g_dbg.current_line, 1);
+                    editor.editor_ensure_cursor_visible(&g_app.ed, g_app.window_mgr.editor_content.h);
+                }
+            }
+            dbg_js := services.dbg_get_state_json(context.temp_allocator);
+            broadcast_event(.DebugStateChanged, .DebugStateChanged, dbg_js);
         }
 
         // Draw Settings modal overlay (if open)

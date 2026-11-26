@@ -57,18 +57,20 @@ This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolc
 
 ---
 
-## Next: Phase 4 — Live Debugger & Domain-Specific Mini-Apps
+## Completed: Phase 4.1 — Live Side-by-Side Onyx <-> WASM Debugger
 
-### Host Services (`src/services/debugger.onyx`)
-- Wire opcodes `90–94` (`debug_*`):
-  - Toggle breakpoints & synchronize red gutter dots via `editor_set_gutter_marker`.
-  - Compile active entry with `onyx build --debug --generate-name-section --print-function-mappings` and launch under OVM debug socket (`onyx_run_wasm_with_debug` or `onyx run --debug`).
-  - Map active Onyx source line to its corresponding WAT instruction range (`SourceWatMap`).
+- [x] **Host Debugger Service (`src/services/debugger.onyx`) & Opcodes `90–94`**:
+  - Line breakpoint management (`debug_toggle_breakpoint`, `debug_get_breakpoints`) synchronized with red gutter dots in the core editor (via gutter click, `F9`, or inside the Debugger plugin).
+  - Compiles & disassembles target functions (`wat_get_function_raw`), maps executable Onyx source lines to WAT instruction ranges (`SourceWatMap`), parses procedure parameters & WASM `(local ...)` slots, and supports `StepOver` (`F10`), `StepInstruction` (`F11`), `StepInto`, `StepOut`, `Continue` (`F5`), and `Stop` (`Shift+F5`).
+  - Broadcasts `DebugStateChanged` events to plugins and syncs the editor cursor/gutter highlight to the paused execution line.
+- [x] **Live Debugger WASM Plugin (`plugins/debugger/main.onyx` → `build/plugins/debugger.wasm`)**:
+  - Declarative `@sdk.Plugin` split view showing Onyx source lines (with clickable breakpoint gutter) alongside syntax-colored mapped `.wat` instructions, active range highlighting, single WAT-instruction stepping, and a bottom Locals/Params inspector.
+
+## Next: Phase 4.2 — Domain-Specific Mini-Apps
 
 ### Plugins to Build (`plugins/*/main.onyx`)
-1. `plugins/debugger/main.onyx` — Breakpoint manager + side-by-side split view showing Onyx source lines mapped to WAT instructions + Step/Continue/Inspect controls.
-2. `plugins/http_routes/main.onyx` — Scans workspace `.onyx` files via `workspace_find_files` + `workspace_read_file` for HTTP route registrations and renders a `Handler | Method (pill) | Path` table; clicking a row jumps to the handler definition.
-3. `plugins/orm_schema/main.onyx` — Scans structs annotated/mapped to database tables and renders visual schema cards (`Table Name`, field names, and Onyx types).
+1. `plugins/http_routes/main.onyx` — Scans workspace `.onyx` files via `workspace_find_files` + `workspace_read_file` for HTTP route registrations and renders a `Handler | Method (pill) | Path` table; clicking a row jumps to the handler definition.
+2. `plugins/orm_schema/main.onyx` — Scans structs annotated/mapped to database tables and renders visual schema cards (`Table Name`, field names, and Onyx types).
 
 ---
 

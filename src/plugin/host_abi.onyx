@@ -573,9 +573,38 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
             }
         }
 
-        // Phase 4 debugger services (return clean AbiError.NotReady until wired)
-        case 90, 91, 92, 93, 94 {
-            ret_i32(cast(i32) abi.AbiError.NotReady);
+        // ---- E. Live Debugger (90..94) ----
+        case 90 { // debug_toggle_breakpoint(path_ptr, path_len, line) -> u32
+            path := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            if path.count == 0 do path = g_host_ctx.ed.buf.path;
+            ret_u32(services.dbg_toggle_breakpoint(path, arg_u32(2)));
+        }
+
+        case 91 { // debug_get_breakpoints(path_ptr, path_len, out_ptr, out_cap) -> i32
+            path := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            js := services.dbg_get_breakpoints_json(path, context.temp_allocator);
+            ret_i32(guest_write_out(handle, js, arg_u32(2), arg_u32(3)));
+        }
+
+        case 92 { // debug_start(entry_ptr, entry_len) -> i32
+            entry := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            rc := services.dbg_start(
+                entry,
+                g_host_ctx.ed.buf.path,
+                cast(u32) (g_host_ctx.ed.buf.cursor_line + 1),
+                g_host_ctx.ed.buf.version
+            );
+            ret_i32(rc);
+        }
+
+        case 93 { // debug_command(cmd) -> i32
+            rc := services.dbg_command(cast(abi.DebugCommand) arg_u32(0), g_host_ctx.ed.buf.version);
+            ret_i32(rc);
+        }
+
+        case 94 { // debug_get_state(out_ptr, out_cap) -> i32
+            js := services.dbg_get_state_json(context.temp_allocator);
+            ret_i32(guest_write_out(handle, js, arg_u32(0), arg_u32(1)));
         }
 
         case _ {

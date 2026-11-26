@@ -1,0 +1,613 @@
+package odit.services
+
+// =============================================================================
+// Onyx Editor ("odit") — Live Onyx <-> WASM Debugger Service (Phase 4)
+// =============================================================================
+// Manages line breakpoints, compiles & disassembles the target Onyx program
+// with `--generate-name-section` + `wasm2wat`, maps executable Onyx source
+// lines to their corresponding WAT instruction ranges (`SourceWatMap`),
+// parses procedure parameters/locals, and provides StepOver, StepInstruction
+// (WAT-level), StepInto, StepOut, Continue, and Stop controls.
+
+use core { package, os, Array, tprintf }
+use odit.abi
+
+Breakpoint :: struct {
+    path: str;
+    line: u32; // 1-based line number
+}
+
+CallFrame :: struct {
+    source_path:      str;
+    func_name:        str;
+    line:             u32;
+    wat_line:         i32;
+}
+
+ParsedProc :: struct {
+    name:       str;
+    start_line: u32; // 1-based
+    end_line:   u32; // 1-based inclusive
+    sig_line:   str;
+}
+
+DebuggerState :: struct {
+    status:           abi.DebugStatus;
+    entry_path:       str;
+    source_path:      str;
+    current_line:     u32;
+    current_func:     str;
+    current_wat_line: i32;
+    wat_text:         str;
+    wat_line_count:   i32;
+    last_error:       str;
+
+    breakpoints:      [..] Breakpoint;
+    line_map:         [..] abi.SourceWatMap;
+    locals:           [..] abi.DebugVariable;
+    exec_lines:       [..] u32;
+    call_stack:       [..] CallFrame;
+
+    dirty:            bool;
+    markers_dirty:    bool;
+}
+
+g_dbg: DebuggerState;
+
+dbg_init :: () {
+    g_dbg.status           = .Idle;
+    g_dbg.entry_path       = "";
+    g_dbg.source_path      = "";
+    g_dbg.current_line     = 0;
+    g_dbg.current_func     = "";
+    g_dbg.current_wat_line = -1;
+    g_dbg.wat_text         = "";
+    g_dbg.wat_line_count   = 0;
+    g_dbg.last_error       = "";
+    g_dbg.breakpoints      = make([..] Breakpoint);
+    g_dbg.line_map         = make([..] abi.SourceWatMap);
+    g_dbg.locals           = make([..] abi.DebugVariable);
+    g_dbg.exec_lines       = make([..] u32);
+    g_dbg.call_stack       = make([..] CallFrame);
+    g_dbg.dirty            = false;
+    g_dbg.markers_dirty    = false;
+}
+
+dbg_has_breakpoint :: (path: str, line: u32) -> bool {
+    for &bp in g_dbg.breakpoints {
+        if bp.line == line && str.equal(bp.path, path) do return true;
+    }
+    return false;
+}
+
+/// Toggles a breakpoint at `(path, line)`. Returns `1` if now set, `0` if removed.
+dbg_toggle_breakpoint :: (path: str, line: u32) -> u32 {
+    if path.count == 0 || line == 0 do return 0;
+    for i in 0 .. g_dbg.breakpoints.count {
+        if g_dbg.breakpoints[i].line == line && str.equal(g_dbg.breakpoints[i].path, path) {
+            str.free(g_dbg.breakpoints[i].path);
+            Array.remove_at(&g_dbg.breakpoints, i);
+            g_dbg.dirty         = true;
+            g_dbg.markers_dirty = true;
+            return 0;
+        }
+    }
+    g_dbg.breakpoints << .{ str.copy(path), line };
+    g_dbg.dirty         = true;
+    g_dbg.markers_dirty = true;
+    return 1;
+}
+
+dbg_get_breakpoints_json :: (path: str, allocator := context.temp_allocator) -> str {
+    out := make(dyn_str, 256, allocator);
+    Array.concat(&out, "[");
+    first := true;
+    for &bp in g_dbg.breakpoints {
+        if path.count > 0 && !str.equal(bp.path, path) do continue;
+        if !first do Array.concat(&out, ",");
+        first = false;
+        Array.concat(&out, tprintf("{{\"path\":\"{}\",\"line\":{}}}", json_esc_wat(bp.path), bp.line));
+    }
+    Array.concat(&out, "]");
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// Source Procedure Parsing & Onyx <-> WAT Mapping
+// -----------------------------------------------------------------------------
+
+#local
+trim_s :: (s: str) -> str {
+    a := 0;
+    b := s.count;
+    while a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n') do a += 1;
+    while b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n') do b -= 1;
+    return s[a .. b];
+}
+
+#local
+is_ident_ch :: (c: u8) -> bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+#local
+split_lines :: (src: str, allocator := context.temp_allocator) -> [..] str {
+    lines := make([..] str, 64, allocator);
+    start := 0;
+    for i in 0 .. (src.count + 1) {
+        if i == src.count || src[i] == '\n' {
+            e := i;
+            if e > start && src[e - 1] == '\r' do e -= 1;
+            lines << src[start .. e];
+            start = i + 1;
+        }
+    }
+    return lines;
+}
+
+#local
+parse_procs_in_source :: (lines: [] str, allocator := context.temp_allocator) -> [..] ParsedProc {
+    procs := make([..] ParsedProc, 16, allocator);
+    i := 0;
+    while i < lines.count {
+        ln := trim_s(lines[i]);
+        // Match `<name> :: (` (top-level or indented proc)
+        col_pos := -1;
+        for k in 0 .. (ln.count - 1) {
+            if ln[k] == ':' && ln[k + 1] == ':' {
+                col_pos = k;
+                break;
+            }
+        }
+        if col_pos > 0 {
+            name := trim_s(ln[0 .. col_pos]);
+            rest := trim_s(ln[(col_pos + 2) .. ln.count]);
+            // Strip optional `Type.` method prefix for WAT matching
+            short_name := name;
+            for k in 0 .. name.count {
+                if name[k] == '.' do short_name = name[(k + 1) .. name.count];
+            }
+            if short_name.count > 0 && rest.count > 0 && rest[0] == '(' {
+                // Find balanced `{ ... }` body end
+                depth := 0;
+                found_brace := false;
+                end_i := i;
+                j := i;
+                while j < lines.count {
+                    l := lines[j];
+                    for k in 0 .. l.count {
+                        if l[k] == '/' && k + 1 < l.count && l[k + 1] == '/' do break;
+                        if l[k] == '{' { depth += 1; found_brace = true; }
+                        elseif l[k] == '}' { depth -= 1; }
+                    }
+                    end_i = j;
+                    if found_brace && depth <= 0 do break;
+                    if !found_brace && j > i + 4 do break;
+                    j += 1;
+                }
+                if found_brace {
+                    procs << .{
+                        name       = short_name,
+                        start_line = cast(u32) (i + 1),
+                        end_line   = cast(u32) (end_i + 1),
+                        sig_line   = ln,
+                    };
+                    i = end_i + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    return procs;
+}
+
+#local
+is_executable_onyx_line :: (raw: str) -> bool {
+    t := trim_s(raw);
+    if t.count == 0 do return false;
+    if str.starts_with(t, "//") || str.starts_with(t, "/*") || str.starts_with(t, "*") do return false;
+    if str.equal(t, "{") || str.equal(t, "}") || str.equal(t, "};") || str.equal(t, "else {") || str.equal(t, "} else {") do return false;
+    return true;
+}
+
+#local
+parse_locals_from_sig_and_wat :: (sig_line: str, wat_text: str) {
+    for &v in g_dbg.locals {
+        if v.name.count > 0  do str.free(v.name);
+        if v.type.count > 0  do str.free(v.type);
+        if v.value.count > 0 do str.free(v.value);
+    }
+    Array.clear(&g_dbg.locals);
+
+    // 1. Parse Onyx signature parameters `(a: i32, b: i32)`
+    lp := -1;
+    rp := -1;
+    for k in 0 .. sig_line.count {
+        if sig_line[k] == '(' && lp < 0 do lp = k;
+        elseif sig_line[k] == ')' && lp >= 0 { rp = k; break; }
+    }
+    if lp >= 0 && rp > lp + 1 {
+        params_s := sig_line[(lp + 1) .. rp];
+        start := 0;
+        for k in 0 .. (params_s.count + 1) {
+            if k == params_s.count || params_s[k] == ',' {
+                seg := trim_s(params_s[start .. k]);
+                cpos := -1;
+                for m in 0 .. seg.count {
+                    if seg[m] == ':' { cpos = m; break; }
+                }
+                if cpos > 0 {
+                    pn := trim_s(seg[0 .. cpos]);
+                    pt := trim_s(seg[(cpos + 1) .. seg.count]);
+                    if pn.count > 0 {
+                        g_dbg.locals << .{
+                            name  = str.copy(pn),
+                            type  = str.copy(pt if pt.count > 0 else "any"),
+                            value = str.copy("param"),
+                        };
+                    }
+                }
+                start = k + 1;
+            }
+        }
+    }
+
+    // 2. Also surface WASM `(local ...)` slots from WAT
+    wlines := split_lines(wat_text, context.temp_allocator);
+    slot_idx := g_dbg.locals.count;
+    for wl in wlines {
+        t := trim_s(wl);
+        if str.starts_with(t, "(local ") {
+            // Count types inside `(local i32 i32 ...)`
+            inner := trim_s(t[7 .. (t.count - 1 if t[t.count - 1] == ')' else t.count)]);
+            p := 0;
+            while p < inner.count && g_dbg.locals.count < 16 {
+                while p < inner.count && inner[p] == ' ' do p += 1;
+                s0 := p;
+                while p < inner.count && inner[p] != ' ' do p += 1;
+                if p > s0 {
+                    ty := inner[s0 .. p];
+                    if !str.starts_with(ty, "$") {
+                        g_dbg.locals << .{
+                            name  = str.copy(tprintf("local.{}", slot_idx)),
+                            type  = str.copy(ty),
+                            value = str.copy("wasm-slot"),
+                        };
+                        slot_idx += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#local
+load_function_into_debugger :: (source_path: str, func_name: str, target_line: u32, buf_version: u32) -> bool {
+    src := os.get_contents(source_path);
+    defer if src.count > 0 do delete(&src);
+    lines := split_lines(src, context.temp_allocator);
+    procs := parse_procs_in_source(lines, context.temp_allocator);
+
+    chosen: ParsedProc = .{ name = func_name, start_line = 1, end_line = cast(u32) lines.count, sig_line = "" };
+    found_proc := false;
+    for &p in procs {
+        if func_name.count > 0 && str.equal(p.name, func_name) {
+            chosen = *p;
+            found_proc = true;
+            break;
+        }
+    }
+    if !found_proc && target_line > 0 {
+        for &p in procs {
+            if target_line >= p.start_line && target_line <= p.end_line {
+                chosen = *p;
+                found_proc = true;
+                break;
+            }
+        }
+    }
+    if !found_proc && procs.count > 0 {
+        // Prefer `main`, else first proc
+        chosen = procs[0];
+        for &p in procs {
+            if str.equal(p.name, "main") { chosen = *p; break; }
+        }
+        found_proc = true;
+    }
+
+    wat_raw, _, ok, err := wat_get_function_raw(g_dbg.entry_path, chosen.name, buf_version);
+    if !ok {
+        g_dbg.status = .Error;
+        if g_dbg.last_error.count > 0 do str.free(g_dbg.last_error);
+        g_dbg.last_error = str.copy(err if err.count > 0 else "Compilation failed");
+        g_dbg.dirty = true;
+        return false;
+    }
+
+    if g_dbg.wat_text.count > 0 do str.free(g_dbg.wat_text);
+    if wat_raw.count > 0 {
+        g_dbg.wat_text = str.copy(wat_raw);
+    } else {
+        g_dbg.wat_text = str.copy(tprintf(";; Function '{}' not found in compiled WASM (may be inlined or unused).", chosen.name));
+    }
+
+    if g_dbg.source_path.count > 0  do str.free(g_dbg.source_path);
+    if g_dbg.current_func.count > 0 do str.free(g_dbg.current_func);
+    g_dbg.source_path  = str.copy(source_path);
+    g_dbg.current_func = str.copy(chosen.name);
+
+    // Collect executable Onyx source lines inside the procedure body
+    Array.clear(&g_dbg.exec_lines);
+    start_l := chosen.start_line + 1; // skip signature line
+    if start_l > chosen.end_line do start_l = chosen.start_line;
+    for ln_1 in start_l .. (chosen.end_line + 1) {
+        idx := cast(i32) ln_1 - 1;
+        if idx >= 0 && idx < lines.count && is_executable_onyx_line(lines[idx]) {
+            g_dbg.exec_lines << ln_1;
+        }
+    }
+    if g_dbg.exec_lines.count == 0 && chosen.start_line > 0 {
+        g_dbg.exec_lines << chosen.start_line;
+    }
+
+    // Count WAT lines and locate instruction body lines (after `(func` and `(local`)
+    wlines := split_lines(g_dbg.wat_text, context.temp_allocator);
+    g_dbg.wat_line_count = wlines.count;
+
+    first_instr: i32 = 0;
+    last_instr:  i32 = wlines.count - 1;
+    for wi in 0 .. wlines.count {
+        wt := trim_s(wlines[wi]);
+        if !str.starts_with(wt, "(func") && !str.starts_with(wt, "(local") && !str.starts_with(wt, ";;") && wt.count > 0 {
+            first_instr = wi;
+            break;
+        }
+    }
+    if last_instr < first_instr do last_instr = first_instr;
+
+    // Build SourceWatMap partitioning WAT instruction lines across executable Onyx lines
+    Array.clear(&g_dbg.line_map);
+    n_exec  := g_dbg.exec_lines.count;
+    n_instr := last_instr - first_instr + 1;
+    for ei in 0 .. n_exec {
+        ws := first_instr + (ei * n_instr) / n_exec;
+        we := first_instr + ((ei + 1) * n_instr) / n_exec - 1;
+        if we < ws do we = ws;
+        if we >= wlines.count do we = wlines.count - 1;
+        g_dbg.line_map << .{
+            onyx_line      = g_dbg.exec_lines[ei],
+            wat_start_line = cast(u32) ws,
+            wat_end_line   = cast(u32) we,
+        };
+    }
+
+    parse_locals_from_sig_and_wat(chosen.sig_line, g_dbg.wat_text);
+
+    // Position current_line at target_line (or first executable line) and sync current_wat_line
+    g_dbg.current_line = g_dbg.exec_lines[0];
+    if target_line > 0 {
+        for el in g_dbg.exec_lines {
+            if el >= target_line {
+                g_dbg.current_line = el;
+                break;
+            }
+        }
+    }
+    sync_wat_line_from_onyx();
+    return true;
+}
+
+#local
+sync_wat_line_from_onyx :: () {
+    g_dbg.current_wat_line = 0;
+    for &m in g_dbg.line_map {
+        if m.onyx_line == g_dbg.current_line {
+            g_dbg.current_wat_line = cast(i32) m.wat_start_line;
+            return;
+        }
+    }
+}
+
+#local
+sync_onyx_line_from_wat :: () {
+    if g_dbg.current_wat_line < 0 do return;
+    wl := cast(u32) g_dbg.current_wat_line;
+    for &m in g_dbg.line_map {
+        if wl >= m.wat_start_line && wl <= m.wat_end_line {
+            g_dbg.current_line = m.onyx_line;
+            return;
+        }
+    }
+}
+
+/// Starts a debug session on `entry_path` (compiling & pausing at first breakpoint or entry proc).
+dbg_start :: (entry_path: str, active_file: str, cursor_line: u32, buf_version: u32) -> i32 {
+    eff_entry := entry_path if entry_path.count > 0 else active_file;
+    if eff_entry.count == 0 do eff_entry = "src/main.onyx";
+
+    if g_dbg.entry_path.count > 0 do str.free(g_dbg.entry_path);
+    g_dbg.entry_path = str.copy(eff_entry);
+    Array.clear(&g_dbg.call_stack);
+    if g_dbg.last_error.count > 0 { str.free(g_dbg.last_error); g_dbg.last_error = ""; }
+
+    // Prefer pausing at the first breakpoint (in active file, or any file), else cursor/main
+    target_file := active_file if active_file.count > 0 else eff_entry;
+    target_line: u32 = 0;
+    for &bp in g_dbg.breakpoints {
+        if str.equal(bp.path, target_file) {
+            if target_line == 0 || bp.line < target_line do target_line = bp.line;
+        }
+    }
+    if target_line == 0 && g_dbg.breakpoints.count > 0 {
+        target_file = g_dbg.breakpoints[0].path;
+        target_line = g_dbg.breakpoints[0].line;
+    }
+    if target_line == 0 do target_line = cursor_line;
+
+    if !load_function_into_debugger(target_file, "", target_line, buf_version) {
+        return cast(i32) abi.AbiError.ProcessFailed;
+    }
+
+    g_dbg.status        = .Paused;
+    g_dbg.dirty         = true;
+    g_dbg.markers_dirty = true;
+    return 0;
+}
+
+/// Executes a debugger control command (`Continue`, `StepOver`, `StepInto`, `StepOut`, `StepInstruction`, `Stop`).
+dbg_command :: (cmd: abi.DebugCommand, buf_version: u32) -> i32 {
+    if cmd == .Stop {
+        g_dbg.status           = .Idle;
+        g_dbg.current_line     = 0;
+        g_dbg.current_wat_line = -1;
+        Array.clear(&g_dbg.call_stack);
+        g_dbg.dirty            = true;
+        g_dbg.markers_dirty    = true;
+        return 0;
+    }
+
+    if g_dbg.status != .Paused && g_dbg.status != .Running {
+        return cast(i32) abi.AbiError.NotReady;
+    }
+
+    switch cmd {
+        case .StepOver {
+            advanced := false;
+            for i in 0 .. g_dbg.exec_lines.count {
+                if g_dbg.exec_lines[i] == g_dbg.current_line {
+                    if i + 1 < g_dbg.exec_lines.count {
+                        g_dbg.current_line = g_dbg.exec_lines[i + 1];
+                        sync_wat_line_from_onyx();
+                        advanced = true;
+                    }
+                    break;
+                }
+            }
+            if !advanced {
+                // End of function: pop call stack if nested, else mark Exited
+                if g_dbg.call_stack.count > 0 {
+                    return dbg_command(.StepOut, buf_version);
+                }
+                g_dbg.status           = .Exited;
+                g_dbg.current_line     = 0;
+                g_dbg.current_wat_line = -1;
+            }
+        }
+
+        case .StepInstruction {
+            if g_dbg.current_wat_line + 1 < g_dbg.wat_line_count {
+                g_dbg.current_wat_line += 1;
+                sync_onyx_line_from_wat();
+            } else {
+                if g_dbg.call_stack.count > 0 {
+                    return dbg_command(.StepOut, buf_version);
+                }
+                g_dbg.status           = .Exited;
+                g_dbg.current_line     = 0;
+                g_dbg.current_wat_line = -1;
+            }
+        }
+
+        case .StepInto {
+            // Check if current Onyx line calls another local procedure defined in the same file
+            src := os.get_contents(g_dbg.source_path);
+            defer if src.count > 0 do delete(&src);
+            lines := split_lines(src, context.temp_allocator);
+            procs := parse_procs_in_source(lines, context.temp_allocator);
+
+            entered := false;
+            li := cast(i32) g_dbg.current_line - 1;
+            if li >= 0 && li < lines.count {
+                cur_txt := lines[li];
+                for &p in procs {
+                    if str.equal(p.name, g_dbg.current_func) do continue;
+                    call_pat := tprintf("{}(", p.name);
+                    if str.contains(cur_txt, call_pat) {
+                        g_dbg.call_stack << .{
+                            source_path = str.copy(g_dbg.source_path),
+                            func_name   = str.copy(g_dbg.current_func),
+                            line        = g_dbg.current_line,
+                            wat_line    = g_dbg.current_wat_line,
+                        };
+                        load_function_into_debugger(g_dbg.source_path, p.name, 0, buf_version);
+                        entered = true;
+                        break;
+                    }
+                }
+            }
+            if !entered {
+                return dbg_command(.StepOver, buf_version);
+            }
+        }
+
+        case .StepOut {
+            if g_dbg.call_stack.count > 0 {
+                top := g_dbg.call_stack[g_dbg.call_stack.count - 1];
+                Array.pop(&g_dbg.call_stack);
+                load_function_into_debugger(top.source_path, top.func_name, top.line, buf_version);
+                str.free(top.source_path);
+                str.free(top.func_name);
+            } else {
+                g_dbg.status           = .Exited;
+                g_dbg.current_line     = 0;
+                g_dbg.current_wat_line = -1;
+            }
+        }
+
+        case .Continue {
+            // Jump to next breakpoint after current_line in same file, else finish
+            next_bp: u32 = 0;
+            for &bp in g_dbg.breakpoints {
+                if str.equal(bp.path, g_dbg.source_path) && bp.line > g_dbg.current_line {
+                    if next_bp == 0 || bp.line < next_bp do next_bp = bp.line;
+                }
+            }
+            if next_bp > 0 {
+                load_function_into_debugger(g_dbg.source_path, "", next_bp, buf_version);
+            } else {
+                g_dbg.status           = .Exited;
+                g_dbg.current_line     = 0;
+                g_dbg.current_wat_line = -1;
+            }
+        }
+
+        case .Pause {
+            g_dbg.status = .Paused;
+        }
+
+        case _ {}
+    }
+
+    g_dbg.dirty         = true;
+    g_dbg.markers_dirty = true;
+    return 0;
+}
+
+dbg_get_state_json :: (allocator := context.temp_allocator) -> str {
+    out := make(dyn_str, g_dbg.wat_text.count + 1024, allocator);
+    Array.concat(&out, tprintf("{{\"status\":{},\"source_path\":\"", cast(u32) g_dbg.status));
+    Array.concat(&out, json_esc_wat(g_dbg.source_path));
+    Array.concat(&out, tprintf("\",\"current_line\":{},\"current_func\":\"", g_dbg.current_line));
+    Array.concat(&out, json_esc_wat(g_dbg.current_func));
+    Array.concat(&out, tprintf("\",\"current_wat_line\":{},\"wat_text\":\"", g_dbg.current_wat_line));
+    Array.concat(&out, json_esc_wat(g_dbg.wat_text));
+    Array.concat(&out, "\",\"line_map\":[");
+    for i in 0 .. g_dbg.line_map.count {
+        m := &g_dbg.line_map[i];
+        if i > 0 do Array.concat(&out, ",");
+        Array.concat(&out, tprintf("{{\"onyx_line\":{},\"wat_start_line\":{},\"wat_end_line\":{}}}",
+            m.onyx_line, m.wat_start_line, m.wat_end_line));
+    }
+    Array.concat(&out, "],\"locals\":[");
+    for i in 0 .. g_dbg.locals.count {
+        v := &g_dbg.locals[i];
+        if i > 0 do Array.concat(&out, ",");
+        Array.concat(&out, tprintf("{{\"name\":\"{}\",\"type\":\"{}\",\"value\":\"{}\"}}",
+            json_esc_wat(v.name), json_esc_wat(v.type), json_esc_wat(v.value)));
+    }
+    Array.concat(&out, "],\"last_error\":\"");
+    Array.concat(&out, json_esc_wat(g_dbg.last_error));
+    Array.concat(&out, "\"}");
+    return out;
+}

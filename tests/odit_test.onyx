@@ -14,6 +14,7 @@ package main
 #load "./../src/theme.onyx"
 #load "./../src/services/workspace.onyx"
 #load "./../src/services/compiler_wat.onyx"
+#load "./../src/services/debugger.onyx"
 #load "./../src/services/docs_index.onyx"
 #load "./../src/wm/layout.onyx"
 #load "./../src/editor/buffer.onyx"
@@ -268,6 +269,47 @@ use odit.services
 (t: &test.T) {
     wat_js := services.wat_get_function_json("src/settings.onyx", "settings_defaults", 1, context.temp_allocator);
     t->expect_contains(wat_js, "(func $settings_defaults");
+}
+
+// -----------------------------------------------------------------------------
+// 6. Live Onyx <-> WASM Debugger Service
+// -----------------------------------------------------------------------------
+
+@test.tag.{"debugger"}
+@test.it.{"Debugger toggles breakpoints and serializes breakpoints JSON"}
+(t: &test.T) {
+    services.dbg_init();
+    t->expect_eq(services.dbg_toggle_breakpoint("src/settings.onyx", 25), cast(u32) 1);
+    t->expect_true(services.dbg_has_breakpoint("src/settings.onyx", 25));
+
+    bp_js := services.dbg_get_breakpoints_json("src/settings.onyx", context.temp_allocator);
+    t->expect_contains(bp_js, "\"line\":25");
+
+    t->expect_eq(services.dbg_toggle_breakpoint("src/settings.onyx", 25), cast(u32) 0);
+    t->expect_false(services.dbg_has_breakpoint("src/settings.onyx", 25));
+}
+
+@test.tag.{"debugger"}
+@test.it.{"Debugger starts on settings.onyx, maps Onyx lines to WAT, and steps instructions"}
+(t: &test.T) {
+    services.dbg_init();
+    // Place breakpoint inside settings_defaults
+    services.dbg_toggle_breakpoint("src/settings.onyx", 28);
+    rc := services.dbg_start("src/settings.onyx", "src/settings.onyx", 28, 1);
+    t->expect_eq(rc, 0);
+    t->expect_eq(cast(u32) services.g_dbg.status, cast(u32) abi.DebugStatus.Paused);
+    t->expect_true(services.g_dbg.line_map.count > 0);
+
+    st_js := services.dbg_get_state_json(context.temp_allocator);
+    t->expect_contains(st_js, "(func $");
+    t->expect_contains(st_js, "\"line_map\":[");
+
+    w0 := services.g_dbg.current_wat_line;
+    t->expect_eq(services.dbg_command(.StepInstruction, 1), 0);
+    t->expect_true(services.g_dbg.current_wat_line >= w0);
+
+    t->expect_eq(services.dbg_command(.Stop, 1), 0);
+    t->expect_eq(cast(u32) services.g_dbg.status, cast(u32) abi.DebugStatus.Idle);
 }
 
 main :: () {

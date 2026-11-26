@@ -83,7 +83,7 @@ wat_ensure_compiled :: (file_path: str, buf_version: u32) -> bool {
     err_txt := "";
     if is_plugin {
         ok, err_txt = run_cmd_capture(onyx_exe, .[
-            "build", "-r", "custom", "-DComponent_Build", "--wasm-mvp",
+            "build", "-r", "js", "--wasm-mvp",
             "--generate-name-section", "--no-colors", "-o", wasm_out, entry
         ]);
     } else {
@@ -207,6 +207,18 @@ extract_wat_function :: (wat: str, func_name: str) -> (str, i32) {
         return wat[best_start .. end_c], best_idx;
     }
     return "", -1;
+}
+
+/// Returns raw extracted WAT text and function index for `(file_path, func_name)`.
+wat_get_function_raw :: (file_path: str, func_name: str, buf_version: u32) -> (wat_text: str, func_idx: i32, ok: bool, err: str) {
+    if !wat_ensure_compiled(file_path, buf_version) {
+        return "", -1, false, g_wat_cache.last_error;
+    }
+    wat_slice, fidx := extract_wat_function(g_wat_cache.wat_full, func_name);
+    if wat_slice.count == 0 {
+        return "", -1, true, "";
+    }
+    return wat_slice, fidx, true, "";
 }
 
 /// Compiles (with caching) and returns `FunctionWatInfo` JSON for `(file_path, func_name)`.

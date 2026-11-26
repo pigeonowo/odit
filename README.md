@@ -15,6 +15,8 @@
   - **Build & Run** — Persistent per-project `odit-build.json`, OBV-inspired compiler flags drawer, extra `compiler_args` (e.g. `-DComponent_Build`), 2-stage Build → Run pipeline (capable of building & running `odit` inside `odit`), clickable `file.onyx:line:col` error jumps, and **interactive `stdin`** with live unflushed prompt rendering.
   - **WASM Inspector (`.wat`)** — Lists functions from the active file via Onyx LSP and disassembles them to syntax-colored WebAssembly Text Format (`.wat`) with horizontal scrolling & pan controls.
   - **Onyx Docs & Core Browser** — Live searchable reference indexing `~/.onyx/core` packages/procs/types and built-in `#` compiler directives.
+  - **Live Debugger (`Onyx <-> .wat`)** — Toggle breakpoints via editor gutter clicks or `F9`, then step through Onyx lines (`F10`) or individual WebAssembly `.wat` instructions (`F11`) in a synchronized side-by-side split view with parameter & WASM local slot inspection.
+  - **Advent of Code Runner** — Day-by-day `test`/`real` runner with `.odit/aoc_state.json` persistence, expected vs. actual comparison, clipboard copy, and per-day boilerplate generator.
 - **Command-First & Configurable:** Fuzzy Command Palette (`Ctrl+P`), Fuzzy File Finder (`Ctrl+O`), live Settings panel (`Ctrl+,`) with 4 built-in themes (`mocha`, `tokyo_night`, `gruvbox`, `light`), font size & UI scaling, and global CLI install (`odit [dir_or_file]`).
 
 ---
@@ -27,7 +29,8 @@
 | **Phase 2** | Non-blocking Onyx LSP client (`onyx lsp`): diagnostics, hover (`K`), go-to-definition (`F12`/`gd`), completion (`Ctrl+Space`), `ast_get_*` Host ABI | **Complete** |
 | **Phase 3.1** | Fuzzy File Finder (`Ctrl+O`), **File Explorer** `.wasm` plugin, **Build & Run** `.wasm` plugin (`odit-build.json`, flags drawer, clickable errors, interactive `stdin`) | **Complete** |
 | **Phase 3.2** | **WASM Inspector** (`.wat` disassembly `.wasm` plugin) & **Onyx Docs / Core Browser** `.wasm` plugin | **Complete** |
-| **Phase 4** | Live Side-by-Side Onyx/WASM Debugger + Domain Plugins (HTTP-Server Route Viewer, ORM Schema Viewer) | Planned |
+| **Phase 4.1** | **Live Side-by-Side Onyx/WASM Debugger** (`F5`/`F9`/`F10`/`F11`, gutter breakpoints, mapped `.wat` stepping, `debugger.wasm`) + **Advent of Code** (`aoc.wasm`) | **Complete** |
+| **Phase 4.2** | Domain Plugins (HTTP-Server Route Viewer, ORM Schema Viewer) | Planned |
 
 ---
 
@@ -86,6 +89,9 @@ In installed mode:
 | `K` (Normal) | **LSP: Hover Info** tooltip |
 | `Ctrl+Space` | **LSP: Autocomplete** (`Up`/`Down`, `Enter`/`Tab`, `Esc`) |
 | `F8` | **LSP: Jump to Next Diagnostic** |
+| `F9` / Gutter Click | **Debugger: Toggle Breakpoint** on line (red gutter dot) |
+| `F5` / `Shift+F5` | **Debugger: Start / Continue** / **Stop** session |
+| `F10` / `F11` | **Debugger: Step Over (Onyx line)** / **Step WAT Instruction** |
 | `Ctrl+Tab` | Cycle focus between the Code Editor and plugin panes |
 | `Ctrl+S` / `Ctrl+Z` | Save active buffer (saving `odit.json` reloads live!) / Undo |
 | `Esc` | Return to **NORMAL** mode (or close overlays / unfocus plugin input) |
@@ -111,6 +117,7 @@ odit/
 │   ├── services/
 │   │   ├── workspace.onyx        # Recursive workspace file indexer
 │   │   ├── compiler_wat.onyx     # `onyx --generate-name-section` + `wasm2wat` disassembly service
+│   │   ├── debugger.onyx         # Live Onyx <-> WASM breakpoint & stepping service (opcodes 90-94)
 │   │   └── docs_index.onyx       # Onyx `~/.onyx/core` & `#` directive documentation indexer
 │   ├── ui/
 │   │   ├── renderer.onyx         # Host Raylib immediate UI renderer for WASM plugins (+ headless mode)
@@ -129,6 +136,8 @@ odit/
 │   ├── build_run/main.onyx       # Build & Run WASM plugin (persistent config + interactive stdin)
 │   ├── wasm_inspector/main.onyx  # Live `.wat` WebAssembly Inspector WASM plugin
 │   ├── docs_browser/main.onyx    # Onyx Core & `#` Directives Docs Browser WASM plugin
+│   ├── debugger/main.onyx        # Live Side-by-Side Onyx <-> WAT Debugger WASM plugin
+│   ├── aoc/main.onyx             # Advent of Code Runner & Dashboard WASM plugin
 │   └── welcome/main.onyx         # Minimal reference/verification WASM plugin
 ├── tests/
 │   └── odit_test.onyx            # Unit test suite powered by `onyx_testing_framework`
