@@ -104,6 +104,7 @@ In installed mode:
 | `F10` / `F11` | **Debugger: Step Over (Onyx line)** / **Step WAT Instruction** |
 | `Ctrl+Tab` | Cycle focus between the Code Editor and plugin panes |
 | `Ctrl+S` / `Ctrl+Z` | Save active buffer (saving `odit.json` reloads live!) / Undo |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` / `Ctrl+A` | Copy / Cut / Paste (with mouse-drag or `Shift+Arrows` selection; also `yy` / `p` in Normal mode, and `Ctrl+V` in plugin inputs) / Select All |
 | `Esc` | Return to **NORMAL** mode (or close overlays / unfocus plugin input) |
 | **Normal mode** | `h/j/k/l` or Arrows move, `w`/`b` word jump, `0`/`$` line start/end, `g`/`G` top/bottom, `i`/`a`/`o`/`O` enter **INSERT**, `x` delete char, `dd` delete line, `u` undo |
 | **Horizontal Scroll** | `Shift + MouseWheel` in the Editor or WASM Inspector (plus `<` / `>` pan buttons in WASM Inspector) |

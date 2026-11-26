@@ -8,7 +8,7 @@ package odit.ui
 // (buttons, text inputs, dropdowns, scroll areas, tables), and caches loaded
 // PNG/JPG/animated GIF textures.
 
-use core { memory, math }
+use core { package, memory, math }
 use raylib
 use odit.abi
 use odit.theme
@@ -65,6 +65,7 @@ UiContext :: struct {
     key_enter:     bool;
     key_escape:    bool;
     key_tab:       bool;
+    key_paste:     bool;
 
     // Persistent focused text input across frames
     focused_input_win: u32;
@@ -118,12 +119,14 @@ ui_begin_frame :: (dt: f32, capture_keys_for_plugins: bool) {
     g_ui.key_enter = false;
     g_ui.key_escape = false;
     g_ui.key_tab = false;
+    g_ui.key_paste = false;
 
     if capture_keys_for_plugins {
+        ctrl_p := raylib.IsKeyDown(.LEFT_CONTROL) || raylib.IsKeyDown(.RIGHT_CONTROL);
         while true {
             ch := raylib.GetCharPressed();
             if ch <= 0 do break;
-            if g_ui.typed_count < 32 {
+            if !ctrl_p && g_ui.typed_count < 32 {
                 g_ui.typed_chars[g_ui.typed_count] = cast(u32) ch;
                 g_ui.typed_count += 1;
             }
@@ -132,6 +135,7 @@ ui_begin_frame :: (dt: f32, capture_keys_for_plugins: bool) {
         g_ui.key_enter     = raylib.IsKeyPressed(.ENTER) || raylib.IsKeyPressed(.KP_ENTER);
         g_ui.key_escape    = raylib.IsKeyPressed(.ESCAPE);
         g_ui.key_tab       = raylib.IsKeyPressed(.TAB);
+        g_ui.key_paste     = ctrl_p && raylib.IsKeyPressed(.V);
         if g_ui.key_escape {
             g_ui.focused_input_win = 0;
             g_ui.focused_input_id = 0;
@@ -449,6 +453,25 @@ ui_input :: (id: u32, x, y, w, h: f32, buf: [] u8, len: &u32, placeholder: str) 
         if g_ui.key_tab {
             g_ui.focused_input_id = id + 1;
             g_ui.key_tab = false;
+        }
+        if g_ui.key_paste && !g_ui.headless {
+            cp := raylib.GetClipboardText();
+            if cp.data != 0 {
+                n := core.cptr.extract_str(cp, .[]);
+                if n > 0 {
+                    tmp := make([] u8, cast(i32) n, context.temp_allocator);
+                    core.cptr.extract_str(cp, tmp);
+                    for ci in 0 .. tmp.count {
+                        c := tmp[ci];
+                        if c >= 32 && c < 127 && cur_len < buf.count {
+                            buf[cur_len] = c;
+                            cur_len += 1;
+                            res |= cast(u32) abi.WidgetState.Changed;
+                        }
+                    }
+                    g_ui.blink_timer = 0.0;
+                }
+            }
         }
     }
 

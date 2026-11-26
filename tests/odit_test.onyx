@@ -107,6 +107,31 @@ use odit.services
 }
 
 @test.tag.{"editor"}
+@test.it.{"TextBuffer selection, copy, cut, and multi-line paste round-trip"}
+(t: &test.T) {
+    buf: editor.TextBuffer;
+    editor.buffer_init(&buf);
+    editor.buffer_set_text(&buf, "alpha\nbeta\ngamma");
+
+    // Select "pha\nbe" (line 0 col 2 .. line 1 col 2)
+    buf.cursor_line = 0; buf.cursor_col = 2;
+    editor.buffer_start_selection(&buf);
+    buf.cursor_line = 1; buf.cursor_col = 2;
+
+    sel := editor.buffer_get_selected_text(&buf, context.temp_allocator);
+    t->expect_eq(sel, "pha\nbe");
+
+    // Replace selection via multi-line paste
+    editor.buffer_insert_text(&buf, "X\nY");
+    t->expect_eq(editor.buffer_to_string(&buf, context.temp_allocator), "alX\nYta\ngamma");
+
+    // Select all & delete
+    editor.buffer_select_all(&buf);
+    t->expect_true(editor.buffer_delete_selection(&buf));
+    t->expect_eq(editor.buffer_to_string(&buf, context.temp_allocator), "");
+}
+
+@test.tag.{"editor"}
 @test.it.{"Onyx lexer highlights directives, keywords, strings, numbers, and comments"}
 (t: &test.T) {
     line := "#load \"foo.onyx\" // comment";

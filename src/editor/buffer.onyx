@@ -15,27 +15,33 @@ GutterMarker :: struct {
 }
 
 TextBuffer :: struct {
-    path:          str;
-    lines:         [..] [..] u8;
-    cursor_line:   i32; // 0-based
-    cursor_col:    i32; // 0-based byte/char column
-    version:       u32;
-    dirty:         bool;
+    path:            str;
+    lines:           [..] [..] u8;
+    cursor_line:     i32; // 0-based
+    cursor_col:      i32; // 0-based byte/char column
+    has_sel:         bool;
+    sel_anchor_line: i32;
+    sel_anchor_col:  i32;
+    version:         u32;
+    dirty:           bool;
 
     // Simple undo snapshots (UTF-8 full-buffer text)
-    undo_stack:    [..] str;
-    gutter_markers:[..] GutterMarker;
+    undo_stack:      [..] str;
+    gutter_markers:  [..] GutterMarker;
 }
 
 buffer_init :: (b: &TextBuffer) {
-    b.path           = "";
-    b.lines          = make([..] [..] u8);
-    b.undo_stack     = make([..] str);
-    b.gutter_markers = make([..] GutterMarker);
-    b.cursor_line    = 0;
-    b.cursor_col     = 0;
-    b.version        = 1;
-    b.dirty          = false;
+    b.path            = "";
+    b.lines           = make([..] [..] u8);
+    b.undo_stack      = make([..] str);
+    b.gutter_markers  = make([..] GutterMarker);
+    b.cursor_line     = 0;
+    b.cursor_col      = 0;
+    b.has_sel         = false;
+    b.sel_anchor_line = 0;
+    b.sel_anchor_col  = 0;
+    b.version         = 1;
+    b.dirty           = false;
 
     // Start with one empty line
     first := make([..] u8);
@@ -77,6 +83,7 @@ buffer_set_text :: (b: &TextBuffer, text: str) {
 
     b.cursor_line = 0;
     b.cursor_col  = 0;
+    b.has_sel     = false;
     b.version += 1;
 }
 
@@ -290,6 +297,140 @@ buffer_delete_line :: (b: &TextBuffer) {
         buffer_clamp_cursor(b);
     }
     b.dirty = true;
+    b.version += 1;
+}
+
+buffer_clear_selection :: (b: &TextBuffer) {
+    b.has_sel = false;
+}
+
+buffer_start_selection :: (b: &TextBuffer) {
+    if !b.has_sel {
+        b.has_sel         = true;
+        b.sel_anchor_line = b.cursor_line;
+        b.sel_anchor_col  = b.cursor_col;
+    }
+}
+
+buffer_select_all :: (b: &TextBuffer) {
+    buffer_clamp_cursor(b);
+    b.has_sel         = true;
+    b.sel_anchor_line = 0;
+    b.sel_anchor_col  = 0;
+    b.cursor_line     = b.lines.count - 1;
+    b.cursor_col      = b.lines[b.cursor_line].count;
+}
+
+buffer_get_selection_bounds :: (b: &TextBuffer) -> (sl: i32, sc: i32, el: i32, ec: i32, active: bool) {
+    if !b.has_sel do return 0, 0, 0, 0, false;
+    al := b.sel_anchor_line;
+    ac := b.sel_anchor_col;
+    cl := b.cursor_line;
+    cc := b.cursor_col;
+    if al < 0 do al = 0;
+    if al >= b.lines.count do al = b.lines.count - 1;
+    if ac < 0 do ac = 0;
+    if ac > b.lines[al].count do ac = b.lines[al].count;
+    if al == cl && ac == cc do return 0, 0, 0, 0, false;
+    if al < cl || (al == cl && ac < cc) {
+        return al, ac, cl, cc, true;
+    }
+    return cl, cc, al, ac, true;
+}
+
+buffer_get_selected_text :: (b: &TextBuffer, allocator := context.temp_allocator) -> str {
+    buffer_clamp_cursor(b);
+    sl, sc, el, ec, active := buffer_get_selection_bounds(b);
+    if !active {
+        // VS Code-style fallback: copy current line + newline when no selection is active
+        ln := &b.lines[b.cursor_line];
+        out := make([..] u8, ln.count + 2, allocator);
+        for i in 0 .. ln.count do out << ln.data[i];
+        out << '\n';
+        return str.{ out.data, out.count };
+    }
+    out := make([..] u8, 64, allocator);
+    if sl == el {
+        ln := &b.lines[sl];
+        for i in sc .. ec do out << ln.data[i];
+    } else {
+        first := &b.lines[sl];
+        for i in sc .. first.count do out << first.data[i];
+        out << '\n';
+        for li in (sl + 1) .. el {
+            mid := &b.lines[li];
+            for i in 0 .. mid.count do out << mid.data[i];
+            out << '\n';
+        }
+        last := &b.lines[el];
+        for i in 0 .. ec do out << last.data[i];
+    }
+    return str.{ out.data, out.count };
+}
+
+buffer_delete_selection :: (b: &TextBuffer) -> bool {
+    buffer_clamp_cursor(b);
+    sl, sc, el, ec, active := buffer_get_selection_bounds(b);
+    if !active do return false;
+
+    buffer_push_undo(b);
+    if sl == el {
+        ln := &b.lines[sl];
+        del_n := ec - sc;
+        for _ in 0 .. del_n {
+            Array.remove_at(ln, sc);
+        }
+    } else {
+        first := &b.lines[sl];
+        last  := &b.lines[el];
+        first.count = sc;
+        for i in ec .. last.count do *first << last.data[i];
+        // Remove lines (sl + 1) ..= el
+        for _ in 0 .. (el - sl) {
+            delete(&b.lines[sl + 1]);
+            Array.remove_at(&b.lines, sl + 1);
+        }
+    }
+    b.cursor_line = sl;
+    b.cursor_col  = sc;
+    b.has_sel     = false;
+    b.dirty       = true;
+    b.version    += 1;
+    return true;
+}
+
+buffer_insert_text :: (b: &TextBuffer, text: str) {
+    if text.count == 0 do return;
+    buffer_clamp_cursor(b);
+    if !buffer_delete_selection(b) {
+        buffer_push_undo(b);
+    }
+
+    // Split text by `\n` (stripping `\r`) and insert cleanly at cursor
+    for i in 0 .. text.count {
+        c := text[i];
+        if c == '\r' do continue;
+        if c == '\n' {
+            cur := &b.lines[b.cursor_line];
+            new_ln := make([..] u8, (cur.count - b.cursor_col) + 8);
+            for k in b.cursor_col .. cur.count do new_ln << cur.data[k];
+            cur.count = b.cursor_col;
+            Array.insert(&b.lines, b.cursor_line + 1, new_ln);
+            b.cursor_line += 1;
+            b.cursor_col   = 0;
+        } elseif c == '\t' {
+            ln := &b.lines[b.cursor_line];
+            for _ in 0 .. 4 {
+                Array.insert(ln, b.cursor_col, ' ');
+                b.cursor_col += 1;
+            }
+        } elseif c >= 32 {
+            ln := &b.lines[b.cursor_line];
+            Array.insert(ln, b.cursor_col, c);
+            b.cursor_col += 1;
+        }
+    }
+    b.dirty    = true;
     b.version += 1;
 }
 

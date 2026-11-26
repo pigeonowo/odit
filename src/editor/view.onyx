@@ -28,11 +28,13 @@ EditorView :: struct {
     char_width:     f32;
     gutter_width:   f32;
     blink_timer:    f32;
-    pending_d:      bool; // For `dd` in Normal mode
-    pending_g:      bool; // For `gg` / `gd` in Normal mode
-    last_version:   u32;
-    last_line:      i32;
-    last_col:       i32;
+    pending_d:       bool; // For `dd` in Normal mode
+    pending_g:       bool; // For `gg` / `gd` in Normal mode
+    pending_y:       bool; // For `yy` in Normal mode
+    mouse_selecting: bool; // Active left-mouse drag selection
+    last_version:    u32;
+    last_line:       i32;
+    last_col:        i32;
 }
 
 EditorUpdateEvents :: struct {
@@ -116,6 +118,51 @@ key_trig :: (k: raylib.KeyboardKey) -> bool {
     return raylib.IsKeyPressed(k) || raylib.IsKeyPressedRepeat(k);
 }
 
+#local
+clipboard_get_str :: (allocator := context.temp_allocator) -> str {
+    cp := raylib.GetClipboardText();
+    if cp.data == 0 do return "";
+    n := core.cptr.extract_str(cp, .[]);
+    if n == 0 do return "";
+    buf := make([] u8, cast(i32) n, allocator);
+    core.cptr.extract_str(cp, buf);
+    return buf;
+}
+
+#local
+clipboard_set_str :: (txt: str) {
+    raylib.SetClipboardText(core.cptr.make(theme.to_temp_cstr(txt)));
+}
+
+#local
+mouse_pos_to_line_col :: (ed: &EditorView, rect: wm.PaneRect, mpos: raylib.Vector2) -> (line: i32, col: i32) {
+    rel_y := (mpos.y - rect.y) + ed.scroll_y - 6.0f;
+    clicked_line := cast(i32) (rel_y / ed.line_height);
+    if clicked_line < 0 do clicked_line = 0;
+    if clicked_line >= ed.buf.lines.count do clicked_line = ed.buf.lines.count - 1;
+
+    rel_x := (mpos.x - (rect.x + ed.gutter_width + 8.0f)) + ed.scroll_x;
+    clicked_col: i32 = 0;
+    if clicked_line >= 0 && clicked_line < ed.buf.lines.count && rel_x > 0.0f {
+        ln_b := &ed.buf.lines[clicked_line];
+        ln_s := str.{ ln_b.data, ln_b.count };
+        best_col: i32 = 0;
+        best_dist: f32 = rel_x;
+        for c in 1 .. (ln_s.count + 1) {
+            px := theme.measure_text(ln_s[0 .. c], ed.font_size);
+            d := px - rel_x;
+            if d < 0.0f do d = -d;
+            if d < best_dist {
+                best_dist = d;
+                best_col = c;
+            }
+            if px > rel_x + ed.char_width do break;
+        }
+        clicked_col = best_col;
+    }
+    return clicked_line, clicked_col;
+}
+
 editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, block_input: bool, lsp_c: &lsp.LspClient = null) -> EditorUpdateEvents {
     ev: EditorUpdateEvents;
     ed.blink_timer += dt;
@@ -144,43 +191,45 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
         }
     }
 
-    // Mouse click: toggle breakpoint if clicking in gutter, else place cursor
+    // Mouse click: toggle breakpoint if clicking in gutter, else place cursor & start drag selection
     if hovered && raylib.IsMouseButtonPressed(.LEFT) {
         if lsp_c != null {
             lsp_c.hover_visible = false;
             lsp_c.comp_open = false;
         }
-        rel_y := (mpos.y - rect.y) + ed.scroll_y - 6.0f;
-        clicked_line := cast(i32) (rel_y / ed.line_height);
-        if clicked_line < 0 do clicked_line = 0;
-        if clicked_line >= ed.buf.lines.count do clicked_line = ed.buf.lines.count - 1;
-
+        clicked_line, clicked_col := mouse_pos_to_line_col(ed, rect, mpos);
         if mpos.x < rect.x + ed.gutter_width {
             ev.toggle_breakpoint_line = cast(u32) (clicked_line + 1);
         } else {
-            rel_x := (mpos.x - (rect.x + ed.gutter_width + 8.0f)) + ed.scroll_x;
-            clicked_col: i32 = 0;
-            if clicked_line >= 0 && clicked_line < ed.buf.lines.count && rel_x > 0.0f {
-                ln_b := &ed.buf.lines[clicked_line];
-                ln_s := str.{ ln_b.data, ln_b.count };
-                best_col: i32 = 0;
-                best_dist: f32 = rel_x;
-                for c in 1 .. (ln_s.count + 1) {
-                    px := theme.measure_text(ln_s[0 .. c], ed.font_size);
-                    d := px - rel_x;
-                    if d < 0.0f do d = -d;
-                    if d < best_dist {
-                        best_dist = d;
-                        best_col = c;
-                    }
-                    if px > rel_x + ed.char_width do break;
-                }
-                clicked_col = best_col;
+            shift_click := raylib.IsKeyDown(.LEFT_SHIFT) || raylib.IsKeyDown(.RIGHT_SHIFT);
+            if shift_click {
+                buffer_start_selection(&ed.buf);
+            } else {
+                buffer_clear_selection(&ed.buf);
             }
             ed.buf.cursor_line = clicked_line;
             ed.buf.cursor_col  = clicked_col;
             buffer_clamp_cursor(&ed.buf);
+            if !shift_click {
+                ed.buf.sel_anchor_line = ed.buf.cursor_line;
+                ed.buf.sel_anchor_col  = ed.buf.cursor_col;
+                ed.buf.has_sel         = true;
+            }
+            ed.mouse_selecting = true;
             ed.blink_timer = 0.0;
+        }
+    }
+    if ed.mouse_selecting {
+        if raylib.IsMouseButtonDown(.LEFT) {
+            dl, dc := mouse_pos_to_line_col(ed, rect, mpos);
+            ed.buf.cursor_line = dl;
+            ed.buf.cursor_col  = dc;
+            buffer_clamp_cursor(&ed.buf);
+        } else {
+            ed.mouse_selecting = false;
+            if ed.buf.sel_anchor_line == ed.buf.cursor_line && ed.buf.sel_anchor_col == ed.buf.cursor_col {
+                buffer_clear_selection(&ed.buf);
+            }
         }
     }
 
@@ -227,6 +276,37 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
         }
         return ev;
     }
+    if ctrl && raylib.IsKeyPressed(.A) {
+        buffer_select_all(&ed.buf);
+        return ev;
+    }
+    if ctrl && raylib.IsKeyPressed(.C) {
+        txt := buffer_get_selected_text(&ed.buf, context.temp_allocator);
+        clipboard_set_str(txt);
+        return ev;
+    }
+    if ctrl && raylib.IsKeyPressed(.X) {
+        txt := buffer_get_selected_text(&ed.buf, context.temp_allocator);
+        clipboard_set_str(txt);
+        if !buffer_delete_selection(&ed.buf) {
+            buffer_delete_line(&ed.buf);
+        }
+        ev.buffer_modified = true;
+        ed.last_version = ed.buf.version;
+        editor_ensure_cursor_visible(ed, rect.h);
+        return ev;
+    }
+    if ctrl && raylib.IsKeyPressed(.V) {
+        clip := clipboard_get_str(context.temp_allocator);
+        if clip.count > 0 {
+            buffer_insert_text(&ed.buf, clip);
+            ev.buffer_modified = true;
+            ed.last_version = ed.buf.version;
+            editor_ensure_cursor_visible(ed, rect.h);
+            editor_ensure_cursor_visible_x(ed, rect.w);
+        }
+        return ev;
+    }
     if raylib.IsKeyPressed(.F12) {
         ev.req_definition = true;
         return ev;
@@ -236,20 +316,24 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
         return ev;
     }
 
-    // Navigation keys work in both modes
+    // Navigation keys work in both modes (hold Shift to extend selection)
+    shift_nav := raylib.IsKeyDown(.LEFT_SHIFT) || raylib.IsKeyDown(.RIGHT_SHIFT);
     if key_trig(.UP) {
+        if shift_nav do buffer_start_selection(&ed.buf); else do buffer_clear_selection(&ed.buf);
         ed.buf.cursor_line -= 1;
         buffer_clamp_cursor(&ed.buf);
         editor_ensure_cursor_visible(ed, rect.h);
         ed.blink_timer = 0.0;
     }
     if key_trig(.DOWN) {
+        if shift_nav do buffer_start_selection(&ed.buf); else do buffer_clear_selection(&ed.buf);
         ed.buf.cursor_line += 1;
         buffer_clamp_cursor(&ed.buf);
         editor_ensure_cursor_visible(ed, rect.h);
         ed.blink_timer = 0.0;
     }
     if key_trig(.LEFT) {
+        if shift_nav do buffer_start_selection(&ed.buf); else do buffer_clear_selection(&ed.buf);
         if ed.buf.cursor_col > 0 {
             ed.buf.cursor_col -= 1;
         } elseif ed.buf.cursor_line > 0 {
@@ -259,6 +343,7 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
         ed.blink_timer = 0.0;
     }
     if key_trig(.RIGHT) {
+        if shift_nav do buffer_start_selection(&ed.buf); else do buffer_clear_selection(&ed.buf);
         cur_len := ed.buf.lines[ed.buf.cursor_line].count;
         if ed.buf.cursor_col < cur_len {
             ed.buf.cursor_col += 1;
@@ -269,19 +354,23 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
         ed.blink_timer = 0.0;
     }
     if raylib.IsKeyPressed(.HOME) {
+        if shift_nav do buffer_start_selection(&ed.buf); else do buffer_clear_selection(&ed.buf);
         ed.buf.cursor_col = 0;
         ed.blink_timer = 0.0;
     }
     if raylib.IsKeyPressed(.END) {
+        if shift_nav do buffer_start_selection(&ed.buf); else do buffer_clear_selection(&ed.buf);
         ed.buf.cursor_col = ed.buf.lines[ed.buf.cursor_line].count;
         ed.blink_timer = 0.0;
     }
     if raylib.IsKeyPressed(.PAGE_UP) {
+        if shift_nav do buffer_start_selection(&ed.buf); else do buffer_clear_selection(&ed.buf);
         ed.buf.cursor_line -= cast(i32) (rect.h / ed.line_height);
         buffer_clamp_cursor(&ed.buf);
         editor_ensure_cursor_visible(ed, rect.h);
     }
     if raylib.IsKeyPressed(.PAGE_DOWN) {
+        if shift_nav do buffer_start_selection(&ed.buf); else do buffer_clear_selection(&ed.buf);
         ed.buf.cursor_line += cast(i32) (rect.h / ed.line_height);
         buffer_clamp_cursor(&ed.buf);
         editor_ensure_cursor_visible(ed, rect.h);
@@ -301,29 +390,36 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
                 ch := raylib.GetCharPressed();
                 if ch <= 0 do break;
                 if !ctrl && ch >= 32 && ch < 127 {
+                    buffer_delete_selection(&ed.buf);
                     buffer_insert_char(&ed.buf, cast(u8) ch);
                     ed.blink_timer = 0.0;
                     editor_ensure_cursor_visible(ed, rect.h);
                 }
             }
             if key_trig(.ENTER) || key_trig(.KP_ENTER) {
+                buffer_delete_selection(&ed.buf);
                 buffer_insert_newline(&ed.buf, settings.g_settings.auto_indent);
                 ed.blink_timer = 0.0;
                 editor_ensure_cursor_visible(ed, rect.h);
             }
             if key_trig(.TAB) {
+                buffer_delete_selection(&ed.buf);
                 spaces := settings.g_settings.tab_size;
                 if spaces < 1 do spaces = 2;
                 for _ in 0 .. spaces do buffer_insert_char(&ed.buf, ' ');
                 ed.blink_timer = 0.0;
             }
             if key_trig(.BACKSPACE) {
-                buffer_backspace(&ed.buf);
+                if !buffer_delete_selection(&ed.buf) {
+                    buffer_backspace(&ed.buf);
+                }
                 ed.blink_timer = 0.0;
                 editor_ensure_cursor_visible(ed, rect.h);
             }
             if key_trig(.DELETE) {
-                buffer_delete_char(&ed.buf);
+                if !buffer_delete_selection(&ed.buf) {
+                    buffer_delete_char(&ed.buf);
+                }
                 ed.blink_timer = 0.0;
             }
         }
@@ -358,7 +454,26 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
                 continue;
             }
 
+            if ed.pending_y {
+                ed.pending_y = false;
+                if ch == 'y' {
+                    txt := buffer_get_selected_text(&ed.buf, context.temp_allocator);
+                    clipboard_set_str(txt);
+                }
+                continue;
+            }
+
             switch ch {
+                case 'y' {
+                    ed.pending_y = true;
+                }
+                case 'p' {
+                    clip := clipboard_get_str(context.temp_allocator);
+                    if clip.count > 0 {
+                        buffer_insert_text(&ed.buf, clip);
+                        editor_ensure_cursor_visible(ed, rect.h);
+                    }
+                }
                 case 'K' {
                     ev.req_hover = true;
                 }
@@ -537,6 +652,8 @@ editor_draw :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, lsp_c: &lsp.L
     // Pass 2: Clipped code viewport (prevents horizontally scrolled text from bleeding into gutter)
     raylib.BeginScissorMode(cast(i32) code_clip_x, cast(i32) rect.y, cast(i32) code_clip_w, cast(i32) rect.h);
 
+    sel_sl, sel_sc, sel_el, sel_ec, has_sel := buffer_get_selection_bounds(&ed.buf);
+
     for li in first_vis .. last_vis {
         ly := rect.y + 6.0f + cast(f32) li * ed.line_height - ed.scroll_y;
         line_1 := cast(u32) (li + 1);
@@ -549,6 +666,20 @@ editor_draw :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, lsp_c: &lsp.L
         // Syntax-highlighted source line (each span positioned by exact prefix width so cursor never drifts!)
         line_bytes := &ed.buf.lines[li];
         line_str := str.{ line_bytes.data, line_bytes.count };
+
+        // Selection highlight rectangle
+        if has_sel && li >= sel_sl && li <= sel_el {
+            c0 := sel_sc if li == sel_sl else 0;
+            c1 := sel_ec if li == sel_el else line_str.count;
+            if c0 > line_str.count do c0 = line_str.count;
+            if c1 > line_str.count do c1 = line_str.count;
+            sx0 := code_x + theme.measure_text(line_str[0 .. c0], ed.font_size);
+            sx1 := code_x + theme.measure_text(line_str[0 .. c1], ed.font_size);
+            if li < sel_el do sx1 += ed.char_width * 0.6f;
+            if sx1 > sx0 {
+                theme.draw_rect(sx0, ly - 1.0f, sx1 - sx0, ed.line_height, theme.get_color(.BgSelection));
+            }
+        }
         line_end_x := code_x;
         if line_str.count > 0 {
             n_spans := lex_onyx_line(line_str, spans);
