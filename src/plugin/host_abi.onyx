@@ -130,6 +130,13 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
             ret_u32(1);
         }
 
+        case 8 { // host_set_clipboard(text_ptr, text_len)
+            txt := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            if !ui.g_ui.headless {
+                raylib.SetClipboardText(core.cptr.make(theme.to_temp_cstr(txt)));
+            }
+        }
+
         // ---- B. UI Drawing Primitives & Immediate Widgets (20..49) ----
 
         case 20 { // ui_push_clip(x, y, w, h)
@@ -431,7 +438,15 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
             rel  := guest_read_str(handle, arg_u32(0), arg_u32(1));
             data := guest_read_str(handle, arg_u32(2), arg_u32(3));
             if full := sanitize_rel_path(rel); full {
-                if os.File.write_contents(full->unwrap(), data) {
+                fp := full->unwrap();
+                // Ensure parent directories exist (e.g. `.odit/aoc_state.json`)
+                for i in 1 .. fp.count {
+                    if fp[i] == '/' {
+                        dir := fp[0 .. i];
+                        if !os.Directory.exists(dir) do os.Directory.create(dir);
+                    }
+                }
+                if os.File.write_contents(fp, data) {
                     ret_i32(cast(i32) data.count);
                 } else {
                     ret_i32(cast(i32) abi.AbiError.Unknown);

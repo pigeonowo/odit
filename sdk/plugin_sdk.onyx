@@ -511,6 +511,10 @@ spawn_plugin :: (plugin_id: str) -> u32 {
     return abi.host_spawn_plugin(cast(u32) plugin_id.data, cast(u32) plugin_id.count);
 }
 
+set_clipboard :: (text: str) {
+    abi.host_set_clipboard(cast(u32) text.data, cast(u32) text.count);
+}
+
 // -----------------------------------------------------------------------------
 // B. UI Primitives & Immediate Widget Wrappers
 // -----------------------------------------------------------------------------
@@ -657,6 +661,18 @@ workspace_list_dir_json :: (rel_path: str, allocator := context.temp_allocator) 
     if needed <= 0 do return "";
     buf := make([] u8, needed, allocator);
     got := abi.workspace_list_dir(cast(u32) rel_path.data, cast(u32) rel_path.count, cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
+    return buf[0 .. got];
+}
+
+workspace_find_files_json :: (ext: str = "", allocator := context.temp_allocator) -> str {
+    needed := abi.workspace_find_files(cast(u32) ext.data, cast(u32) ext.count, 0, 0);
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.workspace_find_files(cast(u32) ext.data, cast(u32) ext.count, cast(u32) buf.data, cast(u32) buf.count);
     if got <= 0 {
         raw_free(allocator, buf.data);
         return "";

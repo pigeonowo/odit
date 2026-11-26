@@ -1,0 +1,824 @@
+// =============================================================================
+// Onyx Editor ("odit") — Advent of Code (`odit.aoc`) WASM Plugin
+// =============================================================================
+// Scrollable day-by-day Advent of Code test/real runner, answer comparison
+// dashboard, and project-local state tracker (`.odit/aoc_state.json`) built
+// with the modernized declarative `odit.sdk` (`@sdk.Plugin`, `sdk.Event`,
+// trailing `Code`-block macros).
+
+#load "../../abi/abi.onyx"
+#load "../../sdk/plugin_sdk.onyx"
+
+use core { memory, Array, tprintf }
+use core.encoding.json
+use odit.abi
+use odit.sdk
+
+STATE_FILE :: ".odit/aoc_state.json"
+
+RunSlot :: struct {
+    should:   str;
+    is:       str;
+    verified: bool;
+}
+
+DayRecord :: struct {
+    day:             u32;
+    source_path:     str;
+    input_path:      str;
+    test_input_path: str;
+    test_p1:         RunSlot;
+    test_p2:         RunSlot;
+    real_p1:         RunSlot;
+    real_p2:         RunSlot;
+    last_error:      str;
+
+    // Live editable buffers for `test` expected answers (`should`)
+    p1_buf:          [64] u8;
+    p1_len:          u32;
+    p2_buf:          [64] u8;
+    p2_len:          u32;
+}
+
+SavedSlot :: struct {
+    should:   str;
+    is:       str;
+    verified: bool;
+}
+
+SavedDay :: struct {
+    day:             u32;
+    source_path:     str;
+    input_path:      str;
+    test_input_path: str;
+    test_p1:         SavedSlot;
+    test_p2:         SavedSlot;
+    real_p1:         SavedSlot;
+    real_p2:         SavedSlot;
+    last_error:      str;
+}
+
+SavedState :: struct {
+    active_day: u32;
+    input_dir:  str;
+    days:       [] SavedDay;
+}
+
+RunStage :: enum (u32) {
+    Idle   :: 0;
+    Both   :: 1; // aoc.part=0
+    Part1  :: 2; // fallback sequential aoc.part=1
+    Part2  :: 3; // fallback sequential aoc.part=2
+}
+
+@sdk.Plugin.{
+    id             = "odit.aoc",
+    title          = "Advent of Code",
+    version        = "0.1.0",
+    default_slot   = 0,
+    default_width  = 360.0f,
+    default_height = 460.0f,
+    event_mask     = 99, // ActiveFileChanged | BufferModified | ProcessEvent | CommandInvoked
+    allow_multiple = false,
+}
+AocPlugin :: struct {
+    active_day:  u32;
+    input_dir:   str;
+    days:        [..] DayRecord;
+    scroll_y:    f32;
+
+    // Active child process state
+    proc_handle: u32;
+    run_day:     u32;
+    run_is_test: bool;
+    run_stage:   RunStage;
+    out_buf:     [..] u8;
+    p1_tmp:      str;
+}
+
+// -----------------------------------------------------------------------------
+// Lifecycle Hooks
+// -----------------------------------------------------------------------------
+
+@sdk.PluginInit
+init :: (self: &AocPlugin, window_id: u32) -> i32 {
+    self.active_day = 1;
+    self.input_dir  = sdk.copy_str("inputs");
+    self.days       = make([..] DayRecord);
+    self.out_buf    = make([..] u8);
+
+    sdk.register_command("aoc.add_day",  "AoC: Add Next Day", "");
+    sdk.register_command("aoc.run_test", "AoC: Run Active Day Test", "");
+    sdk.register_command("aoc.run_real", "AoC: Run Active Day Real", "");
+
+    if !load_state(self) {
+        add_day_record(self, 1);
+        add_day_record(self, 2);
+        save_state(self);
+    }
+
+    // Sync active day from currently open editor file if it matches `day<N>.onyx`
+    ap := sdk.editor_active_path(context.temp_allocator);
+    if d := extract_day_from_path(ap); d > 0 {
+        self.active_day = d;
+    }
+    return 0;
+}
+
+@sdk.PluginShutdown
+shutdown :: (self: &AocPlugin, window_id: u32) {
+    if self.proc_handle != 0 {
+        sdk.proc_kill(self.proc_handle);
+        self.proc_handle = 0;
+    }
+}
+
+@sdk.PluginEvent
+on_event :: (self: &AocPlugin, window_id: u32, event: sdk.Event) {
+    switch event {
+        case .Command as cmd {
+            if cmd == "aoc.add_day" {
+                add_next_day(self);
+            } elseif cmd == "aoc.run_test" {
+                start_run(self, self.active_day, true);
+            } elseif cmd == "aoc.run_real" {
+                start_run(self, self.active_day, false);
+            }
+        }
+        case .ActiveFileChanged as path {
+            if d := extract_day_from_path(path); d > 0 {
+                self.active_day = d;
+                if find_day(self, d) == null && d <= 25 {
+                    add_day_record(self, d);
+                    save_state(self);
+                }
+            }
+        }
+        case .BufferModified as bm {
+            if bm.saved {
+                if d := extract_day_from_path(bm.path); d > 0 {
+                    self.active_day = d;
+                    if find_day(self, d) == null && d <= 25 {
+                        add_day_record(self, d);
+                        save_state(self);
+                    }
+                    start_run(self, d, true);
+                }
+            }
+        }
+        case _ {}
+    }
+}
+
+// -----------------------------------------------------------------------------
+// State Helpers & Persistence (`.odit/aoc_state.json`)
+// -----------------------------------------------------------------------------
+
+#local
+set_edit_buf :: (dst: [] u8, len: &u32, s: str) {
+    n := s.count;
+    if n > dst.count - 1 do n = dst.count - 1;
+    if n > 0 do memory.copy(dst.data, s.data, n);
+    *len = cast(u32) n;
+}
+
+#local
+find_day :: (self: &AocPlugin, day: u32) -> &DayRecord {
+    for &d in self.days {
+        if d.day == day do return d;
+    }
+    return null;
+}
+
+#local
+detect_source_path :: (day: u32) -> str {
+    files_js := sdk.workspace_find_files_json(".onyx", context.temp_allocator);
+    d_str := tprintf("{}", day);
+    d_pad := tprintf("0{}", day) if day < 10 else d_str;
+
+    cands := str.[
+        tprintf("src/day{}.onyx",  d_str),
+        tprintf("src/day{}.onyx",  d_pad),
+        tprintf("day{}.onyx",      d_str),
+        tprintf("day{}.onyx",      d_pad),
+        "src/main.onyx",
+        "main.onyx",
+    ];
+    for cand in cands {
+        needle := tprintf("\"{}\"", cand);
+        if str.contains(files_js, needle) {
+            return sdk.copy_str(cand);
+        }
+    }
+    return sdk.copy_str(tprintf("src/day{}.onyx", d_str));
+}
+
+#local
+add_day_record :: (self: &AocPlugin, day: u32) -> &DayRecord {
+    if existing := find_day(self, day); existing != null do return existing;
+    rec: DayRecord;
+    rec.day             = day;
+    rec.source_path     = detect_source_path(day);
+    rec.input_path      = sdk.copy_str(tprintf("{}/input_day{}.txt", self.input_dir, day));
+    rec.test_input_path = sdk.copy_str(tprintf("{}/test_input_day{}.txt", self.input_dir, day));
+    self.days << rec;
+    return &self.days[self.days.count - 1];
+}
+
+#local
+add_next_day :: (self: &AocPlugin) {
+    max_d: u32 = 0;
+    for &d in self.days {
+        if d.day > max_d do max_d = d.day;
+    }
+    next_d := max_d + 1;
+    if next_d > 25 {
+        sdk.notify(.Warn, "AoC supports Days 1..25");
+        return;
+    }
+    add_day_record(self, next_d);
+    self.active_day = next_d;
+    save_state(self);
+    sdk.notify(.Info, tprintf("Added AoC Day {}", next_d));
+}
+
+#local
+load_state :: (self: &AocPlugin) -> bool {
+    raw := sdk.workspace_read_file(STATE_FILE, context.temp_allocator);
+    if raw.count == 0 do return false;
+
+    switch json.decode_as(raw, SavedState) {
+        case .Ok as st {
+            self.active_day = st.active_day if st.active_day >= 1 else 1;
+            if st.input_dir.count > 0 {
+                sdk.free_str(self.input_dir);
+                self.input_dir = sdk.copy_str(st.input_dir);
+            }
+            Array.clear(&self.days);
+            for &sd in st.days {
+                rec: DayRecord;
+                rec.day             = sd.day;
+                rec.source_path     = sdk.copy_str(sd.source_path) if sd.source_path.count > 0 else detect_source_path(sd.day);
+                rec.input_path      = sdk.copy_str(sd.input_path)  if sd.input_path.count > 0  else sdk.copy_str(tprintf("{}/input_day{}.txt", self.input_dir, sd.day));
+                rec.test_input_path = sdk.copy_str(sd.test_input_path) if sd.test_input_path.count > 0 else sdk.copy_str(tprintf("{}/test_input_day{}.txt", self.input_dir, sd.day));
+                rec.test_p1         = .{ sdk.copy_str(sd.test_p1.should), sdk.copy_str(sd.test_p1.is), sd.test_p1.verified };
+                rec.test_p2         = .{ sdk.copy_str(sd.test_p2.should), sdk.copy_str(sd.test_p2.is), sd.test_p2.verified };
+                rec.real_p1         = .{ sdk.copy_str(sd.real_p1.should), sdk.copy_str(sd.real_p1.is), sd.real_p1.verified };
+                rec.real_p2         = .{ sdk.copy_str(sd.real_p2.should), sdk.copy_str(sd.real_p2.is), sd.real_p2.verified };
+                rec.last_error      = sdk.copy_str(sd.last_error);
+                set_edit_buf(rec.p1_buf, &rec.p1_len, rec.test_p1.should);
+                set_edit_buf(rec.p2_buf, &rec.p2_len, rec.test_p2.should);
+                self.days << rec;
+            }
+            return self.days.count > 0;
+        }
+        case .Err do return false;
+    }
+}
+
+#local
+append_esc :: (out: &[..] u8, s: str) {
+    for i in 0 .. s.count {
+        c := s[i];
+        if c == '"'       do Array.concat(out, "\\\"");
+        elseif c == '\\'  do Array.concat(out, "\\\\");
+        elseif c == '\n'  do Array.concat(out, "\\n");
+        elseif c == '\r'  {}
+        else              do *out << c;
+    }
+}
+
+#local
+append_slot_json :: (out: &[..] u8, name: str, sl: &RunSlot, comma: bool) {
+    Array.concat(out, "            \""); Array.concat(out, name); Array.concat(out, "\": {\"should\":\"");
+    append_esc(out, sl.should);
+    Array.concat(out, "\",\"is\":\"");
+    append_esc(out, sl.is);
+    Array.concat(out, "\",\"verified\":");
+    Array.concat(out, "true}" if sl.verified else "false}");
+    if comma do Array.concat(out, ",");
+    Array.concat(out, "\n");
+}
+
+#local
+save_state :: (self: &AocPlugin) {
+    out := make([..] u8, 1024, context.temp_allocator);
+    Array.concat(&out, "{\n");
+    Array.concat(&out, tprintf("    \"active_day\": {},\n", self.active_day));
+    Array.concat(&out, "    \"input_dir\": \""); append_esc(&out, self.input_dir); Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"days\": [\n");
+
+    for i in 0 .. self.days.count {
+        d := &self.days[i];
+        Array.concat(&out, "        {\n");
+        Array.concat(&out, tprintf("            \"day\": {},\n", d.day));
+        Array.concat(&out, "            \"source_path\": \"");     append_esc(&out, d.source_path);     Array.concat(&out, "\",\n");
+        Array.concat(&out, "            \"input_path\": \"");      append_esc(&out, d.input_path);      Array.concat(&out, "\",\n");
+        Array.concat(&out, "            \"test_input_path\": \""); append_esc(&out, d.test_input_path); Array.concat(&out, "\",\n");
+        append_slot_json(&out, "test_p1", &d.test_p1, true);
+        append_slot_json(&out, "test_p2", &d.test_p2, true);
+        append_slot_json(&out, "real_p1", &d.real_p1, true);
+        append_slot_json(&out, "real_p2", &d.real_p2, true);
+        Array.concat(&out, "            \"last_error\": \""); append_esc(&out, d.last_error); Array.concat(&out, "\"\n");
+        Array.concat(&out, "        },\n" if (i + 1 < self.days.count) else "        }\n");
+    }
+    Array.concat(&out, "    ]\n}\n");
+    sdk.workspace_write_file(STATE_FILE, str.{ out.data, out.count });
+}
+
+// -----------------------------------------------------------------------------
+// Runner Execution (`onyx run --param aoc.day=N --param aoc.part=...`)
+// -----------------------------------------------------------------------------
+
+#local
+spawn_aoc_part :: (self: &AocPlugin, day: u32, part: u32, is_test: bool, stage: RunStage) {
+    rec := find_day(self, day);
+    if rec == null do rec = add_day_record(self, day);
+
+    src := rec.source_path;
+    if src.count == 0 do src = detect_source_path(day);
+
+    test_str := "true" if is_test else "false";
+    args := tprintf("run\n--no-colors\n--param\naoc.day={}\n--param\naoc.part={}\n--param\naoc.test={}\n{}",
+                    day, part, test_str, src);
+
+    Array.clear(&self.out_buf);
+    ph := sdk.proc_spawn("onyx", args);
+    if ph == 0 {
+        sdk.free_str(rec.last_error);
+        rec.last_error = sdk.copy_str("Failed to spawn onyx runner");
+        self.run_stage = .Idle;
+        save_state(self);
+        return;
+    }
+
+    self.proc_handle = ph;
+    self.run_day     = day;
+    self.run_is_test = is_test;
+    self.run_stage   = stage;
+}
+
+#local
+start_run :: (self: &AocPlugin, day: u32, is_test: bool) {
+    if self.proc_handle != 0 {
+        sdk.proc_kill(self.proc_handle);
+        self.proc_handle = 0;
+    }
+    rec := find_day(self, day);
+    if rec == null do rec = add_day_record(self, day);
+    sdk.free_str(rec.last_error);
+    rec.last_error = "";
+    sdk.free_str(self.p1_tmp);
+    self.p1_tmp = "";
+
+    // Refresh source path if file was newly created
+    if sdk.workspace_read_file(rec.source_path, context.temp_allocator).count == 0 {
+        sdk.free_str(rec.source_path);
+        rec.source_path = detect_source_path(day);
+    }
+
+    self.active_day = day;
+    spawn_aoc_part(self, day, 0, is_test, .Both);
+}
+
+#local
+poll_runner :: (self: &AocPlugin) {
+    if self.proc_handle == 0 do return;
+
+    chunk: [2048] u8;
+    for _ in 0 .. 8 {
+        n := sdk.proc_read(self.proc_handle, abi.StreamMask.Stdout | .Stderr, chunk);
+        if n > 0 {
+            for i in 0 .. n do self.out_buf << chunk[i];
+        } else {
+            break;
+        }
+    }
+
+    code: i32 = 0;
+    st := sdk.proc_poll(self.proc_handle, &code);
+    if st == .Running do return;
+
+    // Drain any final bytes after exit
+    for _ in 0 .. 8 {
+        n := sdk.proc_read(self.proc_handle, abi.StreamMask.Stdout | .Stderr, chunk);
+        if n > 0 {
+            for i in 0 .. n do self.out_buf << chunk[i];
+        } else {
+            break;
+        }
+    }
+    sdk.proc_kill(self.proc_handle);
+    self.proc_handle = 0;
+
+    raw_out := str.{ self.out_buf.data, self.out_buf.count };
+    rec := find_day(self, self.run_day);
+    if rec == null {
+        self.run_stage = .Idle;
+        return;
+    }
+
+    if self.run_stage == .Both {
+        p1, p2 := parse_parts(raw_out);
+        if code == 0 && (p1.count > 0 || p2.count > 0) {
+            apply_results(self, rec, self.run_is_test, p1, p2);
+            self.run_stage = .Idle;
+            save_state(self);
+            return;
+        }
+        // Fallback: try sequential `aoc.part=1` then `aoc.part=2`
+        if code == 0 || str.contains(raw_out, "part") {
+            spawn_aoc_part(self, self.run_day, 1, self.run_is_test, .Part1);
+            return;
+        }
+        record_run_error(rec, raw_out, code);
+        self.run_stage = .Idle;
+        save_state(self);
+        return;
+    }
+
+    if self.run_stage == .Part1 {
+        if code == 0 {
+            p1, _ := parse_parts(raw_out);
+            sdk.free_str(self.p1_tmp);
+            self.p1_tmp = sdk.copy_str(p1);
+            spawn_aoc_part(self, self.run_day, 2, self.run_is_test, .Part2);
+        } else {
+            record_run_error(rec, raw_out, code);
+            self.run_stage = .Idle;
+            save_state(self);
+        }
+        return;
+    }
+
+    if self.run_stage == .Part2 {
+        p2 := "";
+        if code == 0 {
+            a, b := parse_parts(raw_out);
+            p2 = b if b.count > 0 else a;
+        }
+        apply_results(self, rec, self.run_is_test, self.p1_tmp, p2);
+        sdk.free_str(self.p1_tmp);
+        self.p1_tmp = "";
+        self.run_stage = .Idle;
+        save_state(self);
+    }
+}
+
+#local
+apply_results :: (self: &AocPlugin, rec: &DayRecord, is_test: bool, p1: str, p2: str) {
+    sdk.free_str(rec.last_error);
+    rec.last_error = "";
+    if is_test {
+        sdk.free_str(rec.test_p1.is); rec.test_p1.is = sdk.copy_str(p1);
+        sdk.free_str(rec.test_p2.is); rec.test_p2.is = sdk.copy_str(p2);
+        sdk.notify(.Info, tprintf("Day {} Test done (P1={}, P2={})", rec.day, p1, p2));
+    } else {
+        sdk.free_str(rec.real_p1.is); rec.real_p1.is = sdk.copy_str(p1);
+        sdk.free_str(rec.real_p2.is); rec.real_p2.is = sdk.copy_str(p2);
+        sdk.notify(.Info, tprintf("Day {} Real done (P1={}, P2={})", rec.day, p1, p2));
+    }
+}
+
+#local
+record_run_error :: (rec: &DayRecord, raw_out: str, code: i32) {
+    // Capture first non-empty error line for compact display
+    msg := tprintf("Exit code {}", code);
+    start := 0;
+    for i in 0 .. (raw_out.count + 1) {
+        if i == raw_out.count || raw_out[i] == '\n' {
+            ln := trim_ws(raw_out[start .. i]);
+            if ln.count > 0 {
+                msg = ln[0 .. (72 if ln.count > 72 else ln.count)];
+                break;
+            }
+            start = i + 1;
+        }
+    }
+    sdk.free_str(rec.last_error);
+    rec.last_error = sdk.copy_str(msg);
+    sdk.notify(.Error, tprintf("AoC Day {} failed", rec.day));
+}
+
+// -----------------------------------------------------------------------------
+// Output & Path Parsing Helpers
+// -----------------------------------------------------------------------------
+
+#local
+trim_ws :: (s: str) -> str {
+    a := 0;
+    b := s.count;
+    while a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n') do a += 1;
+    while b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n') do b -= 1;
+    return s[a .. b];
+}
+
+#local
+strip_ansi :: (s: str) -> str {
+    out := make([..] u8, s.count, context.temp_allocator);
+    i := 0;
+    while i < s.count {
+        if s[i] == 0x1B && i + 1 < s.count && s[i + 1] == '[' {
+            i += 2;
+            while i < s.count && !((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) do i += 1;
+            if i < s.count do i += 1;
+            continue;
+        }
+        out << s[i];
+        i += 1;
+    }
+    return str.{ out.data, out.count };
+}
+
+#local
+starts_with_ci :: (s: str, prefix: str) -> bool {
+    if s.count < prefix.count do return false;
+    for i in 0 .. prefix.count {
+        a := s[i]; if a >= 'A' && a <= 'Z' do a += 32;
+        b := prefix[i]; if b >= 'A' && b <= 'Z' do b += 32;
+        if a != b do return false;
+    }
+    return true;
+}
+
+#local
+parse_parts :: (raw_out: str) -> (str, str) {
+    clean := strip_ansi(raw_out);
+    p1 := "";
+    p2 := "";
+    fallback_lines := make([..] str, 8, context.temp_allocator);
+
+    start := 0;
+    for i in 0 .. (clean.count + 1) {
+        if i == clean.count || clean[i] == '\n' {
+            ln := trim_ws(clean[start .. i]);
+            if ln.count > 0 {
+                if starts_with_ci(ln, "part 1:") {
+                    p1 = trim_ws(ln[7 .. ln.count]);
+                } elseif starts_with_ci(ln, "part 2:") {
+                    p2 = trim_ws(ln[7 .. ln.count]);
+                } elseif starts_with_ci(ln, "p1:") {
+                    p1 = trim_ws(ln[3 .. ln.count]);
+                } elseif starts_with_ci(ln, "p2:") {
+                    p2 = trim_ws(ln[3 .. ln.count]);
+                } else {
+                    fallback_lines << ln;
+                }
+            }
+            start = i + 1;
+        }
+    }
+
+    if p1.count == 0 && p2.count == 0 {
+        if fallback_lines.count >= 1 do p1 = fallback_lines[0];
+        if fallback_lines.count >= 2 do p2 = fallback_lines[1];
+    }
+    return p1, p2;
+}
+
+#local
+extract_day_from_path :: (path: str) -> u32 {
+    if path.count < 5 || !str.ends_with(path, ".onyx") do return 0;
+    // Scan for "day<digits>.onyx" (case-insensitive)
+    for i in 0 .. (path.count - 3) {
+        c0 := path[i];     if c0 >= 'A' && c0 <= 'Z' do c0 += 32;
+        c1 := path[i + 1]; if c1 >= 'A' && c1 <= 'Z' do c1 += 32;
+        c2 := path[i + 2]; if c2 >= 'A' && c2 <= 'Z' do c2 += 32;
+        if c0 == 'd' && c1 == 'a' && c2 == 'y' {
+            j := i + 3;
+            val: u32 = 0;
+            digits := 0;
+            while j < path.count && path[j] >= '0' && path[j] <= '9' {
+                val = val * 10 + cast(u32) (path[j] - '0');
+                j += 1;
+                digits += 1;
+            }
+            if digits > 0 && val >= 1 && val <= 25 do return val;
+        }
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// UI Rendering (`@sdk.PluginRender`)
+// -----------------------------------------------------------------------------
+
+#local
+draw_readonly_box :: (ctx: &abi.FrameContext, x, y, w, h: f32, val: str, scroll_y: f32, copyable: bool) {
+    hov, clk := sdk.row_hit(ctx, x, y, w, h, scroll_y);
+    bg := sdk.theme_color(.BgHover) if (copyable && hov && val.count > 0) else sdk.theme_color(.BgBase);
+    border := sdk.theme_color(.Accent) if (copyable && hov && val.count > 0) else sdk.theme_color(.Border);
+    sdk.draw_rect(x, y, w, h, bg, 4.0f, border, 1.0f);
+    if val.count > 0 {
+        sdk.clipped(x + 4.0f, y + 1.0f, w - 8.0f, h - 2.0f) {
+            sdk.draw_text(x + 6.0f, y + 5.0f, val, 12.0f, sdk.theme_color(.TextPrimary), .Mono);
+        }
+        if copyable && clk {
+            sdk.set_clipboard(val);
+            sdk.notify(.Info, tprintf("Copied '{}'", val));
+        }
+    }
+}
+
+@sdk.PluginRender
+render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
+    poll_runner(self);
+
+    pad: f32 = 10.0f;
+    w := ctx.width - pad * 2.0f;
+    if w < 220.0f do w = 220.0f;
+
+    // Header Bar: "Advent of Code" + "+ Day" button
+    sdk.draw_text(pad, pad + 5.0f, "Advent of Code", 14.5f, sdk.theme_color(.TextPrimary), .Bold);
+    add_w: f32 = 64.0f;
+    sdk.on_click(1, pad + w - add_w, pad, add_w, 26.0f, "+ Day", .Primary) {
+        add_next_day(self);
+    }
+
+    list_y := pad + 34.0f;
+    list_h := ctx.height - list_y - pad;
+    if list_h < 80.0f do list_h = 80.0f;
+
+    // Compute total scrollable content height across all Day cards
+    total_h: f32 = 8.0f;
+    for &d in self.days {
+        card_h: f32 = 166.0f if d.last_error.count == 0 else 188.0f;
+        total_h += card_h + 10.0f;
+    }
+
+    state_dirty := false;
+    run_req_day: u32 = 0;
+    run_req_test := true;
+
+    sdk.scroll_area(2, pad, list_y, w, list_h, total_h, &self.scroll_y) {
+        cy := list_y + 2.0f;
+        cw := w - 8.0f; // leave space for scrollbar
+
+        // Column layout inside each Day card
+        lbl_w:    f32 = 54.0f;
+        play_w:   f32 = 30.0f;
+        status_w: f32 = 34.0f;
+        gap:      f32 = 6.0f;
+        box_w := (cw - 16.0f - lbl_w - play_w - status_w - gap * 4.0f) * 0.5f;
+        if box_w < 54.0f do box_w = 54.0f;
+
+        x_lbl  := pad + 8.0f;
+        x_shd  := x_lbl + lbl_w + gap;
+        x_is   := x_shd + box_w + gap;
+        x_play := x_is  + box_w + gap;
+        x_stat := x_play + play_w + gap;
+        row_h:  f32 = 24.0f;
+
+        for i in 0 .. self.days.count {
+            d := &self.days[i];
+            card_h: f32 = 166.0f if d.last_error.count == 0 else 188.0f;
+            is_active := d.day == self.active_day;
+
+            border_col := sdk.theme_color(.BorderFocused) if is_active else sdk.theme_color(.Border);
+            sdk.draw_rect(pad, cy, cw, card_h, sdk.theme_color(.BgSurface), 6.0f, border_col, 1.5f if is_active else 1.0f);
+
+            // Day header (click to select & open source file)
+            day_title := tprintf("Day {}", d.day);
+            title_col := sdk.theme_color(.Accent) if is_active else sdk.theme_color(.TextPrimary);
+            sdk.draw_text(x_lbl, cy + 7.0f, day_title, 13.5f, title_col, .Bold);
+            sdk.draw_text(x_shd, cy + 9.0f, d.source_path, 11.0f, sdk.theme_color(.TextSecondary), .Mono);
+
+            hdr_hov, hdr_clk := sdk.row_hit(ctx, pad + 2.0f, cy + 2.0f, cw - 4.0f, 24.0f, self.scroll_y);
+            if hdr_hov && hdr_clk {
+                self.active_day = d.day;
+                if d.source_path.count > 0 do sdk.editor_open(d.source_path, 1, 1);
+                state_dirty = true;
+            }
+
+            // Column headers ("should" / "is")
+            hy := cy + 28.0f;
+            sdk.draw_text(x_shd + 4.0f, hy, "should", 11.0f, sdk.theme_color(.TextSecondary));
+            sdk.draw_text(x_is  + 4.0f, hy, "is",     11.0f, sdk.theme_color(.TextSecondary));
+
+            base_id := d.day * 20;
+            running_this_test := self.proc_handle != 0 && self.run_day == d.day && self.run_is_test;
+            running_this_real := self.proc_handle != 0 && self.run_day == d.day && !self.run_is_test;
+
+            // ---- TEST GROUP (p1 & p2) ----
+            ty1 := cy + 45.0f;
+            ty2 := ty1 + row_h + 4.0f;
+            sdk.draw_text(x_lbl, ty1 + 5.0f, "test p1", 11.5f, sdk.theme_color(.Info), .Mono);
+            sdk.draw_text(x_lbl + 35.0f, ty2 + 5.0f, "p2", 11.5f, sdk.theme_color(.Info), .Mono);
+
+            // Editable `should` inputs (Tab moves from base_id+1 -> base_id+2!)
+            st_p1 := sdk.input_text(base_id + 1, x_shd, ty1, box_w, row_h, d.p1_buf, &d.p1_len, "...");
+            if st_p1 & .Changed {
+                sdk.free_str(d.test_p1.should);
+                d.test_p1.should = sdk.copy_str(str.{ &d.p1_buf[0], cast(i32) d.p1_len });
+                state_dirty = true;
+            }
+            st_p2 := sdk.input_text(base_id + 2, x_shd, ty2, box_w, row_h, d.p2_buf, &d.p2_len, "...");
+            if st_p2 & .Changed {
+                sdk.free_str(d.test_p2.should);
+                d.test_p2.should = sdk.copy_str(str.{ &d.p2_buf[0], cast(i32) d.p2_len });
+                state_dirty = true;
+            }
+
+            // Read-only `is` boxes (click to copy)
+            draw_readonly_box(ctx, x_is, ty1, box_w, row_h, d.test_p1.is, self.scroll_y, true);
+            draw_readonly_box(ctx, x_is, ty2, box_w, row_h, d.test_p2.is, self.scroll_y, true);
+
+            // `>` Play button spanning p1 & p2
+            play_h := row_h * 2.0f + 4.0f;
+            sdk.on_click(base_id + 3, x_play, ty1, play_w, play_h,
+                         "..." if running_this_test else ">",
+                         .Disabled if running_this_test else .Primary) {
+                run_req_day  = d.day;
+                run_req_test = true;
+            }
+
+            // Automatic Test status (`OK` green / `X` red)
+            if d.test_p1.is.count > 0 {
+                ok1 := d.test_p1.should.count > 0 && str.equal(d.test_p1.should, d.test_p1.is);
+                sdk.draw_text(x_stat + 8.0f, ty1 + 5.0f, "OK" if ok1 else "X", 12.0f,
+                              sdk.theme_color(.Success) if ok1 else sdk.theme_color(.Error), .Bold);
+            }
+            if d.test_p2.is.count > 0 {
+                ok2 := d.test_p2.should.count > 0 && str.equal(d.test_p2.should, d.test_p2.is);
+                sdk.draw_text(x_stat + 8.0f, ty2 + 5.0f, "OK" if ok2 else "X", 12.0f,
+                              sdk.theme_color(.Success) if ok2 else sdk.theme_color(.Error), .Bold);
+            }
+
+            // Subtle divider between test & real groups
+            div_y := ty2 + row_h + 6.0f;
+            sdk.draw_line(pad + 8.0f, div_y, pad + cw - 8.0f, div_y, 1.0f, sdk.theme_color(.Border));
+
+            // ---- REAL GROUP (p1 & p2) ----
+            ry1 := div_y + 6.0f;
+            ry2 := ry1 + row_h + 4.0f;
+            sdk.draw_text(x_lbl, ry1 + 5.0f, "real p1", 11.5f, sdk.theme_color(.Warning), .Mono);
+            sdk.draw_text(x_lbl + 35.0f, ry2 + 5.0f, "p2", 11.5f, sdk.theme_color(.Warning), .Mono);
+
+            // Read-only `should` and copyable `is` boxes
+            draw_readonly_box(ctx, x_shd, ry1, box_w, row_h, d.real_p1.should, self.scroll_y, false);
+            draw_readonly_box(ctx, x_shd, ry2, box_w, row_h, d.real_p2.should, self.scroll_y, false);
+            draw_readonly_box(ctx, x_is,  ry1, box_w, row_h, d.real_p1.is,     self.scroll_y, true);
+            draw_readonly_box(ctx, x_is,  ry2, box_w, row_h, d.real_p2.is,     self.scroll_y, true);
+
+            // `>` Play button spanning p1 & p2
+            sdk.on_click(base_id + 4, x_play, ry1, play_w, play_h,
+                         "..." if running_this_real else ">",
+                         .Disabled if running_this_real else .Active) {
+                run_req_day  = d.day;
+                run_req_test = false;
+            }
+
+            // Manual confirmation checkboxes (`[ ]` / `[v]` / `[x]`)
+            render_real_checkbox(base_id + 5, x_stat, ry1, status_w, row_h, &d.real_p1, &state_dirty);
+            render_real_checkbox(base_id + 6, x_stat, ry2, status_w, row_h, &d.real_p2, &state_dirty);
+
+            // Optional error line at bottom of card
+            if d.last_error.count > 0 {
+                sdk.draw_text(x_lbl, ry2 + row_h + 5.0f, d.last_error, 11.0f, sdk.theme_color(.Error), .Mono);
+            }
+
+            cy += card_h + 10.0f;
+        }
+    }
+
+    if state_dirty do save_state(self);
+    if run_req_day > 0 do start_run(self, run_req_day, run_req_test);
+}
+
+#local
+render_real_checkbox :: (id: u32, x, y, w, h: f32, slot: &RunSlot, dirty: &bool) {
+    lbl := "[ ]";
+    style := abi.ButtonFlags.Ghost;
+    if slot.verified {
+        matches := slot.is.count == 0 || str.equal(slot.should, slot.is);
+        if matches {
+            lbl = "[v]";
+            style = .Active;
+        } else {
+            lbl = "[x]";
+            style = .Danger;
+        }
+    }
+    sdk.on_click(id, x, y, w, h, lbl, style) {
+        if !slot.verified {
+            if slot.is.count > 0 {
+                sdk.free_str(slot.should);
+                slot.should   = sdk.copy_str(slot.is);
+                slot.verified = true;
+                *dirty = true;
+                sdk.notify(.Info, "Verified real AoC answer!");
+            } else {
+                sdk.notify(.Warn, "Run Real first before verifying");
+            }
+        } elseif slot.is.count > 0 && !str.equal(slot.should, slot.is) {
+            // Re-verify updated answer
+            sdk.free_str(slot.should);
+            slot.should = sdk.copy_str(slot.is);
+            *dirty = true;
+            sdk.notify(.Info, "Updated verified real AoC answer");
+        } else {
+            slot.verified = false;
+            *dirty = true;
+        }
+    }
+}

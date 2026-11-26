@@ -431,7 +431,7 @@ run_headless_selftest :: () {
     wid_doc := spawn_plugin_from_wasm("build/plugins/docs_browser.wasm");
     wid_w   := spawn_plugin_from_wasm("build/plugins/welcome.wasm");
     if wid_fe == 0 || wid_br == 0 || wid_wat == 0 || wid_doc == 0 || wid_w == 0 {
-        println("[odit] FAIL: could not spawn all Phase 3 WASM plugins");
+        println("[odit] FAIL: could not spawn all WASM plugins");
         lsp.lsp_shutdown(&g_app.lsp_client);
         os.exit(1);
     }
@@ -656,6 +656,31 @@ run_headless_selftest :: () {
     }
     println("[odit] PASS: WindowManager dock/swap/float/z-order/persistence tests succeeded!");
 
+    // 5) Advent of Code plugin: spawn, verify render (0 traps) & command registration
+    wid_aoc := spawn_plugin_from_wasm("build/plugins/aoc.wasm");
+    if wid_aoc == 0 {
+        println("[odit] FAIL: could not spawn build/plugins/aoc.wasm");
+        os.exit(1);
+    }
+    if ap := wm.wm_find_pane(&g_app.window_mgr, wid_aoc); ap != null {
+        if lp := find_loaded_plugin(ap.plugin_handle); lp != null {
+            ui.ui_begin_pane(wid_aoc, 0, 0, 360, 460, true, true);
+            fctx := abi.FrameContext.{
+                window_id = wid_aoc, width = 360, height = 460,
+                mouse_x = 10, mouse_y = 10, flags = abi.FRAME_FLAG_FOCUSED | abi.FRAME_FLAG_HOVERED,
+                delta_time = 0.016f,
+            };
+            plugin.plugin_render_with_ctx(lp, wid_aoc, &fctx);
+            ui.ui_end_pane();
+            if err := plugin.host_last_error(); err.count > 0 {
+                printf("[odit] FAIL: AoC plugin trapped on render: {}\n", err);
+                os.exit(1);
+            }
+        }
+    }
+    println("[odit] PASS: Advent of Code WASM plugin spawned, persisted state & rendered with 0 traps!");
+
+    close_plugin_window(wid_aoc);
     close_plugin_window(wid_w);
     close_plugin_window(wid_doc);
     close_plugin_window(wid_wat);

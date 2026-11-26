@@ -430,6 +430,7 @@ DebugState :: struct {
         host_register_command :: (id_ptr: u32, id_len: u32, label_ptr: u32, label_len: u32, shortcut_ptr: u32, shortcut_len: u32) -> u32 ---
         host_execute_command  :: (id_ptr: u32, id_len: u32, arg_ptr: u32, arg_len: u32) -> i32 ---
         host_spawn_plugin     :: (plugin_id_ptr: u32, plugin_id_len: u32) -> u32 ---
+        host_set_clipboard    :: (text_ptr: u32, text_len: u32) -> void ---
 
         // ---- B. UI Drawing Primitives & Immediate Widgets ----
 

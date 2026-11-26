@@ -64,6 +64,7 @@ UiContext :: struct {
     key_backspace: bool;
     key_enter:     bool;
     key_escape:    bool;
+    key_tab:       bool;
 
     // Persistent focused text input across frames
     focused_input_win: u32;
@@ -116,6 +117,7 @@ ui_begin_frame :: (dt: f32, capture_keys_for_plugins: bool) {
     g_ui.key_backspace = false;
     g_ui.key_enter = false;
     g_ui.key_escape = false;
+    g_ui.key_tab = false;
 
     if capture_keys_for_plugins {
         while true {
@@ -129,6 +131,7 @@ ui_begin_frame :: (dt: f32, capture_keys_for_plugins: bool) {
         g_ui.key_backspace = raylib.IsKeyPressed(.BACKSPACE) || raylib.IsKeyPressedRepeat(.BACKSPACE);
         g_ui.key_enter     = raylib.IsKeyPressed(.ENTER) || raylib.IsKeyPressed(.KP_ENTER);
         g_ui.key_escape    = raylib.IsKeyPressed(.ESCAPE);
+        g_ui.key_tab       = raylib.IsKeyPressed(.TAB);
         if g_ui.key_escape {
             g_ui.focused_input_win = 0;
             g_ui.focused_input_id = 0;
@@ -442,6 +445,10 @@ ui_input :: (id: u32, x, y, w, h: f32, buf: [] u8, len: &u32, placeholder: str) 
         }
         if g_ui.key_enter {
             res |= cast(u32) abi.WidgetState.Submitted;
+        }
+        if g_ui.key_tab {
+            g_ui.focused_input_id = id + 1;
+            g_ui.key_tab = false;
         }
     }
 

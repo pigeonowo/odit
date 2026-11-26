@@ -205,6 +205,7 @@ static const HostOpSpec g_host_ops[] = {
     { "host_register_command",       5 },
     { "host_execute_command",        6 },
     { "host_spawn_plugin",           7 },
+    { "host_set_clipboard",          8 },
 
     // B. UI Drawing Primitives & Immediate Widgets (20..49)
     { "ui_push_clip",                20 },
