@@ -598,6 +598,15 @@ audio_load :: (rel_path: str) -> u32 {
     return abi.audio_load(cast(u32) rel_path.data, cast(u32) rel_path.count);
 }
 
+/// Loads a sound effect directly from embedded bytes (e.g. `#file_contents "vine_boom.mp3"`).
+/// `ext` may be with or without a leading dot (e.g. `".mp3"` or `"mp3"`, `".wav"`, `".ogg"`).
+audio_load_memory :: (data: [] u8, ext: str = ".mp3") -> u32 {
+    return abi.audio_load_memory(
+        cast(u32) data.data, cast(u32) data.count,
+        cast(u32) ext.data, cast(u32) ext.count
+    );
+}
+
 audio_play :: (handle: u32, volume: f32 = 1.0f) {
     abi.audio_play(handle, volume);
 }

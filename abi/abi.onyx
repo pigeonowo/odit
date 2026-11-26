@@ -472,6 +472,7 @@ DebugState :: struct {
         ui_draw_texture      :: (handle: u32, x: f32, y: f32, w: f32, h: f32, tint_rgba: u32) -> void ---
 
         audio_load           :: (path_ptr: u32, path_len: u32) -> u32 ---
+        audio_load_memory    :: (data_ptr: u32, data_len: u32, ext_ptr: u32, ext_len: u32) -> u32 ---
         audio_play           :: (handle: u32, volume: f32) -> void ---
         audio_unload         :: (handle: u32) -> void ---
 

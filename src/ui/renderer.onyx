@@ -755,6 +755,36 @@ ui_audio_load :: (full_path: str) -> u32 {
     return cast(u32) g_sounds.count;
 }
 
+ui_audio_load_memory :: (data: [] u8, ext: str) -> u32 {
+    if !ensure_audio_ready() do return 0;
+    if data.count == 0 do return 0;
+
+    // Accept both ".mp3" and "mp3" (normalize to leading dot for Raylib)
+    dot_ext := ".wav";
+    if ext.count > 0 {
+        dot_ext = ext if ext[0] == '.' else core.tprintf(".{}", ext);
+    }
+
+    wave: raylib.Wave;
+    raylib.LoadWaveFromMemory(theme.to_temp_cstr(dot_ext), data, &wave);
+    if wave.frameCount == 0 do return 0;
+
+    snd: raylib.Sound;
+    raylib.LoadSoundFromWave(wave, &snd);
+    raylib.UnloadWave(wave);
+    if snd.frameCount == 0 do return 0;
+
+    for i in 0 .. g_sounds.count {
+        if !g_sounds[i].in_use {
+            g_sounds[i].in_use = true;
+            g_sounds[i].sound  = snd;
+            return cast(u32) (i + 1);
+        }
+    }
+    g_sounds << .{ in_use = true, sound = snd };
+    return cast(u32) g_sounds.count;
+}
+
 ui_audio_play :: (handle: u32, volume: f32) {
     if !ensure_audio_ready() do return;
     if handle == 0 || cast(i32) handle > g_sounds.count do return;

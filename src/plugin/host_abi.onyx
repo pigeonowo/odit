@@ -321,6 +321,22 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
             ui.ui_audio_unload(arg_u32(0));
         }
 
+        case 44 { // audio_load_memory(data_ptr, data_len, ext_ptr, ext_len) -> u32
+            dptr := arg_u32(0);
+            dlen := arg_u32(1);
+            ext  := guest_read_str(handle, arg_u32(2), arg_u32(3));
+            if dptr == 0 || dlen == 0 || dlen > 16 * 1024 * 1024 {
+                ret_u32(0);
+            } else {
+                buf := make([] u8, cast(i32) dlen, context.temp_allocator);
+                if wasm_plugin_mem_read(handle, dptr, buf.data, dlen) == 0 {
+                    ret_u32(ui.ui_audio_load_memory(buf, ext));
+                } else {
+                    ret_u32(0);
+                }
+            }
+        }
+
         // ---- C. Workspace & Editor Context (50..65) ----
 
         case 50 { // workspace_get_root(out_ptr, out_cap) -> i32

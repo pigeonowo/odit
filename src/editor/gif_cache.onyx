@@ -222,7 +222,7 @@ gif_cache_update :: (dt: f32) {
             }
         } elseif e.state == .Ready && e.frame_count > 1 && e.has_img && e.has_tex && e.frame_buf.count > 0 {
             e.timer += dt;
-            if e.timer >= 0.08f {
+            if e.timer >= 0.045f {
                 e.timer = 0.0f;
                 e.cur_frame = (e.cur_frame + 1) % e.frame_count;
                 offset := cast(u64) e.cur_frame * cast(u64) e.frame_buf.count;

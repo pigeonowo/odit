@@ -80,7 +80,7 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
 | `33–34` | `ui_scroll_area_begin` / `ui_scroll_area_end` | Live |
 | `35–37` | `ui_table_begin` / `ui_table_row` / `ui_table_end` | Live |
 | `38–40` | `ui_texture_load`, `ui_texture_unload`, `ui_draw_texture` | Live |
-| `41–43` | `audio_load(path...) -> u32`, `audio_play(handle, volume)`, `audio_unload(handle)` | Live |
+| `41–44` | `audio_load(path...)`, `audio_play(handle, volume)`, `audio_unload(handle)`, `audio_load_memory(data..., ext...)` | Live |
 
 ### C. Workspace, Editor, AST/LSP & Docs (`50..79`)
 | Opcode | Function | Status |

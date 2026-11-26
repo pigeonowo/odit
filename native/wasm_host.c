@@ -235,6 +235,7 @@ static const HostOpSpec g_host_ops[] = {
     { "audio_load",                  41 },
     { "audio_play",                  42 },
     { "audio_unload",                43 },
+    { "audio_load_memory",           44 },
 
     // C. Workspace, Editor, AST/LSP & Docs (50..79)
     { "workspace_get_root",          50 },
