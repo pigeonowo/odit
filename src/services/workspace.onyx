@@ -8,12 +8,12 @@ use core { package, os, Array }
 
 #local
 should_skip_dir :: (name: str) -> bool {
-    return str.equal(name, ".") ||
-           str.equal(name, "..") ||
-           str.equal(name, ".git") ||
-           str.equal(name, "build") ||
+    if name.count == 0 do return true;
+    if name[0] == '.' do return true; // Skip ., .., .git, .cache, .venv, etc.
+    return str.equal(name, "build") ||
            str.equal(name, "bin") ||
            str.equal(name, "lib") ||
+           str.equal(name, "target") ||
            str.equal(name, "node_modules");
 }
 

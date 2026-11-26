@@ -75,6 +75,7 @@ LspClient :: struct {
     change_timer:       f32;
 
     // Live LSP data consumed by Editor & WASM Host ABI
+    tx_buf:             [..] u8;
     diagnostics:        [..] abi.Diagnostic;
     symbols:            [..] abi.SymbolInfo;
     symbols_path:       str;
@@ -157,22 +158,31 @@ json_escape :: (s: str, allocator := context.temp_allocator) -> str {
 }
 
 #local
+lsp_flush_tx :: (c: &LspClient) {
+    if !c.proc_active || c.proc_handle == 0 || c.tx_buf.count == 0 do return;
+    while c.tx_buf.count > 0 {
+        n := native_proc_write(c.proc_handle, c.tx_buf.data, c.tx_buf.count);
+        if n > 0 {
+            consume_prefix(&c.tx_buf, n);
+        } elseif n == 0 {
+            break; // Pipe buffer temporarily full (EAGAIN); retry next frame without blocking UI!
+        } else {
+            c.proc_active = false;
+            c.state = .Failed;
+            Array.clear(&c.tx_buf);
+            break;
+        }
+    }
+}
+
+#local
 lsp_send_raw :: (c: &LspClient, body: str) -> bool {
     if !c.proc_active || c.proc_handle == 0 do return false;
     hdr := core.tprintf("Content-Length: {}\r\n\r\n", body.count);
-
-    // Send header then body directly (avoids tprintf's 8KB fixed buffer limit!)
-    parts := str.[ hdr, body ];
-    for part in parts {
-        written := 0;
-        while written < part.count {
-            slice := part[written .. part.count];
-            n := native_proc_write(c.proc_handle, slice.data, slice.count);
-            if n <= 0 do return false;
-            written += n;
-        }
-    }
-    return true;
+    Array.concat(&c.tx_buf, hdr);
+    Array.concat(&c.tx_buf, body);
+    lsp_flush_tx(c);
+    return c.proc_active;
 }
 
 lsp_init :: (c: &LspClient) {
@@ -182,6 +192,7 @@ lsp_init :: (c: &LspClient) {
     c.next_req_id    = 1;
     c.pending        = make([..] PendingRequest);
     c.rx_buf         = make([..] u8, 8192);
+    c.tx_buf         = make([..] u8, 8192);
     c.diagnostics    = make([..] abi.Diagnostic);
     c.symbols        = make([..] abi.SymbolInfo);
     c.references     = make([..] LspLocation);
@@ -380,6 +391,8 @@ lsp_request_completion :: (c: &LspClient, rel_path: str, line_0: i32, col_0: i32
 /// JSON-RPC frames. Returns true if the server just transitioned to Ready.
 lsp_poll :: (c: &LspClient, dt: f32) -> bool {
     if !c.proc_active do return false;
+
+    lsp_flush_tx(c);
 
     if c.change_pending && c.change_timer > 0.0f {
         c.change_timer -= dt;

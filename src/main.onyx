@@ -51,6 +51,7 @@ AppState :: struct {
     settings_view:   ui.SettingsView;
     loaded_plugins:  [..] plugin.LoadedPlugin;
     available_wasms: [..] str;
+    startup_queue:   [..] str;
     headless_test:   bool;
 }
 
@@ -872,6 +873,7 @@ main :: (args: [] cstr) {
     g_app.workspace_root = ".";
     g_app.loaded_plugins  = make([..] plugin.LoadedPlugin);
     g_app.available_wasms = make([..] str);
+    g_app.startup_queue   = make([..] str);
 
     wm.wm_init(&g_app.window_mgr);
     init_install_paths();
@@ -909,6 +911,12 @@ main :: (args: [] cstr) {
     defer theme.theme_shutdown();
     defer ui.ui_audio_shutdown();
 
+    // Paint an immediate first frame & pump GLFW/OS events so the window manager
+    // never marks the window "Not Responding" during plugin/LSP startup.
+    raylib.BeginDrawing();
+    raylib.ClearBackground(theme.get_rl(.BgBase));
+    raylib.EndDrawing();
+
     ui.palette_init(&g_app.palette);
     ui.finder_init(&g_app.file_finder);
     editor.editor_init(&g_app.ed);
@@ -930,22 +938,18 @@ main :: (args: [] cstr) {
         discover_plugins();
         wm.wm_load_layout(&g_app.window_mgr);
         if g_app.window_mgr.has_saved_layout && g_app.window_mgr.saved_panes.count > 0 {
-            saved_paths := make([..] str, context.temp_allocator);
             for &sp in g_app.window_mgr.saved_panes {
                 resolved := resolve_plugin_wasm(sp.wasm_path, context.temp_allocator);
                 if resolved.count > 0 {
-                    saved_paths << resolved;
+                    g_app.startup_queue << str.copy(resolved);
                 }
             }
-            for p in saved_paths {
-                spawn_plugin_from_wasm(p);
-            }
         } else {
-            // Auto-spawn Phase 3.1 Core Mini-Apps on first run
+            // Auto-spawn Core Mini-Apps on first run (staggered 1 per frame)
             fe_p := resolve_plugin_wasm("file_explorer.wasm", context.temp_allocator);
-            if fe_p.count > 0 do spawn_plugin_from_wasm(fe_p);
+            if fe_p.count > 0 do g_app.startup_queue << str.copy(fe_p);
             br_p := resolve_plugin_wasm("build_run.wasm", context.temp_allocator);
-            if br_p.count > 0 do spawn_plugin_from_wasm(br_p);
+            if br_p.count > 0 do g_app.startup_queue << str.copy(br_p);
         }
     } else {
         wm.wm_notify(&g_app.window_mgr, 3, "WASM runtime failed to initialize (check libwasmer.so)");
@@ -953,6 +957,15 @@ main :: (args: [] cstr) {
 
     while !raylib.WindowShouldClose() {
         alloc.clear_temp_allocator();
+
+        // Spawn at most one queued startup plugin per frame so Raylib keeps
+        // pumping OS/window-manager events smoothly without "Not Responding".
+        if g_app.startup_queue.count > 0 {
+            next_p := g_app.startup_queue[0];
+            Array.remove_at(&g_app.startup_queue, 0);
+            spawn_plugin_from_wasm(next_p);
+            str.free(next_p);
+        }
 
         dt := raylib.GetFrameTime();
         screen_w := cast(f32) raylib.GetScreenWidth();

@@ -1023,10 +1023,12 @@ ONYX_DEF(native_proc_spawn, (PTR, INT, PTR, INT, PTR, INT), (INT)) {
         _exit(127);
     }
 
-    // Parent process: close unused ends, set O_NONBLOCK ONLY on stdout/stderr read ends
+    // Parent process: close unused ends, set O_NONBLOCK on parent pipe ends
+    // (child's stdin read end `in_pipe[0]` stays blocking so `onyx lsp` never sees EAGAIN!).
     close(in_pipe[0]);
     close(out_pipe[1]);
     close(err_pipe[1]);
+    fcntl(in_pipe[1],  F_SETFL, fcntl(in_pipe[1],  F_GETFL, 0) | O_NONBLOCK);
     fcntl(out_pipe[0], F_SETFL, fcntl(out_pipe[0], F_GETFL, 0) | O_NONBLOCK);
     fcntl(err_pipe[0], F_SETFL, fcntl(err_pipe[0], F_GETFL, 0) | O_NONBLOCK);
 
@@ -1054,7 +1056,13 @@ ONYX_DEF(native_proc_write, (INT, PTR, INT), (INT)) {
         return NULL;
     }
     ssize_t w = write(p->stdin_fd, src, (size_t)len);
-    results->data[0] = WASM_I32_VAL(w < 0 ? -1 : (int32_t)w);
+    if (w > 0) {
+        results->data[0] = WASM_I32_VAL((int32_t)w);
+    } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        results->data[0] = WASM_I32_VAL(0);
+    } else {
+        results->data[0] = WASM_I32_VAL(-1);
+    }
     return NULL;
 }
 
