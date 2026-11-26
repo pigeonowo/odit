@@ -110,7 +110,7 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
 ## Authoring a New WASM Plugin
 
 ### Option A: Standalone Onyx Plugin (`onyx new odit-plugin`) — Recommended
-Scaffold a standalone plugin outside the `odit` repo using the installed template and `odit_onyx_sdk`:
+Scaffold a standalone plugin outside the `odit` repo using the installed template and [`odit_onyx_sdk`](https://github.com/pigeonowo/odit_onyx_sdk):
 ```bash
 onyx new odit-plugin my_plugin
 cd my_plugin
@@ -120,8 +120,8 @@ onyx run build.onyx -- dev       # installs to .odit/plugins/my_plugin.wasm (wor
 ```
 Inside `odit`, open the built-in **Plugin Dev** pane (`Ctrl+P` → `Plugin: Open plugin_dev.wasm`) for one-click **Dev + Reload** / **Install + Reload** with clickable compiler errors.
 
-### Option B: Standalone Rust Plugin (`odit_rust_sdk`)
-Because the ABI is a flat WebAssembly scalar boundary, you can also author plugins in Rust (`wasm32-unknown-unknown`) using the **`odit_rust_sdk`** crate (`#[odit_plugin(...)]` proc-macro + safe Rust wrappers for all ABI opcodes):
+### Option B: Standalone Rust Plugin ([`odit_rust_sdk`](https://github.com/pigeonowo/odit_rust_sdk))
+Because the ABI is a flat WebAssembly scalar boundary, you can also author plugins in Rust (`wasm32-unknown-unknown`) using the **[`odit_rust_sdk`](https://github.com/pigeonowo/odit_rust_sdk)** crate (`#[odit_plugin(...)]` proc-macro + safe Rust wrappers for all ABI opcodes):
 ```bash
 cargo build --target wasm32-unknown-unknown --release
 cp target/wasm32-unknown-unknown/release/my_plugin.wasm ~/.config/odit/plugins/
