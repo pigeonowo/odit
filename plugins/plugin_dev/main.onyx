@@ -1,0 +1,553 @@
+// =============================================================================
+// Onyx Editor ("odit") — Plugin Dev Core Plugin (`plugin_dev.wasm`)
+// =============================================================================
+// One-click authoring loop for developing ODIT WASM plugins inside ODIT:
+//   - Auto-detects `build.onyx` and plugin name from `onyx-pkg.kdl`
+//   - Dev + Reload     (`onyx run build.onyx -- dev`     + `plugin.reload_all`)
+//   - Install + Reload (`onyx run build.onyx -- install` + `plugin.reload_all`)
+//   - Build Only       (`onyx run build.onyx`)
+//   - Reload Plugins   (`plugin.reload_all`)
+//   - Open <name>.wasm (`plugin.spawn.<name>.wasm`)
+//   - Live color-coded compiler output with clickable `file.onyx:line:col` links
+
+#load "../../abi/abi.onyx"
+#load "../../sdk/plugin_sdk.onyx"
+
+use core { memory, Array, tprintf }
+use odit.abi
+use odit.sdk
+
+LogKind :: enum {
+    Normal;
+    Command;
+    Info;
+    Success;
+    Warning;
+    Error;
+}
+
+LogLine :: struct {
+    kind:     LogKind;
+    text:     str;
+    err_path: str;
+    err_line: i32;
+    err_col:  i32;
+}
+
+ActionKind :: enum {
+    None;
+    Build;
+    Dev;
+    Install;
+}
+
+@sdk.Plugin.{
+    id             = "odit.plugin_dev",
+    title          = "Plugin Dev",
+    version        = "0.1.0",
+    default_slot   = 0,
+    default_width  = 380.0f,
+    default_height = 360.0f,
+    event_mask     = 0xFFFFFFFF,
+    allow_multiple = false,
+}
+PluginDevState :: struct {
+    plugin_name:   str;
+    has_build_scr: bool;
+    auto_reload:   bool;
+
+    proc_handle:   u32;
+    proc_state:    abi.ProcState;
+    exit_code:     i32;
+    active_action: ActionKind;
+    elapsed:       f32;
+    last_dur:      f32;
+
+    logs:          [..] LogLine;
+    partial_line:  [..] u8;
+    scroll_y:      f32;
+    auto_scroll:   bool;
+}
+
+#local
+str_has :: (hay: str, needle: str) -> bool {
+    if needle.count == 0 do return true;
+    if hay.count < needle.count do return false;
+    for i in 0 .. (hay.count - needle.count + 1) {
+        ok := true;
+        for j in 0 .. needle.count {
+            if hay[i + j] != needle[j] { ok = false; break; }
+        }
+        if ok do return true;
+    }
+    return false;
+}
+
+/// Parses `name "my_plugin"` from `onyx-pkg.kdl`.
+#local
+parse_kdl_name :: (kdl: str) -> str {
+    needle := "name \"";
+    if kdl.count < needle.count do return "";
+    for i in 0 .. (kdl.count - needle.count + 1) {
+        ok := true;
+        for j in 0 .. needle.count {
+            if kdl[i + j] != needle[j] { ok = false; break; }
+        }
+        if ok {
+            start := i + needle.count;
+            end := start;
+            while end < kdl.count && kdl[end] != '"' && kdl[end] != '\n' {
+                end += 1;
+            }
+            if end > start do return kdl[start .. end];
+        }
+    }
+    return "";
+}
+
+#local
+detect_workspace :: (self: &PluginDevState) {
+    if self.plugin_name.count > 0 {
+        sdk.free_str(self.plugin_name);
+        self.plugin_name = "";
+    }
+    kdl := sdk.workspace_read_file("onyx-pkg.kdl", context.temp_allocator);
+    if kdl.count > 0 {
+        nm := parse_kdl_name(kdl);
+        if nm.count > 0 {
+            self.plugin_name = sdk.copy_str(nm);
+        }
+    }
+    bs := sdk.workspace_read_file("build.onyx", context.temp_allocator);
+    self.has_build_scr = bs.count > 0;
+}
+
+#local
+classify_line :: (line: str) -> LogKind {
+    if str_has(line, "error:") || str_has(line, "Error") || str_has(line, "failed") || str_has(line, "Failed") do return .Error;
+    if str_has(line, "warning:") || str_has(line, "Warning") do return .Warning;
+    if str_has(line, "[build] Built") || str_has(line, "[dev] Installed") || str_has(line, "[install] Installed") || str_has(line, "exit 0") do return .Success;
+    return .Normal;
+}
+
+#local
+parse_error_loc :: (line: str) -> (str, i32, i32) {
+    idx := -1;
+    needle := ".onyx:";
+    if line.count >= needle.count {
+        for i in 0 .. (line.count - needle.count + 1) {
+            ok := true;
+            for j in 0 .. needle.count {
+                if line[i + j] != needle[j] { ok = false; break; }
+            }
+            if ok { idx = i; break; }
+        }
+    }
+    if idx < 0 do return "", 0, 0;
+
+    ps := idx;
+    while ps > 0 && line[ps - 1] != ' ' && line[ps - 1] != '\t' do ps -= 1;
+    pe := idx + 5;
+    raw_path := line[ps .. pe];
+
+    rel := raw_path;
+    for marker in str.[ "/src/", "/plugins/", "/lib/" ] {
+        if raw_path.count >= marker.count {
+            for k in 0 .. (raw_path.count - marker.count + 1) {
+                ok := true;
+                for j in 0 .. marker.count {
+                    if raw_path[k + j] != marker[j] { ok = false; break; }
+                }
+                if ok {
+                    rel = raw_path[(k + 1) .. raw_path.count];
+                    break;
+                }
+            }
+        }
+    }
+
+    p := pe + 1;
+    ln: i32 = 0;
+    while p < line.count && line[p] >= '0' && line[p] <= '9' {
+        ln = ln * 10 + cast(i32) (line[p] - '0');
+        p += 1;
+    }
+    col: i32 = 1;
+    if p < line.count && (line[p] == ':' || line[p] == ',') {
+        p += 1;
+        c: i32 = 0;
+        while p < line.count && line[p] >= '0' && line[p] <= '9' {
+            c = c * 10 + cast(i32) (line[p] - '0');
+            p += 1;
+        }
+        if c > 0 do col = c;
+    }
+
+    return rel, ln, col;
+}
+
+#local
+append_log :: (self: &PluginDevState, kind: LogKind, line: str) {
+    if self.logs.count >= 400 {
+        sdk.free_str(self.logs[0].text);
+        sdk.free_str(self.logs[0].err_path);
+        Array.remove_at(&self.logs, 0);
+    }
+    ep, el, ec := parse_error_loc(line);
+    self.logs << .{
+        kind     = kind,
+        text     = sdk.copy_str(line),
+        err_path = sdk.copy_str(ep),
+        err_line = el,
+        err_col  = ec,
+    };
+    self.auto_scroll = true;
+}
+
+#local
+clear_logs :: (self: &PluginDevState) {
+    for &l in self.logs {
+        sdk.free_str(l.text);
+        sdk.free_str(l.err_path);
+    }
+    Array.clear(&self.logs);
+    Array.clear(&self.partial_line);
+    self.scroll_y = 0.0f;
+}
+
+#local
+ingest_chunk :: (self: &PluginDevState, data: [] u8) {
+    for i in 0 .. data.count {
+        ch := data[i];
+        if ch == '\r' do continue;
+        if ch == '\n' {
+            line := str.{ self.partial_line.data, self.partial_line.count };
+            append_log(self, classify_line(line), line);
+            Array.clear(&self.partial_line);
+        } else {
+            self.partial_line << ch;
+        }
+    }
+    if data.count > 0 do self.auto_scroll = true;
+}
+
+#local
+flush_partial :: (self: &PluginDevState) {
+    if self.partial_line.count > 0 {
+        line := str.{ self.partial_line.data, self.partial_line.count };
+        append_log(self, classify_line(line), line);
+        Array.clear(&self.partial_line);
+    }
+}
+
+#local
+start_action :: (self: &PluginDevState, action: ActionKind) {
+    if self.proc_handle != 0 && self.proc_state == .Running {
+        sdk.notify(.Warn, "Plugin build already running");
+        return;
+    }
+
+    detect_workspace(self);
+    if !self.has_build_scr {
+        append_log(self, .Error, "No build.onyx found in workspace root.");
+        append_log(self, .Info,  "Scaffold a plugin project with: onyx new odit-plugin <name>");
+        sdk.notify(.Warn, "No build.onyx found in workspace root");
+        return;
+    }
+
+    clear_logs(self);
+    args := switch action {
+        case .Dev     => "run\nbuild.onyx\n--\ndev";
+        case .Install => "run\nbuild.onyx\n--\ninstall";
+        case _        => "run\nbuild.onyx";
+    };
+    cmd_label := switch action {
+        case .Dev     => "$ onyx run build.onyx -- dev";
+        case .Install => "$ onyx run build.onyx -- install";
+        case _        => "$ onyx run build.onyx";
+    };
+
+    append_log(self, .Command, cmd_label);
+    ph := sdk.proc_spawn("onyx", args, "");
+    if ph == 0 {
+        append_log(self, .Error, "Failed to spawn onyx process.");
+        sdk.notify(.Error, "Failed to spawn onyx");
+        return;
+    }
+
+    self.proc_handle   = ph;
+    self.proc_state    = .Running;
+    self.exit_code     = 0;
+    self.active_action = action;
+    self.elapsed       = 0.0f;
+}
+
+#local
+stop_action :: (self: &PluginDevState) {
+    if self.proc_handle != 0 && self.proc_state == .Running {
+        sdk.proc_kill(self.proc_handle);
+        self.proc_state = .Killed;
+        self.proc_handle = 0;
+        flush_partial(self);
+        append_log(self, .Warning, "Process terminated by user.");
+    }
+}
+
+#local
+open_current_plugin :: (self: &PluginDevState) {
+    if self.plugin_name.count == 0 {
+        detect_workspace(self);
+    }
+    if self.plugin_name.count == 0 {
+        sdk.notify(.Warn, "No plugin name found in onyx-pkg.kdl");
+        return;
+    }
+    sdk.execute_command(tprintf("plugin.spawn.{}.wasm", self.plugin_name));
+}
+
+@sdk.PluginInit
+init :: (self: &PluginDevState, window_id: u32) -> i32 {
+    self.logs         = make([..] LogLine);
+    self.partial_line = make([..] u8);
+    self.auto_reload  = true;
+    self.auto_scroll  = true;
+
+    detect_workspace(self);
+
+    sdk.register_command("plugin_dev.dev_reload",     "Plugin Dev: Dev Build & Reload",     "");
+    sdk.register_command("plugin_dev.install_reload", "Plugin Dev: Install & Reload",       "");
+    sdk.register_command("plugin_dev.build",          "Plugin Dev: Build Only",             "");
+    sdk.register_command("plugin_dev.open_plugin",    "Plugin Dev: Open Current Plugin",    "");
+
+    if self.has_build_scr {
+        nm := self.plugin_name if self.plugin_name.count > 0 else "plugin";
+        append_log(self, .Info, tprintf("Detected plugin workspace '{}' (build.onyx ready)", nm));
+    } else {
+        append_log(self, .Info, "Open a plugin workspace containing build.onyx to build & hot-reload.");
+    }
+    return 0;
+}
+
+@sdk.PluginShutdown
+shutdown :: (self: &PluginDevState, window_id: u32) {
+    if self.proc_handle != 0 && self.proc_state == .Running {
+        sdk.proc_kill(self.proc_handle);
+        self.proc_handle = 0;
+    }
+}
+
+@sdk.PluginEvent
+on_event :: (self: &PluginDevState, window_id: u32, event: sdk.Event) {
+    switch event {
+        case .Command as cmd {
+            if str.equal(cmd, "plugin_dev.dev_reload") {
+                start_action(self, .Dev);
+            } elseif str.equal(cmd, "plugin_dev.install_reload") {
+                start_action(self, .Install);
+            } elseif str.equal(cmd, "plugin_dev.build") {
+                start_action(self, .Build);
+            } elseif str.equal(cmd, "plugin_dev.open_plugin") {
+                open_current_plugin(self);
+            }
+        }
+        case .WorkspaceChanged {
+            detect_workspace(self);
+        }
+        case _ {}
+    }
+}
+
+#local
+poll_process :: (self: &PluginDevState, dt: f32) {
+    if self.proc_handle == 0 do return;
+
+    if self.proc_state == .Running {
+        self.elapsed += dt;
+    }
+
+    // Drain available stdout/stderr
+    buf: [4096] u8;
+    for _ in 0 .. 8 {
+        n := sdk.proc_read(self.proc_handle, abi.StreamMask.Stdout | abi.StreamMask.Stderr, buf);
+        if n <= 0 do break;
+        ingest_chunk(self, buf[0 .. n]);
+    }
+
+    ec: i32 = 0;
+    st := sdk.proc_poll(self.proc_handle, &ec);
+    self.proc_state = st;
+
+    if st != .Running {
+        // Final drain
+        for _ in 0 .. 8 {
+            n := sdk.proc_read(self.proc_handle, abi.StreamMask.Stdout | abi.StreamMask.Stderr, buf);
+            if n <= 0 do break;
+            ingest_chunk(self, buf[0 .. n]);
+        }
+        flush_partial(self);
+
+        self.exit_code   = ec;
+        self.last_dur    = self.elapsed;
+        self.proc_handle = 0;
+
+        if st == .Exited && ec == 0 {
+            append_log(self, .Success, tprintf("Finished (exit 0) in {:.2}s", self.last_dur));
+            should_reload := self.auto_reload && (self.active_action == .Dev || self.active_action == .Install);
+            if should_reload {
+                append_log(self, .Info, "Reloading all WASM plugins...");
+                sdk.execute_command("plugin.reload_all");
+            } else {
+                sdk.notify(.Info, "Plugin build succeeded");
+            }
+        } else {
+            append_log(self, .Error, tprintf("Failed (exit {}) after {:.2}s", ec, self.last_dur));
+            sdk.notify(.Error, tprintf("Plugin build failed (exit {})", ec));
+        }
+    }
+}
+
+@sdk.PluginRender
+render :: (self: &PluginDevState, window_id: u32, ctx: &abi.FrameContext) {
+    poll_process(self, ctx.delta_time);
+
+    pad: f32 = 10.0f;
+    w := ctx.width;
+    h := ctx.height;
+    y := pad;
+
+    c_text   := sdk.theme_color(.TextPrimary);
+    c_muted  := sdk.theme_color(.TextSecondary);
+    c_accent := sdk.theme_color(.Accent);
+    c_ok     := sdk.theme_color(.Success);
+    c_warn   := sdk.theme_color(.Warning);
+    c_err    := sdk.theme_color(.Error);
+    c_info   := sdk.theme_color(.Info);
+    c_surf   := sdk.theme_color(.BgSurface);
+    c_border := sdk.theme_color(.Border);
+    c_base   := sdk.theme_color(.BgBase);
+
+    running := self.proc_handle != 0 && self.proc_state == .Running;
+
+    // ---- Row 1: Workspace Header + Status Pill ----
+    title_lbl := tprintf("Plugin: {}", self.plugin_name) if self.plugin_name.count > 0 else "Plugin Workspace";
+    sdk.draw_text(pad, y + 3.0f, title_lbl, 14.0f, c_text, .Bold);
+
+    pill_txt := "Running..." if running else ("build.onyx" if self.has_build_scr else "No build.onyx");
+    pill_bg  := c_accent if running else (c_ok if self.has_build_scr else c_warn);
+    pill_w   := sdk.measure_text(pill_txt, 11.0f) + 18.0f;
+    sdk.pill(w - pad - pill_w, y + 1.0f, pill_txt, pill_bg, c_base);
+    y += 26.0f;
+
+    // ---- Row 2: Primary Action Buttons (Dev + Reload, Install + Reload, Reload) ----
+    gap: f32 = 6.0f;
+    inner_w := w - pad * 2.0f;
+    btn_h: f32 = 28.0f;
+
+    if running {
+        sdk.on_click(10, pad, y, 90.0f, btn_h, "Stop", .Danger) {
+            stop_action(self);
+        };
+        sdk.draw_text(pad + 100.0f, y + 6.0f, tprintf("Building... {:.1}s", self.elapsed), 12.0f, c_muted);
+    } else {
+        bw1 := (inner_w - gap * 2.0f) * 0.40f;
+        bw2 := (inner_w - gap * 2.0f) * 0.40f;
+        bw3 := inner_w - bw1 - bw2 - gap * 2.0f;
+        if bw1 < 80.0f do bw1 = 80.0f;
+        if bw2 < 80.0f do bw2 = 80.0f;
+        if bw3 < 58.0f do bw3 = 58.0f;
+
+        dev_lbl := "Dev + Reload" if self.auto_reload else "Dev Build";
+        ins_lbl := "Install + Reload" if self.auto_reload else "Install";
+
+        sdk.on_click(1, pad, y, bw1, btn_h, dev_lbl, .Primary) {
+            start_action(self, .Dev);
+        };
+        sdk.on_click(2, pad + bw1 + gap, y, bw2, btn_h, ins_lbl, .{}) {
+            start_action(self, .Install);
+        };
+        sdk.on_click(3, pad + bw1 + bw2 + gap * 2.0f, y, bw3, btn_h, "Reload", .{}) {
+            sdk.execute_command("plugin.reload_all");
+        };
+    }
+    y += btn_h + 6.0f;
+
+    // ---- Row 3: Secondary Actions (Build, Open Plugin, Auto-Reload toggle, Clear) ----
+    sm_h: f32 = 24.0f;
+    bx := pad;
+
+    sdk.on_click(4, bx, y, 56.0f, sm_h, "Build", .Ghost) {
+        start_action(self, .Build);
+    };
+    bx += 56.0f + gap;
+
+    if self.plugin_name.count > 0 {
+        open_lbl := tprintf("Open {}", self.plugin_name);
+        ow := sdk.measure_text(open_lbl, 12.0f) + 18.0f;
+        if ow > 130.0f do ow = 130.0f;
+        sdk.on_click(5, bx, y, ow, sm_h, open_lbl, .Ghost) {
+            open_current_plugin(self);
+        };
+        bx += ow + gap;
+    }
+
+    ar_lbl := "Auto-Reload: ON" if self.auto_reload else "Auto-Reload: OFF";
+    ar_w   := sdk.measure_text(ar_lbl, 11.0f) + 16.0f;
+    sdk.on_click(6, bx, y, ar_w, sm_h, ar_lbl, .Active if self.auto_reload else .Ghost) {
+        self.auto_reload = !self.auto_reload;
+    };
+
+    clr_w: f32 = 46.0f;
+    sdk.on_click(7, w - pad - clr_w, y, clr_w, sm_h, "Clear", .Ghost) {
+        clear_logs(self);
+    };
+    y += sm_h + 8.0f;
+
+    // ---- Row 4: Output Console ----
+    con_h := h - y - pad;
+    if con_h < 60.0f do con_h = 60.0f;
+
+    sdk.draw_rect(pad, y, inner_w, con_h, c_surf, 6.0f, c_border, 1.0f);
+
+    line_h: f32 = 18.0f;
+    total_lines := self.logs.count + (1 if self.partial_line.count > 0 else 0);
+    content_h   := cast(f32) total_lines * line_h + 12.0f;
+    if self.auto_scroll && content_h > con_h {
+        self.scroll_y = content_h - con_h;
+        self.auto_scroll = false;
+    }
+
+    sdk.scroll_begin(20, pad + 4.0f, y + 4.0f, inner_w - 8.0f, con_h - 8.0f, content_h, &self.scroll_y);
+    ly := y + 6.0f - self.scroll_y;
+    for i in 0 .. self.logs.count {
+        if ly + line_h >= y && ly <= y + con_h {
+            l := &self.logs[i];
+            col := switch l.kind {
+                case .Command => c_info;
+                case .Success => c_ok;
+                case .Warning => c_warn;
+                case .Error   => c_err;
+                case .Info    => c_muted;
+                case _        => c_text;
+            };
+
+            if l.err_path.count > 0 && l.err_line > 0 {
+                st := sdk.button(cast(u32) (1000 + i), pad + 6.0f, ly, inner_w - 16.0f, line_h, "", .Ghost);
+                if cast(u32) (st & .Hovered) != 0 {
+                    sdk.draw_rect(pad + 6.0f, ly, inner_w - 16.0f, line_h, sdk.theme_color(.BgHover), 3.0f);
+                }
+                if cast(u32) (st & .Clicked) != 0 {
+                    sdk.editor_open(l.err_path, l.err_line, l.err_col);
+                }
+            }
+            sdk.draw_text(pad + 8.0f, ly + 2.0f, l.text, 12.0f, col, abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
+        }
+        ly += line_h;
+    }
+    if self.partial_line.count > 0 {
+        if ly + line_h >= y && ly <= y + con_h {
+            ptext := str.{ self.partial_line.data, self.partial_line.count };
+            sdk.draw_text(pad + 8.0f, ly + 2.0f, ptext, 12.0f, c_text, abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
+        }
+    }
+    sdk.scroll_end();
+}

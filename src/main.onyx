@@ -190,7 +190,13 @@ reload_all_plugins :: () {
     }
     discover_plugins();
     for p in paths {
-        spawn_plugin_from_wasm(p);
+        // Re-resolve by basename so a newly built `.odit/plugins/<name>.wasm` overrides `~/.config/odit/plugins/`
+        base := p;
+        for i in 0 .. p.count {
+            if p[i] == '/' do base = p[(i + 1) .. p.count];
+        }
+        resolved := resolve_plugin_wasm(base, context.temp_allocator);
+        spawn_plugin_from_wasm(resolved if resolved.count > 0 else p);
     }
     wm.wm_notify(&g_app.window_mgr, 1, "Reloaded WASM plugins");
 }
