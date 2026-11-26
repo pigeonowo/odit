@@ -38,6 +38,7 @@ DayRecord :: struct {
     p1_len:          u32;
     p2_buf:          [64] u8;
     p2_len:          u32;
+    source_exists:   bool;
 }
 
 SavedSlot :: struct {
@@ -107,15 +108,17 @@ init :: (self: &AocPlugin, window_id: u32) -> i32 {
     self.days       = make([..] DayRecord);
     self.out_buf    = make([..] u8);
 
-    sdk.register_command("aoc.add_day",  "AoC: Add Next Day", "");
-    sdk.register_command("aoc.run_test", "AoC: Run Active Day Test", "");
-    sdk.register_command("aoc.run_real", "AoC: Run Active Day Real", "");
+    sdk.register_command("aoc.add_day",         "AoC: Add Next Day", "");
+    sdk.register_command("aoc.create_day_file", "AoC: Create Active Day Source File", "");
+    sdk.register_command("aoc.run_test",        "AoC: Run Active Day Test", "");
+    sdk.register_command("aoc.run_real",        "AoC: Run Active Day Real", "");
 
     if !load_state(self) {
         add_day_record(self, 1);
         add_day_record(self, 2);
         save_state(self);
     }
+    refresh_source_flags(self);
 
     // Sync active day from currently open editor file if it matches `day<N>.onyx`
     ap := sdk.editor_active_path(context.temp_allocator);
@@ -139,6 +142,10 @@ on_event :: (self: &AocPlugin, window_id: u32, event: sdk.Event) {
         case .Command as cmd {
             if cmd == "aoc.add_day" {
                 add_next_day(self);
+            } elseif cmd == "aoc.create_day_file" {
+                if d := find_day(self, self.active_day); d != null {
+                    create_day_boilerplate(self, d);
+                }
             } elseif cmd == "aoc.run_test" {
                 start_run(self, self.active_day, true);
             } elseif cmd == "aoc.run_real" {
@@ -214,6 +221,79 @@ detect_source_path :: (day: u32) -> str {
 }
 
 #local
+refresh_source_flags :: (self: &AocPlugin) {
+    files_js := sdk.workspace_find_files_json(".onyx", context.temp_allocator);
+    for &d in self.days {
+        needle := tprintf("\"{}\"", d.source_path);
+        d.source_exists = str.contains(files_js, needle);
+    }
+}
+
+#local
+create_day_boilerplate :: (self: &AocPlugin, d: &DayRecord) {
+    target := d.source_path;
+    if target.count == 0 {
+        target = sdk.copy_str(tprintf("src/day{}.onyx", d.day));
+        d.source_path = target;
+    }
+
+    // Never overwrite an existing solution file — just open it!
+    existing := sdk.workspace_read_file(target, context.temp_allocator);
+    if existing.count > 0 {
+        d.source_exists = true;
+        sdk.editor_open(target, 1, 1);
+        sdk.notify(.Info, tprintf("Opened existing {}", target));
+        return;
+    }
+
+    boilerplate := tprintf("""#load "./../lib/packages"
+
+use aoc
+use core.os
+use core.string
+
+main :: () {{
+    aoc.run();
+}}
+
+@aoc.part1
+(input_file: str) -> i64 {{
+    contents := os.get_contents(input_file);
+    defer delete(&contents);
+
+    // TODO: Solve Day {}, Part 1
+    return 0;
+}}
+
+@aoc.part2
+(input_file: str) -> i64 {{
+    contents := os.get_contents(input_file);
+    defer delete(&contents);
+
+    // TODO: Solve Day {}, Part 2
+    return 0;
+}}
+""", d.day, d.day);
+
+    if sdk.workspace_write_file(target, boilerplate) {
+        d.source_exists = true;
+        self.active_day = d.day;
+        // Also ensure empty input files exist so the runner can be tested right away
+        if d.test_input_path.count > 0 && sdk.workspace_read_file(d.test_input_path, context.temp_allocator).count == 0 {
+            sdk.workspace_write_file(d.test_input_path, "");
+        }
+        if d.input_path.count > 0 && sdk.workspace_read_file(d.input_path, context.temp_allocator).count == 0 {
+            sdk.workspace_write_file(d.input_path, "");
+        }
+        save_state(self);
+        sdk.editor_open(target, 16, 5);
+        sdk.notify(.Info, tprintf("Created {}", target));
+    } else {
+        sdk.notify(.Error, tprintf("Failed to create {}", target));
+    }
+}
+
+#local
 add_day_record :: (self: &AocPlugin, day: u32) -> &DayRecord {
     if existing := find_day(self, day); existing != null do return existing;
     rec: DayRecord;
@@ -221,6 +301,8 @@ add_day_record :: (self: &AocPlugin, day: u32) -> &DayRecord {
     rec.source_path     = detect_source_path(day);
     rec.input_path      = sdk.copy_str(tprintf("{}/input_day{}.txt", self.input_dir, day));
     rec.test_input_path = sdk.copy_str(tprintf("{}/test_input_day{}.txt", self.input_dir, day));
+    files_js := sdk.workspace_find_files_json(".onyx", context.temp_allocator);
+    rec.source_exists   = str.contains(files_js, tprintf("\"{}\"", rec.source_path));
     self.days << rec;
     return &self.days[self.days.count - 1];
 }
@@ -677,16 +759,31 @@ render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
             border_col := sdk.theme_color(.BorderFocused) if is_active else sdk.theme_color(.Border);
             sdk.draw_rect(pad, cy, cw, card_h, sdk.theme_color(.BgSurface), 6.0f, border_col, 1.5f if is_active else 1.0f);
 
-            // Day header (click to select & open source file)
+            base_id := d.day * 20;
+
+            // Day header (click title to select/open; Create/Open button on right)
             day_title := tprintf("Day {}", d.day);
             title_col := sdk.theme_color(.Accent) if is_active else sdk.theme_color(.TextPrimary);
             sdk.draw_text(x_lbl, cy + 7.0f, day_title, 13.5f, title_col, .Bold);
             sdk.draw_text(x_shd, cy + 9.0f, d.source_path, 11.0f, sdk.theme_color(.TextSecondary), .Mono);
 
-            hdr_hov, hdr_clk := sdk.row_hit(ctx, pad + 2.0f, cy + 2.0f, cw - 4.0f, 24.0f, self.scroll_y);
+            file_btn_w: f32 = 64.0f;
+            file_btn_x := pad + cw - file_btn_w - 6.0f;
+            sdk.on_click(base_id + 7, file_btn_x, cy + 4.0f, file_btn_w, 20.0f,
+                         "Open" if d.source_exists else "+ File",
+                         .Ghost if d.source_exists else .Primary) {
+                self.active_day = d.day;
+                if d.source_exists {
+                    sdk.editor_open(d.source_path, 1, 1);
+                } else {
+                    create_day_boilerplate(self, d);
+                }
+            }
+
+            hdr_hov, hdr_clk := sdk.row_hit(ctx, pad + 2.0f, cy + 2.0f, file_btn_x - pad - 6.0f, 24.0f, self.scroll_y);
             if hdr_hov && hdr_clk {
                 self.active_day = d.day;
-                if d.source_path.count > 0 do sdk.editor_open(d.source_path, 1, 1);
+                if d.source_exists && d.source_path.count > 0 do sdk.editor_open(d.source_path, 1, 1);
                 state_dirty = true;
             }
 
@@ -695,7 +792,6 @@ render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
             sdk.draw_text(x_shd + 4.0f, hy, "should", 11.0f, sdk.theme_color(.TextSecondary));
             sdk.draw_text(x_is  + 4.0f, hy, "is",     11.0f, sdk.theme_color(.TextSecondary));
 
-            base_id := d.day * 20;
             running_this_test := self.proc_handle != 0 && self.run_day == d.day && self.run_is_test;
             running_this_real := self.proc_handle != 0 && self.run_day == d.day && !self.run_is_test;
 
