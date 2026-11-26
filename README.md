@@ -1,8 +1,21 @@
 # Onyx Editor (`odit`) — Modular WASM-Plugin Desktop IDE
 
-**`odit`** is a desktop IDE for the [Onyx programming language](https://onyxlang.io) written in **Onyx** using **Raylib** (`pkg-raylib`) for native windowing and 2D rendering.
+> **"Window = WASM Plugin"** — A fast, hackable desktop IDE for the [Onyx programming language](https://onyxlang.io), written in **Onyx** and **Raylib** (`pkg-raylib`), where every tool window and inspector is a sandboxed WebAssembly (`.wasm`) mini-app loaded dynamically at runtime.
 
-Its core architectural principle is **"Window = WASM Plugin"**: every panel, tool window, and visual inspector is an independent mini-app compiled to WebAssembly (`.wasm`) and dynamically loaded, sandboxed, and rendered by the native host editor via a versioned Host ABI ([`abi/abi.onyx`](abi/abi.onyx)).
+---
+
+## Highlights
+
+- **Sandboxed WASM Plugin Architecture:** Every panel (`File Explorer`, `Build & Run`, `WASM Inspector`, `Onyx Docs & Core`, and any custom plugin you drop in `plugins/`) compiles to standalone WebAssembly (`-r custom`) with zero OS/WASI imports and communicates exclusively through a versioned Host ABI ([`abi/abi.onyx`](abi/abi.onyx)).
+- **Draggable, Dockable & Floating Window Manager:** Drag any plugin title bar to **swap** panes, snap into **Left**, **Right**, or **Bottom** dock zones with live drop previews, or pop out into z-ordered, corner-resizable **floating windows**. Layout persists automatically in `odit-layout.json`.
+- **Core Onyx Code Editor:** Custom line buffer with multi-step undo, per-line Onyx syntax highlighting, modal Normal/Insert editing (toggleable), pixel-accurate cursor & click alignment, gutter markers, and horizontal scrolling (`Shift+Wheel` + auto-scroll).
+- **Onyx LSP Integration:** Non-blocking JSON-RPC client for `onyx lsp` powering live diagnostic underlines, inline error messages, gutter dots, hover tooltips (`K`), go-to-definition (`F12` / `gd`), autocomplete (`Ctrl+Space`), and symbol feeds to WASM plugins.
+- **Built-In Core Mini-Apps (`.wasm` Plugins):**
+  - **File Explorer** — Full workspace directory tree with live filter, single-click folder expand/collapse, and instant file opening.
+  - **Build & Run** — Persistent per-project `odit-build.json`, OBV-inspired compiler flags drawer, 2-stage Build → Run pipeline (capable of building & running `odit` inside `odit`), clickable `file.onyx:line:col` error jumps, and **interactive `stdin`** with live unflushed prompt rendering.
+  - **WASM Inspector (`.wat`)** — Lists functions from the active file via Onyx LSP and disassembles them to syntax-colored WebAssembly Text Format (`.wat`) with horizontal scrolling & pan controls.
+  - **Onyx Docs & Core Browser** — Live searchable reference indexing `~/.onyx/core` packages/procs/types and built-in `#` compiler directives.
+- **Command-First & Configurable:** Fuzzy Command Palette (`Ctrl+P`), Fuzzy File Finder (`Ctrl+O`), live Settings panel (`Ctrl+,`) with 4 built-in themes (`mocha`, `tokyo_night`, `gruvbox`, `light`), font size & UI scaling, and global CLI install (`odit [dir_or_file]`).
 
 ---
 
@@ -10,10 +23,10 @@ Its core architectural principle is **"Window = WASM Plugin"**: every panel, too
 
 | Phase | Scope | Status |
 | :--- | :--- | :--- |
-| **Phase 1** | Host app, Raylib tiled window manager, `Ctrl+P` Command Palette, Settings (`Ctrl+,`, `odit.json`), Onyx code editor (syntax highlighting + modal editing), Wasmer `.wasm` plugin loader, Host ABI v1.0, Guest SDK, and verification plugin (`welcome.wasm`) | **Complete** |
-| **Phase 2** | Onyx LSP (`onyx lsp`) integration over non-blocking JSON-RPC stdio (diagnostics underlines & gutter markers, hover `K`, go-to-definition `gd`/`F12`, completion `Ctrl+Space`, `ast_get_symbols`/`references`/`diagnostics` Host ABI) | **Complete** |
-| **Phase 3.1** | **Fuzzy File Finder (`Ctrl+O`)**, **File Explorer** (`.wasm` plugin — all folders, instant open-on-click), **Build & Run** (`.wasm` plugin with persistent `odit-build.json`, OBV-style flags, 2-stage Build → Run to build & run `odit` inside `odit`, clickable error jumps) | **Complete** |
-| **Phase 3.2** | **WASM Inspector** (`.wat` disassembly `.wasm` plugin via `onyx --generate-name-section` + `wasm2wat`) & **Onyx Docs / Core Browser** (`.wasm` plugin indexing `~/.onyx/core` & `#` directives) | **Complete** |
+| **Phase 1** | Native Onyx + Raylib host, draggable/dockable/floating window manager, `Ctrl+P` Command Palette, Settings (`Ctrl+,`), Onyx code editor, Wasmer `.wasm` plugin loader, Host ABI v1.0, Guest SDK | **Complete** |
+| **Phase 2** | Non-blocking Onyx LSP client (`onyx lsp`): diagnostics, hover (`K`), go-to-definition (`F12`/`gd`), completion (`Ctrl+Space`), `ast_get_*` Host ABI | **Complete** |
+| **Phase 3.1** | Fuzzy File Finder (`Ctrl+O`), **File Explorer** `.wasm` plugin, **Build & Run** `.wasm` plugin (`odit-build.json`, flags drawer, clickable errors, interactive `stdin`) | **Complete** |
+| **Phase 3.2** | **WASM Inspector** (`.wat` disassembly `.wasm` plugin) & **Onyx Docs / Core Browser** `.wasm` plugin | **Complete** |
 | **Phase 4** | Live Side-by-Side Onyx/WASM Debugger + Domain Plugins (HTTP-Server Route Viewer, ORM Schema Viewer) | Planned |
 
 ---
@@ -23,64 +36,62 @@ Its core architectural principle is **"Window = WASM Plugin"**: every panel, too
 ### Prerequisites
 - **Onyx Toolchain** (tested on `2611`, `ONYX_PATH=~/.onyx`)
 - **Wasmer** shared library (`~/.wasmer/lib/libwasmer.so`, loaded dynamically via `dlopen`)
-- **GCC / Clang** (to build `bin/odit_wasm_host.so` and `bin/onyx_raylib.so`)
-- **WABT (`wasm2wat`)** (optional in Phase 1; used in Phase 3/4 for `.wat` disassembly)
+- **GCC / Clang** (to compile `bin/odit_wasm_host.so` and `bin/onyx_raylib.so`)
+- **WABT (`wasm2wat`)** (used by the WASM Inspector plugin for `.wat` disassembly)
 - **Nushell** (`nu`) or **Bash**
 
-### Build & Run (Nushell)
+### Build, Test & Run (Nushell)
 ```nu
+nu build.nu sync-raylib  # First-time setup: syncs packages & patches pkg-raylib for Onyx 2611
 nu build.nu              # Build native Wasmer bridge, all WASM plugins, and host
-nu build.nu test         # Run headless Host <-> WASM Plugin ABI self-test
-nu build.nu run          # Launch Onyx Editor (opens src/main.onyx)
-nu build.nu run path.onyx
+nu build.nu unit         # Run onyx_testing_framework unit suite (tests/odit_test.onyx)
+nu build.nu test         # Run unit tests + headless WASM plugin ABI & LSP self-test
+nu build.nu run          # Launch Onyx Editor in this repo
 nu build.nu install      # Install `odit` globally to ~/.local/bin/odit
 ```
 
-### Use `odit` in Any Project
-After running `nu build.nu install` (or `./build.sh install`), you can open any Onyx project from anywhere:
+### Build, Test & Run (Bash)
+```bash
+./build.sh sync-raylib
+./build.sh
+./build.sh test
+./build.sh run
+./build.sh install
+```
+
+### Use `odit` in Any Onyx Project
+After running `nu build.nu install` (or `./build.sh install`), ensure `~/.local/bin` is on your `PATH`, then open any project from anywhere:
 ```bash
 cd ~/my-onyx-project && odit
 odit ~/my-onyx-project
 odit ~/my-onyx-project/main.onyx
 ```
-Installed mode loads plugins from `$ODIT_HOME/plugins` (`~/.local/share/odit/plugins`), native `.so` libraries from `$ONYX_PATH/lib`, global settings/layout from `~/.config/odit/`, and project build settings from `<project>/odit-build.json`.
-
-### Build & Run (Bash)
-```bash
-./build.sh               # Build all
-./build.sh test          # Run headless self-test
-./build.sh run           # Launch Onyx Editor
-```
-
-> **Note for fresh clones (Onyx 2611 + `pkg-raylib` 0.0.8):** `pkg-raylib`'s `build.onyx` calls legacy `string.concat` instead of `str.concat`. Running `nu build.nu sync-raylib` (or `./build.sh sync-raylib`) automatically patches it and builds `bin/onyx_raylib.so`.
+In installed mode:
+- **Plugins & Host WASM:** `$ODIT_HOME` (`~/.local/share/odit`)
+- **Native `.so` Libraries:** `$ONYX_PATH/lib` (`~/.onyx/lib`)
+- **Global User Settings & Layout:** `~/.config/odit/odit.json` and `~/.config/odit/odit-layout.json`
+- **Project Build Config:** `<project>/odit-build.json`
 
 ---
 
-## Keybindings & Controls (Phase 1)
+## Keybindings & Controls
 
-| Shortcut | Action |
+| Shortcut / Input | Action |
 | :--- | :--- |
-| `Ctrl+P` | Open / close the fuzzy **Command Palette** (includes built-in commands, Settings actions, discovered `.wasm` plugins, and plugin-registered commands) |
-| `Ctrl+O` | Open / close the **Fuzzy File Finder** to jump to any workspace file immediately |
-| `Ctrl+,` | Open / close the interactive **Settings Panel** (or click `Settings Ctrl+,` in the top bar) |
-| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Increase / decrease / reset editor font size (`10px – 36px`, auto-saved to `odit.json`) |
-| `F12` / `gd` | **LSP: Go to Definition** (opens target file and jumps cursor) |
-| `K` (Normal) | **LSP: Hover Info** tooltip for symbol under cursor |
-| `Ctrl+Space` | **LSP: Autocomplete** popup (`Up`/`Down` navigate, `Enter`/`Tab` insert, `Esc` close) |
+| `Ctrl+P` | Open / close the fuzzy **Command Palette** (host actions, window docking, discovered `.wasm` plugins, and plugin-registered commands) |
+| `Ctrl+O` | Open / close the **Fuzzy File Finder** to jump to any workspace file |
+| `Ctrl+,` | Open / close the interactive **Settings Panel** |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Increase / decrease / reset editor font size (`10px – 36px`, auto-saved) |
+| `F12` / `gd` | **LSP: Go to Definition** |
+| `K` (Normal) | **LSP: Hover Info** tooltip |
+| `Ctrl+Space` | **LSP: Autocomplete** (`Up`/`Down`, `Enter`/`Tab`, `Esc`) |
 | `F8` | **LSP: Jump to Next Diagnostic** |
-| `Ctrl+Tab` | Cycle focus between the Code Editor and tiled WASM plugin panes |
-| `Ctrl+S` | Save active buffer (saving `odit.json` reloads settings live!) |
-| `Ctrl+Z` | Undo |
-| `Esc` | Return to **NORMAL** mode (or close Command Palette / Settings / unfocus plugin input) |
+| `Ctrl+Tab` | Cycle focus between the Code Editor and plugin panes |
+| `Ctrl+S` / `Ctrl+Z` | Save active buffer (saving `odit.json` reloads live!) / Undo |
+| `Esc` | Return to **NORMAL** mode (or close overlays / unfocus plugin input) |
 | **Normal mode** | `h/j/k/l` or Arrows move, `w`/`b` word jump, `0`/`$` line start/end, `g`/`G` top/bottom, `i`/`a`/`o`/`O` enter **INSERT**, `x` delete char, `dd` delete line, `u` undo |
-| **Mouse / Windows** | **Drag any plugin title bar** to reorder/swap panes, snap to **Left / Right / Bottom** dock edges, or drop in the center to **Float** freely; drag splitters or floating bottom-right corner grips to resize; click header `[ ]`/`v` to toggle Float/Dock or `x` to close (auto-saved to `odit-layout.json`) |
-
-### Settings (`odit.json`)
-Settings are persisted automatically in `odit.json` and take effect live (including in WASM plugins):
-- **Typography & Scaling:** `editor_font_size` (default `18px`), `ui_scale` (default `1.15x`), `line_height_factor` (default `1.4x`), `font_path` (optional custom `.ttf` path)
-- **Color Themes:** `mocha` (Catppuccin Mocha), `tokyo_night`, `gruvbox`, `light`
-- **Editor Behavior:** `tab_size` (`2`/`4`/`8`), `modal_editing`, `show_line_numbers`, `highlight_current_line`, `auto_indent`
-- **Layout:** `split_ratio`, `target_fps`
+| **Horizontal Scroll** | `Shift + MouseWheel` in the Editor or WASM Inspector (plus `<` / `>` pan buttons in WASM Inspector) |
+| **Window Management** | **Drag any plugin title bar** to swap panes, dock to **Left / Right / Bottom** edges, or release in the center to **Float**; drag splitters or floating bottom-right corner grips to resize; click header `[ ]`/`v` to toggle Float/Dock or `x` to close |
 
 ---
 
@@ -88,37 +99,51 @@ Settings are persisted automatically in `odit.json` and take effect live (includ
 
 ```text
 odit/
-├── abi/abi.onyx              # Single source of truth: Host <-> WASM Plugin ABI v1.0.0
-├── sdk/plugin_sdk.onyx       # Ergonomic Onyx guest SDK for writing WASM plugins
-├── native/wasm_host.c        # C bridge wrapping libwasmer.so -> bin/odit_wasm_host.so
+├── abi/abi.onyx                  # Single source of truth: Host <-> WASM Plugin ABI v1.0.0
+├── sdk/plugin_sdk.onyx           # Guest SDK for writing zero-WASI Onyx WASM plugins
+├── native/wasm_host.c            # C Wasmer bridge & POSIX process manager -> bin/odit_wasm_host.so
 ├── src/
-│   ├── main.onyx             # Native host entrypoint, event loop, plugin lifecycle, --self-test
-│   ├── theme.onyx            # Dark theme palette, TTF monospace font loader, safe text helpers
-│   ├── wm/layout.onyx        # Tiled multi-pane window manager, splitter, status bar, toasts
+│   ├── main.onyx                 # Native host entrypoint, CLI, event loop, plugin lifecycle, --self-test
+│   ├── settings.onyx             # Persistent settings (`odit.json` / `~/.config/odit/odit.json`)
+│   ├── theme.onyx                # 4 theme presets, crisp 48px TTF font loader, Raylib draw helpers
+│   ├── wm/layout.onyx            # Draggable, dockable & floating window manager + `odit-layout.json`
+│   ├── lsp/client.onyx           # Non-blocking JSON-RPC 2.0 client for `onyx lsp`
+│   ├── services/
+│   │   ├── workspace.onyx        # Recursive workspace file indexer
+│   │   ├── compiler_wat.onyx     # `onyx --generate-name-section` + `wasm2wat` disassembly service
+│   │   └── docs_index.onyx       # Onyx `~/.onyx/core` & `#` directive documentation indexer
 │   ├── ui/
-│   │   ├── renderer.onyx     # Host Raylib renderer for plugin UI primitives & immediate widgets
-│   │   └── palette.onyx      # Command-first Ctrl+P fuzzy command palette
+│   │   ├── renderer.onyx         # Host Raylib immediate UI renderer for WASM plugins (+ headless mode)
+│   │   ├── palette.onyx          # Command-first `Ctrl+P` fuzzy command palette
+│   │   ├── file_finder.onyx      # `Ctrl+O` fuzzy file finder
+│   │   └── settings_view.onyx    # `Ctrl+,` interactive settings modal
 │   ├── editor/
-│   │   ├── buffer.onyx       # Line-based text buffer, file I/O, undo stack, gutter markers
-│   │   ├── lexer.onyx        # Per-line Onyx syntax highlighter
-│   │   └── view.onyx         # Code editor viewport, gutter, modal & standard editing
+│   │   ├── buffer.onyx           # Line buffer, file I/O, undo stack, gutter markers
+│   │   ├── lexer.onyx            # Per-line Onyx syntax highlighter
+│   │   └── view.onyx             # Editor viewport, horizontal/vertical scroll, modal & standard editing
 │   └── plugin/
-│       ├── loader.onyx       # Foreign bindings to odit_wasm_host.so & guest memory helpers
-│       └── host_abi.onyx     # Exported `__odit_host_dispatch` handling all `odit_host` opcodes
+│       ├── loader.onyx           # Foreign bindings to `odit_wasm_host.so` & guest memory helpers
+│       └── host_abi.onyx         # Exported `__odit_host_dispatch` handling all `odit_host` opcodes
 ├── plugins/
-│   └── welcome/main.onyx     # Phase 1 verification plugin ("WASM Inspector (Demo)")
+│   ├── file_explorer/main.onyx   # File Explorer WASM plugin
+│   ├── build_run/main.onyx       # Build & Run WASM plugin (persistent config + interactive stdin)
+│   ├── wasm_inspector/main.onyx  # Live `.wat` WebAssembly Inspector WASM plugin
+│   ├── docs_browser/main.onyx    # Onyx Core & `#` Directives Docs Browser WASM plugin
+│   └── welcome/main.onyx         # Minimal reference/verification WASM plugin
+├── tests/
+│   └── odit_test.onyx            # Unit test suite powered by `onyx_testing_framework`
 ├── docs/
-│   ├── architecture.md       # Deep dive: Host, Wasmer bridge, isolation, UI & Editor internals
-│   ├── plugin-abi.md         # Complete ABI v1.0 reference & guide to creating WASM plugins
-│   └── roadmap.md            # Phase 1–4 implementation plan, extension points & toolchain notes
-├── build.nu                  # Nushell build/test/run script
-└── build.sh                  # Bash build/test/run script
+│   ├── architecture.md           # Host, Wasmer isolation, WM, LSP & Editor internals
+│   ├── plugin-abi.md             # Complete ABI v1.0 opcode reference & plugin authoring guide
+│   └── roadmap.md                # Phase 1–4 roadmap & Onyx 2611 / Wasmer engineering notes
+├── build.nu                      # Nushell build/test/run/install script
+└── build.sh                      # Bash build/test/run/install script
 ```
 
 ---
 
-## Documentation for Humans & AI Agents
+## Documentation
 
-- **[`docs/architecture.md`](docs/architecture.md)** — How the native Onyx host, `dlopen`-isolated Wasmer C bridge, UI renderer, window manager, and code editor fit together.
-- **[`docs/plugin-abi.md`](docs/plugin-abi.md)** — Exact ABI contract (`abi/abi.onyx`), opcode map, memory safety rules, and how to author a new `.wasm` plugin in minutes.
-- **[`docs/roadmap.md`](docs/roadmap.md)** — Detailed blueprint for Phases 2, 3, and 4, including exact toolchain flags and known Onyx 2611 / Wasmer quirks already solved.
+- **[`docs/architecture.md`](docs/architecture.md)** — How the native Onyx host, `dlopen`-isolated Wasmer C bridge, draggable window manager, Onyx LSP client, UI renderer, and code editor fit together.
+- **[`docs/plugin-abi.md`](docs/plugin-abi.md)** — Complete ABI v1.0 contract (`abi/abi.onyx`), opcode map, memory safety guidelines, and a quickstart template for authoring your own `.wasm` plugin.
+- **[`docs/roadmap.md`](docs/roadmap.md)** — Phase 1–4 status, Phase 4 design notes, and Onyx 2611 / Wasmer toolchain quirks already solved.

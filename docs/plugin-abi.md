@@ -14,13 +14,16 @@ The canonical ABI definition lives in [`abi/abi.onyx`](../abi/abi.onyx). Both th
 3. **Hot-Path Binary Structs vs. JSON**:
    - Per-frame data (`FrameContext` 48B, `EditorCursor` 28B, `KeyEvent` 16B, `ProcessEventHeader` 16B) uses fixed 4-byte-aligned POD structs.
    - Structured queries (`PluginManifest`, `DirEntry[]`, `SymbolInfo[]`, `Diagnostic[]`, `DocEntry[]`, `FunctionWatInfo`, `DebugState`) use UTF-8 JSON.
-4. **Colors**: Packed `u32` in `0xRRGGBBAA` order (`abi.rgba(r, g, b, a)`). Prefer `sdk.theme_color(.Role)` to match the IDE theme.
+4. **Colors**: Packed `u32` in `0xRRGGBBAA` order (`abi.rgba(r, g, b, a)`). Prefer `sdk.theme_color(.Role)` to match the active IDE theme.
+5. **Guest Memory Hygiene (`sdk/plugin_sdk.onyx`)**:
+   - Call `sdk.begin_frame()` at the start of `odit_plugin_render` to clear `context.temp_allocator`.
+   - Always use `sdk.free_str` / `sdk.copy_str` instead of raw `str.free` so empty (`null`) or static strings never trigger a WASM out-of-bounds trap.
 
 ---
 
 ## Required Plugin Exports (Guest → Host)
 
-When using `sdk/plugin_sdk.onyx`, the first 4 exports are provided automatically. Each plugin only implements the 5 lifecycle hooks:
+When using [`sdk/plugin_sdk.onyx`](../sdk/plugin_sdk.onyx), the first 4 exports are provided automatically. Each plugin only implements the 5 lifecycle hooks:
 
 | Export | Provided By | Purpose |
 | :--- | :--- | :--- |
@@ -30,7 +33,7 @@ When using `sdk/plugin_sdk.onyx`, the first 4 exports are provided automatically
 | `odit_free(ptr: u32)` | `sdk/plugin_sdk.onyx` | Frees guest memory |
 | `odit_plugin_manifest(out_ptr, out_cap) -> i32` | Plugin | Writes JSON `PluginManifest` |
 | `odit_plugin_init(window_id) -> i32` | Plugin | Init state, register `Ctrl+P` commands |
-| `odit_plugin_shutdown(window_id)` | Plugin | Clean up state/textures |
+| `odit_plugin_shutdown(window_id)` | Plugin | Clean up state/textures/processes |
 | `odit_plugin_event(window_id, ev_type, ptr, len)` | Plugin | Handle subscribed `EventMask` events |
 | `odit_plugin_render(window_id, ctx_ptr)` | Plugin | Render immediate UI for this frame |
 
@@ -39,48 +42,51 @@ When using `sdk/plugin_sdk.onyx`, the first 4 exports are provided automatically
 ## Host Import Opcodes (`#foreign "odit_host"`)
 
 ### A. Core & Command Palette (`1..19`)
-| Opcode | Function | Phase |
+| Opcode | Function | Status |
 | :---: | :--- | :---: |
-| `1` | `host_log(level, msg_ptr, msg_len)` | 1 |
-| `2` | `host_set_window_title(title_ptr, title_len)` | 1 |
-| `3` | `host_request_redraw()` | 1 |
-| `4` | `host_notify(severity, msg_ptr, msg_len)` | 1 |
-| `5` | `host_register_command(id..., label..., shortcut...) -> u32` | 1 |
-| `6` | `host_execute_command(id..., arg...) -> i32` | 1 |
-| `7` | `host_spawn_plugin(plugin_id...) -> u32` | 1 |
+| `1` | `host_log(level, msg_ptr, msg_len)` | Live |
+| `2` | `host_set_window_title(title_ptr, title_len)` | Live |
+| `3` | `host_request_redraw()` | Live |
+| `4` | `host_notify(severity, msg_ptr, msg_len)` | Live |
+| `5` | `host_register_command(id..., label..., shortcut...) -> u32` | Live |
+| `6` | `host_execute_command(id..., arg...) -> i32` | Live |
+| `7` | `host_spawn_plugin(plugin_id...) -> u32` | Live |
 
 ### B. UI Drawing & Immediate Widgets (`20..49`)
 All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped to the pane.
 
-| Opcode | Function | Phase |
+| Opcode | Function | Status |
 | :---: | :--- | :---: |
-| `20–21` | `ui_push_clip` / `ui_pop_clip` | 1 |
-| `22–23` | `ui_measure_text` / `ui_get_theme_color` | 1 |
-| `24–28` | `ui_draw_rect`, `ui_draw_line`, `ui_draw_arrow`, `ui_draw_circle`, `ui_draw_text` | 1 |
-| `29–32` | `ui_pill`, `ui_button`, `ui_input`, `ui_dropdown` | 1 |
-| `33–34` | `ui_scroll_area_begin` / `ui_scroll_area_end` | 1 |
-| `35–37` | `ui_table_begin` / `ui_table_row` / `ui_table_end` | 1 |
-| `38–40` | `ui_texture_load`, `ui_texture_unload`, `ui_draw_texture` | 1 |
+| `20–21` | `ui_push_clip` / `ui_pop_clip` | Live |
+| `22–23` | `ui_measure_text` / `ui_get_theme_color` | Live |
+| `24–28` | `ui_draw_rect`, `ui_draw_line`, `ui_draw_arrow`, `ui_draw_circle`, `ui_draw_text` | Live |
+| `29–32` | `ui_pill`, `ui_button`, `ui_input`, `ui_dropdown` | Live |
+| `33–34` | `ui_scroll_area_begin` / `ui_scroll_area_end` | Live |
+| `35–37` | `ui_table_begin` / `ui_table_row` / `ui_table_end` | Live |
+| `38–40` | `ui_texture_load`, `ui_texture_unload`, `ui_draw_texture` | Live |
 
 ### C. Workspace, Editor, AST/LSP & Docs (`50..79`)
-| Opcode | Function | Phase |
+| Opcode | Function | Status |
 | :---: | :--- | :---: |
-| `50–52` | `workspace_get_root`, `workspace_list_dir`, `workspace_read_file` | 1 |
-| `53` | `workspace_find_files(ext...)` | 3 |
-| `54–61` | `editor_get_active_path`, `editor_get_buffer_len`, `editor_get_buffer`, `editor_get_cursor`, `editor_open_file`, `editor_set_cursor`, `editor_set_gutter_marker`, `editor_clear_gutter_markers` | 1 |
-| `62–64` | `ast_get_symbols`, `ast_get_references`, `ast_get_diagnostics` | 2 |
-| `65` | `docs_search` | 3 |
+| `50–52` | `workspace_get_root`, `workspace_list_dir`, `workspace_read_file` | Live |
+| `53` | `workspace_find_files(ext...)` | Live |
+| `54–61` | `editor_get_active_path`, `editor_get_buffer_len`, `editor_get_buffer`, `editor_get_cursor`, `editor_open_file`, `editor_set_cursor`, `editor_set_gutter_marker`, `editor_clear_gutter_markers` | Live |
+| `62–64` | `ast_get_symbols`, `ast_get_references`, `ast_get_diagnostics` | Live |
+| `65` | `docs_search(query...)` | Live |
+| `66` | `workspace_write_file(rel_path..., data...)` | Live |
 
 ### D. Process, Compiler & WAT (`80..89`)
-| Opcode | Function | Phase |
+| Opcode | Function | Status |
 | :---: | :--- | :---: |
-| `80–83` | `proc_spawn`, `proc_poll_status`, `proc_read_output`, `proc_kill` | 3 |
-| `84–85` | `compiler_build`, `compiler_get_function_wat` | 3 |
+| `80–83` | `proc_spawn`, `proc_poll_status`, `proc_read_output`, `proc_kill` | Live |
+| `84` | `compiler_build(entry..., target, flags)` | Live |
+| `85` | `compiler_get_function_wat(file..., func..., out...)` | Live |
+| `86` | `proc_write_input(handle, data_ptr, data_len)` | Live |
 
 ### E. Live Debugger (`90..99`)
-| Opcode | Function | Phase |
+| Opcode | Function | Status |
 | :---: | :--- | :---: |
-| `90–94` | `debug_toggle_breakpoint`, `debug_get_breakpoints`, `debug_start`, `debug_command`, `debug_get_state` | 4 |
+| `90–94` | `debug_toggle_breakpoint`, `debug_get_breakpoints`, `debug_start`, `debug_command`, `debug_get_state` | Phase 4 |
 
 ---
 
@@ -113,9 +119,10 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
 
    #export "odit_plugin_render" plugin_render
    plugin_render :: (window_id, ctx_ptr: u32) -> void {
+       sdk.begin_frame();
        ctx := cast(&abi.FrameContext) ctx_ptr;
-       sdk.draw_text(12.0, 12.0, "Hello from WASM!", 14.0, sdk.theme_color(.TextPrimary));
+       sdk.draw_text(12.0f, 12.0f, "Hello from WASM!", 14.0f, sdk.theme_color(.TextPrimary));
    }
    ```
-2. Run `nu build.nu plugins` (auto-discovers every `plugins/*/main.onyx` and outputs `build/plugins/<my_plugin>.wasm`).
+2. Run `nu build.nu plugins` (or `nu build.nu install` to update your global install) — every `plugins/*/main.onyx` is compiled automatically to `build/plugins/<my_plugin>.wasm`.
 3. Inside `odit`, press `Ctrl+P` → `Plugin: Open my_plugin.wasm` (or `Plugins: Reload All .wasm Plugins`).

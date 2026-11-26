@@ -82,6 +82,10 @@ onyx build -r custom -DComponent_Build --wasm-mvp -o build/plugins/<name>.wasm p
 - **Per-frame memory hygiene**: `src/main.onyx` calls `alloc.clear_temp_allocator()` at the start of every frame and every plugin calls `sdk.begin_frame()`. All Raylib string conversions (`theme.to_temp_cstr`), formatting (`tprintf`), and plugin memory reads use `context.temp_allocator`.
 
 ### 5. Core Code Editor (`src/editor/`)
-- **`buffer.onyx`**: Line-oriented `[..] [..] u8` buffer supporting fast edits, undo snapshots (up to 64 levels), `EditorCursor` synchronization, file load/save, and plugin-driven gutter markers (`GutterMarker`).
+- **`buffer.onyx`**: Line-oriented `[..] [..] u8` buffer supporting fast edits, multi-step undo snapshots (up to 64 levels), `EditorCursor` synchronization, file load/save, and plugin-driven gutter markers (`GutterMarker`).
 - **`lexer.onyx`**: Zero-allocation per-line Onyx syntax tokenizer highlighting keywords, `#` directives, `@` tags, types, strings, numbers, comments, functions, and operators.
-- **`view.onyx`**: Supports modal Normal/Insert editing (`h/j/k/l`, `w/b`, `0/$`, `g/G`, `i/a/o/O`, `x`, `dd`, `u`) alongside desktop shortcuts (`Ctrl+S`, `Ctrl+Z`, arrows, Home/End, PgUp/PgDn, mouse click/scroll). Modal mode can be toggled at runtime via `Ctrl+P`.
+- **`view.onyx`**: Supports modal Normal/Insert editing (`h/j/k/l`, `w/b`, `0/$`, `g/G`, `i/a/o/O`, `x`, `dd`, `u`) alongside standard shortcuts (`Ctrl+S`, `Ctrl+Z`, arrows, Home/End, PgUp/PgDn, mouse click/scroll). Uses `0.0f` monospace spacing and exact prefix-width positioning (`theme.measure_text`) so syntax tokens, cursor rendering, and mouse clicks stay pixel-aligned on lines of any length. Supports horizontal scrolling (`Shift+MouseWheel` + cursor auto-scroll + bottom scrollbar) clipped cleanly to the right of the line-number gutter.
+
+### 6. Global Installation & Multi-Project Support
+- **`ODIT_HOME`:** When launched via the installed `~/.local/bin/odit` wrapper (`nu build.nu install`), `src/main.onyx` loads plugins from `$ODIT_HOME/plugins`, native `.so` libraries from `$ONYX_PATH/lib`, global settings/layout from `~/.config/odit/`, and project-specific `odit-build.json` from the opened workspace directory (`cwd` or CLI directory/file argument).
+- **Testing:** Unit tests live in `tests/odit_test.onyx` (powered by [`onyx_testing_framework`](https://github.com/pigeonowo/onyx_testing_framework), run via `nu build.nu unit`), complemented by an end-to-end headless WASM plugin + Onyx LSP integration suite (`nu build.nu test`).
