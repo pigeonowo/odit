@@ -1,12 +1,12 @@
 // =============================================================================
-// Onyx Editor ("odit") — Built-in Phase 1 Verification Plugin ("Inspector")
+// Onyx Editor ("odit") — Reference & Verification WASM Plugin ("Inspector")
 // =============================================================================
-// Demonstrates every Phase 1 ABI feature from inside a sandboxed `.wasm`
-// module:
-//   - Live Editor Context (`editor_active_path`, `editor_cursor`, `editor_buffer`)
-//   - Immediate UI primitives (rects, pills/badges, lines, arrows, circles)
-//   - Interactive widgets (buttons, text input, scroll area)
-//   - Command palette registration (`Ctrl+P` -> "Inspector: Ping Host")
+// Showcases the modernized declarative `odit.sdk`:
+//   - `@sdk.Plugin.{ ... }` struct decorator (auto-generates manifest & state)
+//   - `@sdk.PluginInit`, `@sdk.PluginShutdown`, `@sdk.PluginEvent`, `@sdk.PluginRender`
+//   - Typed `sdk.Event` tagged union (`case .Command as cmd`, etc.)
+//   - Trailing `Code`-block macros (`sdk.card`, `sdk.on_click`, `sdk.each_json_object`)
+//   - `sdk.VStack` vertical layout helper
 
 #load "../../abi/abi.onyx"
 #load "../../sdk/plugin_sdk.onyx"
@@ -15,160 +15,157 @@ use core { memory }
 use odit.abi
 use odit.sdk
 
-// Plugin-local retained state
-g_clicks:       u32 = 0;
-g_events_seen:  u32 = 0;
-g_lsp_syms:     u32 = 0;
-g_lsp_diags:    u32 = 0;
-g_scroll_y:     f32 = 0.0;
-g_note_buf:     [128] u8;
-g_note_len:     u32 = 0;
-g_last_event:   [64] u8;
-g_last_ev_len:  u32 = 0;
-
-MANIFEST_JSON :: """{"id":"odit.inspector","title":"WASM Inspector (Demo)","version":"0.2.0","default_slot":0,"default_width":360,"default_height":260,"event_mask":95,"allow_multiple":false}"""
-
-#export "odit_plugin_manifest" plugin_manifest
-plugin_manifest :: (out_ptr: u32, out_cap: u32) -> i32 {
-    return sdk.write_out_str(MANIFEST_JSON, out_ptr, out_cap);
+@sdk.Plugin.{
+    id             = "odit.inspector",
+    title          = "WASM Inspector (Demo)",
+    version        = "0.3.0",
+    default_slot   = 0,
+    default_width  = 360.0f,
+    default_height = 280.0f,
+    event_mask     = 95,
+    allow_multiple = false,
+}
+InspectorPlugin :: struct {
+    clicks:      u32;
+    events_seen: u32;
+    lsp_syms:    u32;
+    lsp_diags:   u32;
+    note_buf:    [128] u8;
+    note_len:    u32;
+    last_event:  str;
 }
 
-#export "odit_plugin_init" plugin_init
-plugin_init :: (window_id: u32) -> i32 {
+@sdk.PluginInit
+init :: (self: &InspectorPlugin, window_id: u32) -> i32 {
     sdk.log_info("WASM plugin 'odit.inspector' initialized!");
-    sdk.register_command("inspector.ping", "Inspector: Ping Host Notification", "");
+    sdk.register_command("inspector.ping",  "Inspector: Ping Host Notification", "");
     sdk.register_command("inspector.reset", "Inspector: Reset Counter", "");
 
-    initial := "Hello from WASM!";
-    memory.copy(&g_note_buf[0], initial.data, initial.count);
-    g_note_len = cast(u32) initial.count;
+    initial := "Hello from modern WASM SDK!";
+    memory.copy(&self.note_buf[0], initial.data, initial.count);
+    self.note_len   = cast(u32) initial.count;
+    self.last_event = "None";
     return 0;
 }
 
-#export "odit_plugin_shutdown" plugin_shutdown
-plugin_shutdown :: (window_id: u32) -> void {
+@sdk.PluginShutdown
+shutdown :: (self: &InspectorPlugin, window_id: u32) {
     sdk.log_info("WASM plugin 'odit.inspector' shut down.");
 }
 
-#export "odit_plugin_event" plugin_event
-plugin_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len: u32) -> void {
-    g_events_seen += 1;
-    ev := cast(abi.EventType) event_type;
+@sdk.PluginEvent
+on_event :: (self: &InspectorPlugin, window_id: u32, event: sdk.Event) {
+    self.events_seen += 1;
 
-    if ev == .CommandInvoked && payload_ptr != 0 && payload_len > 0 {
-        payload := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len };
-        if str_contains(payload, "inspector.ping") {
-            sdk.notify(.Info, "Pong from sandboxed WASM plugin!");
-        } elseif str_contains(payload, "inspector.reset") {
-            g_clicks = 0;
-            sdk.notify(.Info, "Inspector click counter reset.");
+    switch event {
+        case .Command as cmd {
+            self.last_event = "CommandInvoked";
+            if cmd == "inspector.ping" {
+                sdk.notify(.Info, "Pong from sandboxed WASM plugin!");
+            } elseif cmd == "inspector.reset" {
+                self.clicks = 0;
+                sdk.notify(.Info, "Inspector click counter reset.");
+            }
         }
+        case .ActiveFileChanged {
+            self.last_event = "ActiveFileChanged";
+            refresh_lsp_counts(self);
+        }
+        case .SymbolsUpdated {
+            self.last_event = "SymbolsUpdated";
+            refresh_lsp_counts(self);
+        }
+        case .DiagnosticsUpdated {
+            self.last_event = "DiagnosticsUpdated";
+            refresh_lsp_counts(self);
+        }
+        case .BufferModified do self.last_event = "BufferModified";
+        case .CursorMoved    do self.last_event = "CursorMoved";
+        case _               do self.last_event = "Event";
     }
-
-    if ev == .SymbolsUpdated || ev == .DiagnosticsUpdated || ev == .ActiveFileChanged {
-        refresh_lsp_counts();
-    }
-
-    label := switch ev {
-        case .ActiveFileChanged  => "ActiveFileChanged";
-        case .BufferModified     => "BufferModified";
-        case .CursorMoved        => "CursorMoved";
-        case .DiagnosticsUpdated => "DiagnosticsUpdated";
-        case .SymbolsUpdated     => "SymbolsUpdated";
-        case .CommandInvoked     => "CommandInvoked";
-        case _                   => "Event";
-    };
-    copy_len := label.count;
-    if copy_len > 63 do copy_len = 63;
-    memory.copy(&g_last_event[0], label.data, copy_len);
-    g_last_ev_len = cast(u32) copy_len;
 }
 
-#export "odit_plugin_render" plugin_render
-plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
-    sdk.begin_frame();
-    ctx := cast(&abi.FrameContext) ctx_ptr;
-    pad: f32 = 12.0;
-    y: f32 = pad;
-    w := ctx.width - pad * 2.0;
-    if w < 100.0 do w = 100.0;
+@sdk.PluginRender
+render :: (self: &InspectorPlugin, window_id: u32, ctx: &abi.FrameContext) {
+    pad: f32 = 12.0f;
+    w := ctx.width - pad * 2.0f;
+    if w < 120.0f do w = 120.0f;
 
-    bg_surface := sdk.theme_color(.BgSurface);
-    border_col := sdk.theme_color(.Border);
-    text_pri   := sdk.theme_color(.TextPrimary);
-    text_sec   := sdk.theme_color(.TextSecondary);
-    accent     := sdk.theme_color(.Accent);
-    success    := sdk.theme_color(.Success);
-    info       := sdk.theme_color(.Info);
+    v := sdk.vstack(pad, pad, w, 8.0f);
 
     // Header badge strip
-    pw := sdk.pill(pad, y, "WASM", accent, 0x11111BFF);
-    pw2 := sdk.pill(pad + pw + 6.0, y, "ABI v1.0", success, 0x11111BFF);
-    sdk.pill(pad + pw + pw2 + 12.0, y, "SANDBOXED", info, 0x11111BFF);
-    y += 30.0;
+    by := v->next(24.0f);
+    pw  := sdk.pill(pad, by, "WASM",      sdk.theme_color(.Accent),  0x11111BFF);
+    pw2 := sdk.pill(pad + pw + 6.0f, by, "ABI v1.0", sdk.theme_color(.Success), 0x11111BFF);
+    sdk.pill(pad + pw + pw2 + 12.0f, by, "MODERN SDK", sdk.theme_color(.Info), 0x11111BFF);
 
-    // Live Editor & LSP Context Card
-    sdk.draw_rect(pad, y, w, 114.0, bg_surface, 6.0, border_col, 1.0);
-    sdk.draw_text(pad + 10.0, y + 8.0, "Active Editor & Onyx LSP Context", 13.0, text_sec, .Bold);
+    // Live Editor & LSP Context Card (trailing Code-block macro!)
+    card_y := v->next(110.0f);
+    sdk.card(pad, card_y, w, 110.0f, "Active Editor & Onyx LSP Context") {
+        active_path := sdk.editor_active_path();
+        if active_path.count == 0 do active_path = "(untitled)";
+        sdk.draw_text(pad + 10.0f, card_y + 34.0f, active_path, 13.5f, sdk.theme_color(.TextPrimary), .Mono);
 
-    active_path := sdk.editor_active_path();
-    if active_path.count == 0 do active_path = "(untitled)";
-    sdk.draw_text(pad + 10.0, y + 28.0, active_path, 14.0, text_pri, .Mono);
+        cur := sdk.editor_cursor();
+        buf_len := abi.editor_get_buffer_len();
+        line_buf: [96] u8;
+        sdk.draw_text(pad + 10.0f, card_y + 56.0f, format_cursor_line(&line_buf, cur.line, cur.column, buf_len),
+                      12.5f, sdk.theme_color(.Info), .Mono);
 
-    cur := sdk.editor_cursor();
-    buf_len := abi.editor_get_buffer_len();
+        lsp_buf: [96] u8;
+        sdk.draw_text(pad + 10.0f, card_y + 76.0f, format_lsp_line(&lsp_buf, self.lsp_syms, self.lsp_diags),
+                      12.0f, sdk.theme_color(.Success) if self.lsp_diags == 0 else sdk.theme_color(.Warning), .Mono);
 
-    num_buf: [96] u8;
-    status_line := format_cursor_line(&num_buf, cur.line, cur.column, buf_len, cur.is_dirty != 0);
-    sdk.draw_text(pad + 10.0, y + 50.0, status_line, 13.0, info, .Mono);
+        ev_buf: [96] u8;
+        sdk.draw_text(pad + 10.0f, card_y + 92.0f, format_event_line(&ev_buf, self.events_seen, self.last_event),
+                      11.5f, sdk.theme_color(.TextSecondary));
+    }
 
-    lsp_buf: [96] u8;
-    lsp_line := format_lsp_line(&lsp_buf, g_lsp_syms, g_lsp_diags);
-    sdk.draw_text(pad + 10.0, y + 70.0, lsp_line, 12.0, success, .Mono);
-
-    ev_buf: [96] u8;
-    last_ev_str := str.{ &g_last_event[0], cast(i32) g_last_ev_len };
-    if last_ev_str.count == 0 do last_ev_str = "none";
-    ev_line := format_events_line(&ev_buf, g_events_seen, last_ev_str);
-    sdk.draw_text(pad + 10.0, y + 90.0, ev_line, 12.0, text_sec, .Mono);
-
-    y += 126.0;
-
-    // Interactive Controls
-    sdk.draw_text(pad, y, "Host ABI Widget Test", 13.0, text_sec, .Bold);
-    y += 20.0;
-
-    btn_w := (w - 8.0) * 0.5;
-    if sdk.button(1, pad, y, btn_w, 28.0, "Click WASM +1", .Primary) & .Clicked {
-        g_clicks += 1;
+    // Interactive buttons using `sdk.on_click` trailing Code blocks
+    btn_y := v->next(28.0f);
+    bw := (w - 8.0f) * 0.5f;
+    sdk.on_click(1, pad, btn_y, bw, 28.0f, "Click +1", .Primary) {
+        self.clicks += 1;
         sdk.notify(.Info, "WASM button clicked!");
     }
-    if sdk.button(2, pad + btn_w + 8.0, y, btn_w, 28.0, "Jump Line 1", .Ghost) & .Clicked {
-        abi.editor_set_cursor(1, 1);
+    sdk.on_click(2, pad + bw + 8.0f, btn_y, bw, 28.0f, "Ping Host", .Ghost) {
+        sdk.notify(.Info, "Pong from sandboxed WASM plugin!");
     }
-    y += 36.0;
 
-    click_buf: [64] u8;
-    click_str := format_clicks(&click_buf, g_clicks);
-    sdk.draw_text(pad, y, click_str, 13.0, text_pri, .Mono);
-    y += 22.0;
+    cnt_buf: [48] u8;
+    v->text(format_clicks(&cnt_buf, self.clicks), 12.5f, sdk.theme_color(.TextSecondary));
 
-    // Editable text input inside WASM plugin
-    sdk.input_text(3, pad, y, w, 28.0, g_note_buf, &g_note_len, "Type inside WASM plugin...");
-    y += 38.0;
-
-    // Visual primitives demo (line + arrow + circle)
-    sdk.draw_circle(pad + 8.0, y + 8.0, 5.0, success);
-    sdk.draw_arrow(pad + 20.0, y + 8.0, pad + 64.0, y + 8.0, 2.0, 6.0, accent);
-    sdk.draw_text(pad + 72.0, y + 1.0, "Rendered via odit_host ABI", 12.0, text_sec);
+    // Plugin text input
+    inp_y := v->next(28.0f);
+    sdk.input_text(3, pad, inp_y, w, 28.0f, self.note_buf, &self.note_len, "Type a note...");
 }
 
-// -----------------------------------------------------------------------------
-// Zero-allocation formatting helpers (keeps WASM binary super small & fast)
-// -----------------------------------------------------------------------------
+#local
+refresh_lsp_counts :: (self: &InspectorPlugin) {
+    self.lsp_syms  = 0;
+    self.lsp_diags = 0;
+
+    syms_js := sdk.ast_symbols_json("", context.temp_allocator);
+    sdk.each_json_object(syms_js, [obj] {
+        _ := obj;
+        self.lsp_syms += 1;
+    });
+
+    diag_js := "";
+    needed := abi.ast_get_diagnostics(0, 0, 0, 0);
+    if needed > 0 {
+        buf := make([] u8, needed, context.temp_allocator);
+        got := abi.ast_get_diagnostics(0, 0, cast(u32) buf.data, cast(u32) buf.count);
+        if got > 0 do diag_js = buf[0 .. got];
+    }
+    sdk.each_json_object(diag_js, [obj] {
+        _ := obj;
+        self.lsp_diags += 1;
+    });
+}
 
 #local
-append_str :: (dst: [&] u8, pos: &i32, cap: i32, s: str) {
+append_s :: (dst: [&] u8, pos: &i32, cap: i32, s: str) {
     for i in 0 .. s.count {
         if *pos >= cap do break;
         dst[*pos] = s[i];
@@ -178,109 +175,60 @@ append_str :: (dst: [&] u8, pos: &i32, cap: i32, s: str) {
 
 #local
 append_u32 :: (dst: [&] u8, pos: &i32, cap: i32, v: u32) {
-    if v == 0 {
-        append_str(dst, pos, cap, "0");
-        return;
-    }
+    if v == 0 { append_s(dst, pos, cap, "0"); return; }
     tmp: [16] u8;
     n := 0;
-    cur := v;
-    while cur > 0 && n < 16 {
-        tmp[n] = cast(u8) ('0' + (cur % 10));
-        cur /= 10;
+    x := v;
+    while x > 0 && n < 16 {
+        tmp[n] = cast(u8) ('0' + (x % 10));
+        x /= 10;
         n += 1;
     }
     while n > 0 {
         n -= 1;
-        if *pos < cap {
-            dst[*pos] = tmp[n];
-            *pos += 1;
-        }
+        if *pos < cap { dst[*pos] = tmp[n]; *pos += 1; }
     }
 }
 
 #local
-format_cursor_line :: (buf: &[96] u8, line, col: u32, bytes: i32, dirty: bool) -> str {
+format_cursor_line :: (buf: &[96] u8, line, col: u32, bytes: i32) -> str {
     p := 0;
-    append_str(&(*buf)[0], &p, 96, "Ln ");
+    append_s(&(*buf)[0], &p, 96, "Cursor: Ln ");
     append_u32(&(*buf)[0], &p, 96, line);
-    append_str(&(*buf)[0], &p, 96, ", Col ");
+    append_s(&(*buf)[0], &p, 96, ", Col ");
     append_u32(&(*buf)[0], &p, 96, col);
-    append_str(&(*buf)[0], &p, 96, "  |  ");
-    if bytes > 0 do append_u32(&(*buf)[0], &p, 96, cast(u32) bytes);
-    else do append_str(&(*buf)[0], &p, 96, "0");
-    append_str(&(*buf)[0], &p, 96, " B");
-    if dirty do append_str(&(*buf)[0], &p, 96, " [modified]");
+    append_s(&(*buf)[0], &p, 96, "  |  ");
+    append_u32(&(*buf)[0], &p, 96, cast(u32) (bytes if bytes > 0 else 0));
+    append_s(&(*buf)[0], &p, 96, " bytes");
     return str.{ &(*buf)[0], p };
-}
-
-#local
-format_events_line :: (buf: &[96] u8, count: u32, last_ev: str) -> str {
-    p := 0;
-    append_str(&(*buf)[0], &p, 96, "Events: ");
-    append_u32(&(*buf)[0], &p, 96, count);
-    append_str(&(*buf)[0], &p, 96, " (last: ");
-    append_str(&(*buf)[0], &p, 96, last_ev);
-    append_str(&(*buf)[0], &p, 96, ")");
-    return str.{ &(*buf)[0], p };
-}
-
-#local
-format_clicks :: (buf: &[64] u8, clicks: u32) -> str {
-    p := 0;
-    append_str(&(*buf)[0], &p, 64, "Plugin state clicks = ");
-    append_u32(&(*buf)[0], &p, 64, clicks);
-    return str.{ &(*buf)[0], p };
-}
-
-#local
-count_json_objects :: (js: str) -> u32 {
-    n: u32 = 0;
-    for i in 0 .. js.count {
-        if js[i] == '{' do n += 1;
-    }
-    return n;
-}
-
-#local
-refresh_lsp_counts :: () {
-    sym_len := abi.ast_get_symbols(0, 0, 0, 0);
-    if sym_len > 0 && sym_len < 512 * 1024 {
-        buf := make([] u8, sym_len, context.temp_allocator);
-        got := abi.ast_get_symbols(0, 0, cast(u32) buf.data, cast(u32) buf.count);
-        if got > 0 do g_lsp_syms = count_json_objects(buf[0 .. got]);
-    }
-    diag_len := abi.ast_get_diagnostics(0, 0, 0, 0);
-    if diag_len > 0 && diag_len < 512 * 1024 {
-        buf := make([] u8, diag_len, context.temp_allocator);
-        got := abi.ast_get_diagnostics(0, 0, cast(u32) buf.data, cast(u32) buf.count);
-        if got > 0 do g_lsp_diags = count_json_objects(buf[0 .. got]);
-    }
 }
 
 #local
 format_lsp_line :: (buf: &[96] u8, syms, diags: u32) -> str {
     p := 0;
-    append_str(&(*buf)[0], &p, 96, "LSP Symbols: ");
+    append_s(&(*buf)[0], &p, 96, "LSP: ");
     append_u32(&(*buf)[0], &p, 96, syms);
-    append_str(&(*buf)[0], &p, 96, "  |  Diagnostics: ");
+    append_s(&(*buf)[0], &p, 96, " symbols, ");
     append_u32(&(*buf)[0], &p, 96, diags);
+    append_s(&(*buf)[0], &p, 96, " diagnostics");
     return str.{ &(*buf)[0], p };
 }
 
 #local
-str_contains :: (haystack: str, needle: str) -> bool {
-    if needle.count == 0 do return true;
-    if haystack.count < needle.count do return false;
-    for i in 0 .. (haystack.count - needle.count + 1) {
-        match := true;
-        for j in 0 .. needle.count {
-            if haystack[i + j] != needle[j] {
-                match = false;
-                break;
-            }
-        }
-        if match do return true;
-    }
-    return false;
+format_event_line :: (buf: &[96] u8, count: u32, last: str) -> str {
+    p := 0;
+    append_s(&(*buf)[0], &p, 96, "Events: ");
+    append_u32(&(*buf)[0], &p, 96, count);
+    append_s(&(*buf)[0], &p, 96, " (last: ");
+    append_s(&(*buf)[0], &p, 96, last);
+    append_s(&(*buf)[0], &p, 96, ")");
+    return str.{ &(*buf)[0], p };
+}
+
+#local
+format_clicks :: (buf: &[48] u8, clicks: u32) -> str {
+    p := 0;
+    append_s(&(*buf)[0], &p, 48, "Button clicks: ");
+    append_u32(&(*buf)[0], &p, 48, clicks);
+    return str.{ &(*buf)[0], p };
 }

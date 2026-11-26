@@ -1,19 +1,31 @@
 package odit.sdk
 
 // =============================================================================
-// Onyx Editor ("odit") — Guest Plugin SDK
+// Onyx Editor ("odit") — Modernized Guest Plugin SDK
 // =============================================================================
-// Load this file + `abi/abi.onyx` + `sdk/platform.onyx` in any WASM plugin.
-// Automatically exports the mandatory ABI boilerplate (`odit_abi_version`,
-// `odit_alloc`, `odit_free`) and provides ergonomic Onyx wrappers over every
-// raw scalar `#foreign "odit_host"` call.
+// Load `abi/abi.onyx` and `sdk/plugin_sdk.onyx` in any WASM plugin.
+//
+// Features:
+//   - Declarative plugin decorators (`@sdk.Plugin.{...}`, `@sdk.PluginInit`,
+//     `@sdk.PluginShutdown`, `@sdk.PluginEvent`, `@sdk.PluginRender`) that
+//     automatically export all 5 WASM lifecycle hooks and manage plugin state
+//   - Typed `sdk.Event` tagged union decoded from raw ABI event payloads
+//   - Scoped trailing `Code`-block macros (`sdk.scroll_area`, `sdk.clipped`,
+//     `sdk.table`, `sdk.card`, `sdk.on_click`, `sdk.each_json_object`)
+//   - `VStack` vertical layout helper and `row_hit` hit-testing helper
+//   - Null-safe WASM guest string helpers (`sdk.free_str`, `sdk.copy_str`)
+//   - Full backward compatibility with manual `#export "odit_plugin_*"` plugins
 
-use core { memory, raw_alloc, raw_free, alloc }
+use core { memory, raw_alloc, raw_free, alloc, Array }
 use runtime
 use odit.abi
 
-/// Call at the top of `odit_plugin_render` to reclaim temporary allocations
-/// made during the previous frame (prevents temp_allocator exhaustion!).
+// -----------------------------------------------------------------------------
+// 1. Frame & Guest Memory Hygiene Helpers
+// -----------------------------------------------------------------------------
+
+/// Call at the top of manual `odit_plugin_render` (called automatically when
+/// using `@sdk.PluginRender`) to reclaim scratch allocations from last frame.
 begin_frame :: () {
     alloc.clear_temp_allocator();
 }
@@ -33,13 +45,128 @@ copy_str :: (s: str) -> str {
 }
 
 // -----------------------------------------------------------------------------
-// Mandatory Guest ABI Exports
+// 2. Declarative Plugin Decorators & Typed `Event` Union
 // -----------------------------------------------------------------------------
 
-#export "_initialize" __odit_runtime_init
-__odit_runtime_init :: () {
-    runtime.__runtime_initialize();
-    context.thread_id = 0;
+/// Attach to your plugin's state struct to declare manifest metadata and enable
+/// automatic WASM lifecycle exports:
+///
+///     @sdk.Plugin.{
+///         id = "odit.my_plugin",
+///         title = "My Plugin",
+///         version = "0.1.0",
+///         default_slot = 0,
+///         default_width = 360,
+///         default_height = 240,
+///         event_mask = 64,
+///         allow_multiple = false,
+///     }
+///     MyPlugin :: struct { count: u32; }
+Plugin :: struct {
+    id:             str;
+    title:          str;
+    version:        str  = "0.1.0";
+    default_slot:   u32  = 0;
+    default_width:  f32  = 360.0f;
+    default_height: f32  = 240.0f;
+    event_mask:     u32  = 0;
+    allow_multiple: bool = false;
+}
+
+/// Marks `(self: &MyPlugin, window_id: u32) -> i32` as the plugin initializer.
+PluginInit :: struct {}
+
+/// Marks `(self: &MyPlugin, window_id: u32) -> void` as the shutdown hook.
+PluginShutdown :: struct {}
+
+/// Marks `(self: &MyPlugin, window_id: u32, event: sdk.Event) -> void` as the event handler.
+PluginEvent :: struct {}
+
+/// Marks `(self: &MyPlugin, window_id: u32, ctx: &abi.FrameContext) -> void` as the frame renderer.
+PluginRender :: struct {}
+
+BufferModifiedEvent :: struct {
+    path:    str;
+    version: i32;
+    saved:   bool;
+}
+
+RawEvent :: struct {
+    type:    abi.EventType;
+    payload: [] u8;
+}
+
+/// High-level typed event union delivered to `@sdk.PluginEvent` handlers.
+Event :: union {
+    None:               void;
+    ActiveFileChanged:  str;
+    BufferModified:     BufferModifiedEvent;
+    CursorMoved:        abi.EditorCursor;
+    DiagnosticsUpdated: str;
+    SymbolsUpdated:     str;
+    Command:            str; // Command ID extracted from JSON payload
+    WorkspaceChanged:   str;
+    KeyInput:           abi.KeyEvent;
+    Raw:                RawEvent;
+}
+
+/// Decodes raw ABI `(event_type, payload_ptr, payload_len)` into a typed `Event`.
+decode_event :: (event_type: u32, payload_ptr: u32, payload_len: u32) -> Event {
+    ev := cast(abi.EventType) event_type;
+    raw_str := str.{ cast([&] u8) payload_ptr, cast(i32) payload_len } if (payload_ptr != 0 && payload_len > 0) else "";
+
+    switch ev {
+        case .ActiveFileChanged  do return .{ ActiveFileChanged  = raw_str };
+        case .DiagnosticsUpdated do return .{ DiagnosticsUpdated = raw_str };
+        case .SymbolsUpdated     do return .{ SymbolsUpdated     = raw_str };
+        case .WorkspaceChanged   do return .{ WorkspaceChanged   = raw_str };
+        case .CommandInvoked {
+            id := json_get_str(raw_str, "id", context.temp_allocator);
+            return .{ Command = id if id.count > 0 else raw_str };
+        }
+        case .BufferModified {
+            return .{ BufferModified = .{
+                path    = json_get_str(raw_str, "path", context.temp_allocator),
+                version = json_get_i32(raw_str, "version"),
+                saved   = json_get_bool(raw_str, "saved"),
+            } };
+        }
+        case .CursorMoved {
+            if payload_ptr != 0 && payload_len >= cast(u32) sizeof abi.EditorCursor {
+                return .{ CursorMoved = *cast(&abi.EditorCursor) payload_ptr };
+            }
+            return .{ None = .{} };
+        }
+        case .KeyInput {
+            if payload_ptr != 0 && payload_len >= cast(u32) sizeof abi.KeyEvent {
+                return .{ KeyInput = *cast(&abi.KeyEvent) payload_ptr };
+            }
+            return .{ None = .{} };
+        }
+        case .None do return .{ None = .{} };
+        case _ {
+            bytes := ([] u8).{ cast([&] u8) payload_ptr, cast(i32) payload_len } if payload_ptr != 0 else .[];
+            return .{ Raw = .{ ev, bytes } };
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 3. Mandatory Guest ABI Exports + Automatic Declarative Lifecycle Dispatch
+// -----------------------------------------------------------------------------
+
+#if runtime.runtime == .Custom {
+    #export "_initialize" __odit_runtime_init
+    __odit_runtime_init :: () {
+        runtime.__runtime_initialize();
+        context.thread_id = 0;
+    }
+}
+
+#if runtime.runtime == .Js && !#defined(main.main) {
+    #inject main {
+        main :: () {}
+    }
 }
 
 #export "odit_abi_version" __odit_abi_version
@@ -72,6 +199,286 @@ write_out_str :: (s: str, out_ptr: u32, out_cap: u32) -> i32 {
         memory.copy(cast(rawptr) out_ptr, s.data, s.count);
     }
     return cast(i32) s.count;
+}
+
+#local
+__PluginRuntime :: struct {
+    discovered:    bool;
+    has_plugin:    bool;
+    has_init:      bool;
+    has_shutdown:  bool;
+    has_event:     bool;
+    has_render:    bool;
+    meta:          Plugin;
+    state_ptr:     rawptr;
+    manifest_json: str;
+    fn_init:       (rawptr, u32) -> i32;
+    fn_shutdown:   (rawptr, u32) -> void;
+    fn_event:      (rawptr, u32, Event) -> void;
+    fn_render:     (rawptr, u32, &abi.FrameContext) -> void;
+}
+
+#local __rt: __PluginRuntime;
+
+#local
+__append_u32 :: (out: &[..] u8, v: u32) {
+    if v == 0 { *out << '0'; return; }
+    tmp: [16] u8;
+    n := 0;
+    x := v;
+    while x > 0 && n < 16 {
+        tmp[n] = cast(u8) ('0' + (x % 10));
+        x /= 10;
+        n += 1;
+    }
+    while n > 0 {
+        n -= 1;
+        *out << tmp[n];
+    }
+}
+
+#local
+__append_json_escaped :: (out: &[..] u8, s: str) {
+    for i in 0 .. s.count {
+        c := s[i];
+        if c == '"'       do Array.concat(out, "\\\"");
+        elseif c == '\\'  do Array.concat(out, "\\\\");
+        elseif c == '\n'  do Array.concat(out, "\\n");
+        else              do *out << c;
+    }
+}
+
+#local
+__build_manifest_json :: (m: &Plugin) -> str {
+    out := make([..] u8, 256);
+    Array.concat(&out, "{\"id\":\"");      __append_json_escaped(&out, m.id);
+    Array.concat(&out, "\",\"title\":\"");  __append_json_escaped(&out, m.title);
+    Array.concat(&out, "\",\"version\":\""); __append_json_escaped(&out, m.version if m.version.count > 0 else "0.1.0");
+    Array.concat(&out, "\",\"default_slot\":");   __append_u32(&out, m.default_slot);
+    Array.concat(&out, ",\"default_width\":");    __append_u32(&out, cast(u32) (m.default_width if m.default_width > 0.0f else 360.0f));
+    Array.concat(&out, ",\"default_height\":");   __append_u32(&out, cast(u32) (m.default_height if m.default_height > 0.0f else 240.0f));
+    Array.concat(&out, ",\"event_mask\":");       __append_u32(&out, m.event_mask);
+    Array.concat(&out, ",\"allow_multiple\":");   Array.concat(&out, "true}" if m.allow_multiple else "false}");
+    return str.{ out.data, out.count };
+}
+
+#local
+__tag_matches :: (tag: &any, $T: type_expr) -> bool {
+    if tag.type == T do return true;
+    if tag.type == type_expr && tag.data != null {
+        return (*cast(&type_expr) tag.data) == T;
+    }
+    return false;
+}
+
+#local
+__ensure_discovered :: () {
+    if __rt.discovered do return;
+    __rt.discovered = true;
+
+    // 1. Find the struct tagged with `@sdk.Plugin.{ ... }`
+    for entry in runtime.info.type_table {
+        if entry.info.kind != .Struct do continue;
+        si := cast(&runtime.info.Type_Info_Struct) entry.info;
+        for &tag in si.tags {
+            if tag.type == Plugin {
+                __rt.meta          = *cast(&Plugin) tag.data;
+                __rt.has_plugin    = true;
+                __rt.manifest_json = __build_manifest_json(&__rt.meta);
+                if si.size > 0 {
+                    __rt.state_ptr = raw_alloc(context.allocator, cast(i32) si.size);
+                    memory.set(__rt.state_ptr, 0, cast(i32) si.size);
+                }
+                break;
+            }
+        }
+        if __rt.has_plugin do break;
+    }
+
+    // 2. Discover tagged lifecycle procedures (supports both `@sdk.PluginInit` and `@sdk.PluginInit.{}`)
+    for proc in runtime.info.tagged_procedures {
+        for &tag in proc.tags {
+            if __tag_matches(tag, PluginInit) {
+                __rt.fn_init  = *cast(&(rawptr, u32) -> i32) &proc.func;
+                __rt.has_init = true;
+            } elseif __tag_matches(tag, PluginShutdown) {
+                __rt.fn_shutdown  = *cast(&(rawptr, u32) -> void) &proc.func;
+                __rt.has_shutdown = true;
+            } elseif __tag_matches(tag, PluginEvent) {
+                __rt.fn_event  = *cast(&(rawptr, u32, Event) -> void) &proc.func;
+                __rt.has_event = true;
+            } elseif __tag_matches(tag, PluginRender) {
+                __rt.fn_render  = *cast(&(rawptr, u32, &abi.FrameContext) -> void) &proc.func;
+                __rt.has_render = true;
+            }
+        }
+    }
+}
+
+// Auto-export lifecycle entrypoints whenever the plugin does not define manual
+// `plugin_manifest` (preserves 100% compatibility with legacy manual plugins!).
+use main
+#if !#defined(main.plugin_manifest) {
+    #export "odit_plugin_manifest" __odit_auto_manifest
+    __odit_auto_manifest :: (out_ptr: u32, out_cap: u32) -> i32 {
+        __ensure_discovered();
+        if !__rt.has_plugin do return cast(i32) abi.AbiError.NotReady;
+        return write_out_str(__rt.manifest_json, out_ptr, out_cap);
+    }
+
+    #export "odit_plugin_init" __odit_auto_init
+    __odit_auto_init :: (window_id: u32) -> i32 {
+        __ensure_discovered();
+        if __rt.has_init {
+            return __rt.fn_init(__rt.state_ptr, window_id);
+        }
+        return 0;
+    }
+
+    #export "odit_plugin_shutdown" __odit_auto_shutdown
+    __odit_auto_shutdown :: (window_id: u32) -> void {
+        __ensure_discovered();
+        if __rt.has_shutdown {
+            __rt.fn_shutdown(__rt.state_ptr, window_id);
+        }
+    }
+
+    #export "odit_plugin_event" __odit_auto_event
+    __odit_auto_event :: (window_id: u32, event_type: u32, payload_ptr: u32, payload_len: u32) -> void {
+        __ensure_discovered();
+        if __rt.has_event {
+            ev := decode_event(event_type, payload_ptr, payload_len);
+            __rt.fn_event(__rt.state_ptr, window_id, ev);
+        }
+    }
+
+    #export "odit_plugin_render" __odit_auto_render
+    __odit_auto_render :: (window_id: u32, ctx_ptr: u32) -> void {
+        begin_frame();
+        __ensure_discovered();
+        if __rt.has_render {
+            ctx := cast(&abi.FrameContext) ctx_ptr;
+            __rt.fn_render(__rt.state_ptr, window_id, ctx);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 4. Scoped Trailing `Code`-Block Macros & Layout Helpers
+// -----------------------------------------------------------------------------
+
+/// Scoped scissor clip block: pushes clip rect, runs `body`, pops clip rect.
+clipped :: macro (x, y, w, h: f32, body: Code) {
+    use odit.abi
+    abi.ui_push_clip(x, y, w, h);
+    #unquote body;
+    abi.ui_pop_clip();
+}
+
+/// Scoped scrollable container: calls `scroll_begin`, runs `body`, calls `scroll_end`.
+scroll_area :: macro (id: u32, x, y, w, h, content_h: f32, scroll_y: &f32, body: Code) {
+    use odit.abi
+    abi.ui_scroll_area_begin(id, x, y, w, h, content_h, cast(u32) scroll_y);
+    #unquote body;
+    abi.ui_scroll_area_end();
+}
+
+/// Scoped table container: calls `ui_table_begin`, runs `body`, calls `ui_table_end`.
+table :: macro (id: u32, x, y, w, h: f32, col_count: u32, headers: str, col_widths: [] f32, body: Code) {
+    use odit.abi
+    abi.ui_table_begin(
+        id, x, y, w, h, col_count,
+        cast(u32) headers.data, cast(u32) headers.count,
+        cast(u32) col_widths.data
+    );
+    #unquote body;
+    abi.ui_table_end();
+}
+
+/// Scoped themed surface card with optional header title (pass `""` for untitled).
+card :: macro (x, y, w, h: f32, title: str, body: Code) {
+    use odit.abi
+    abi.ui_draw_rect(x, y, w, h, 6.0f, abi.ui_get_theme_color(cast(u32) abi.ThemeColor.BgSurface),
+                     abi.ui_get_theme_color(cast(u32) abi.ThemeColor.Border), 1.0f);
+    if title.count > 0 {
+        abi.ui_draw_text(x + 10.0f, y + 8.0f, cast(u32) title.data, cast(u32) title.count,
+                         12.5f, abi.ui_get_theme_color(cast(u32) abi.ThemeColor.TextSecondary),
+                         cast(u32) abi.TextFlags.Bold);
+        abi.ui_draw_line(x + 8.0f, y + 26.0f, x + w - 8.0f, y + 26.0f, 1.0f,
+                         abi.ui_get_theme_color(cast(u32) abi.ThemeColor.Border));
+    }
+    #unquote body;
+}
+
+/// Draws a button and runs the trailing block immediately when clicked.
+on_click :: macro (id: u32, x, y, w, h: f32, label: str, style: abi.ButtonFlags, body: Code) {
+    use odit.abi
+    if (cast(abi.WidgetState) abi.ui_button(id, x, y, w, h, cast(u32) label.data, cast(u32) label.count, cast(u32) style)) & .Clicked {
+        #unquote body;
+    }
+}
+
+/// Iterates every top-level `{...}` JSON object in `js`, passing `obj: str` to `body`.
+///
+/// Usage:
+///     sdk.each_json_object(js, [obj] {
+///         name := sdk.json_get_str(obj, "name", context.temp_allocator);
+///     });
+each_json_object :: macro (js: str, body: Code) {
+    use odit.sdk
+    __jpos := 0;
+    __jobj: str;
+    while sdk.json_next_object(js, &__jpos, &__jobj) {
+        #unquote body(__jobj);
+    }
+}
+
+/// Lightweight vertical layout cursor to avoid repetitive manual `y += ...` math.
+VStack :: struct {
+    x:   f32;
+    y:   f32;
+    w:   f32;
+    gap: f32;
+}
+
+vstack :: (x, y, w: f32, gap: f32 = 6.0f) -> VStack {
+    return .{ x = x, y = y, w = w, gap = gap };
+}
+
+VStack.next :: (s: &VStack, h: f32) -> f32 {
+    cur := s.y;
+    s.y += h + s.gap;
+    return cur;
+}
+
+VStack.spacer :: (s: &VStack, px: f32) {
+    s.y += px;
+}
+
+VStack.text :: (s: &VStack, text: str, font_size: f32 = 13.0f, color: u32 = 0, flags: abi.TextFlags = .{}) {
+    col := color if color != 0 else theme_color(.TextPrimary);
+    draw_text(s.x, s.y, text, font_size, col, flags);
+    s.y += font_size + s.gap;
+}
+
+VStack.button :: (s: &VStack, id: u32, label: str, h: f32 = 28.0f, style: abi.ButtonFlags = .{}) -> abi.WidgetState {
+    ry := s->next(h);
+    return button(id, s.x, ry, s.w, h, label, style);
+}
+
+VStack.divider :: (s: &VStack) {
+    draw_line(s.x, s.y, s.x + s.w, s.y, 1.0f, theme_color(.Border));
+    s.y += s.gap + 2.0f;
+}
+
+/// Ergonomic row hit-test helper (accounts for `FRAME_FLAG_HOVERED` and scroll offset).
+row_hit :: (ctx: &abi.FrameContext, x, y, w, h: f32, scroll_y: f32 = 0.0f) -> (hovered: bool, clicked: bool) {
+    if (ctx.flags & abi.FRAME_FLAG_HOVERED) == 0 do return false, false;
+    mx := ctx.mouse_x;
+    my := ctx.mouse_y + scroll_y;
+    hov := mx >= x && mx <= (x + w) && my >= y && my < (y + h);
+    clk := hov && (ctx.mouse_pressed & cast(u32) abi.MouseButton.Left) != 0;
+    return hov, clk;
 }
 
 // -----------------------------------------------------------------------------
@@ -168,6 +575,10 @@ scroll_begin :: (id: u32, x, y, w, h, content_h: f32, scroll_y: &f32) {
 }
 
 scroll_end :: () => abi.ui_scroll_area_end();
+
+table_row :: (row_id: u32, cells_tab_sep: str, flags: abi.TableRowFlags = .{}) -> abi.WidgetState {
+    return cast(abi.WidgetState) abi.ui_table_row(row_id, cast(u32) cells_tab_sep.data, cast(u32) cells_tab_sep.count, cast(u32) flags);
+}
 
 // -----------------------------------------------------------------------------
 // D. Process & Compiler Helpers

@@ -418,7 +418,7 @@ DebugState :: struct {
 // every function below through the Wasmer bridge (`native/wasm_host.c` +
 // `src/plugin/host_abi.onyx`).
 
-#if runtime.runtime == .Custom {
+#if runtime.runtime != .Onyx {
 
     #foreign "odit_host" {
         // ---- A. Host Core, Logging & Command Palette ----

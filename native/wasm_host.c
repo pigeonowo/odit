@@ -534,6 +534,22 @@ ONYX_DEF(wasm_plugin_load, (PTR, INT), (INT)) {
         const wasm_name_t *imp_name = g_wasmer.importtype_name(it);
         const wasm_externtype_t *et = g_wasmer.importtype_type(it);
 
+        if (name_eq(mod_name, "host") && g_wasmer.externtype_kind(et) == WASM_EXTERN_FUNC) {
+            // Sandboxed Onyx `-r js` runtime stubs (print_str -> host_log, exit/time -> no-op)
+            uint32_t hop = name_eq(imp_name, "print_str") ? 1 : 3;
+            const wasm_functype_t *ft = g_wasmer.externtype_as_functype_const(et);
+            const wasm_valtype_vec_t *res_types = g_wasmer.functype_results(ft);
+            ImportEnv *env = (ImportEnv *)malloc(sizeof(ImportEnv));
+            env->handle = handle;
+            env->opcode = hop;
+            env->has_ret = (res_types && res_types->size > 0) ? 1 : 0;
+            env->ret_kind = env->has_ret ? g_wasmer.valtype_kind(res_types->data[0]) : WASM_I32;
+            slot->import_envs[i] = env;
+            wasm_func_t *fn = g_wasmer.func_new_with_env(slot->store, ft, host_import_trampoline, env, free_import_env);
+            imports.data[i] = g_wasmer.func_as_extern(fn);
+            continue;
+        }
+
         if (!name_eq(mod_name, "odit_host") || g_wasmer.externtype_kind(et) != WASM_EXTERN_FUNC) {
             snprintf(g_last_error, sizeof(g_last_error),
                      "Unsupported plugin import: %.*s.%.*s (only odit_host functions allowed)",

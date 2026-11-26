@@ -90,7 +90,7 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
 
 ---
 
-## Authoring a New WASM Plugin
+## Authoring a New WASM Plugin (Modern Declarative SDK)
 
 1. Create `plugins/<my_plugin>/main.onyx`:
    ```onyx
@@ -100,29 +100,53 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
    use odit.abi
    use odit.sdk
 
-   MANIFEST :: """{"id":"odit.my_plugin","title":"My Plugin","version":"0.1.0","default_slot":0,"default_width":360,"default_height":240,"event_mask":3,"allow_multiple":false}"""
+   @sdk.Plugin.{
+       id             = "odit.my_plugin",
+       title          = "My Plugin",
+       version        = "0.1.0",
+       default_slot   = 0,
+       default_width  = 360.0f,
+       default_height = 240.0f,
+       event_mask     = 67, // ActiveFileChanged | BufferModified | CommandInvoked
+       allow_multiple = false,
+   }
+   MyPlugin :: struct {
+       greeting_count: u32;
+   }
 
-   #export "odit_plugin_manifest" plugin_manifest
-   plugin_manifest :: (out_ptr, out_cap: u32) -> i32 => sdk.write_out_str(MANIFEST, out_ptr, out_cap);
-
-   #export "odit_plugin_init" plugin_init
-   plugin_init :: (window_id: u32) -> i32 {
+   @sdk.PluginInit
+   init :: (self: &MyPlugin, window_id: u32) -> i32 {
        sdk.register_command("my_plugin.hello", "My Plugin: Say Hello", "");
        return 0;
    }
 
-   #export "odit_plugin_shutdown" plugin_shutdown
-   plugin_shutdown :: (window_id: u32) -> void {}
+   @sdk.PluginEvent
+   on_event :: (self: &MyPlugin, window_id: u32, event: sdk.Event) {
+       switch event {
+           case .Command as cmd {
+               if cmd == "my_plugin.hello" do self.greeting_count += 1;
+           }
+           case _ {}
+       }
+   }
 
-   #export "odit_plugin_event" plugin_event
-   plugin_event :: (window_id, ev_type, ptr, len: u32) -> void {}
-
-   #export "odit_plugin_render" plugin_render
-   plugin_render :: (window_id, ctx_ptr: u32) -> void {
-       sdk.begin_frame();
-       ctx := cast(&abi.FrameContext) ctx_ptr;
-       sdk.draw_text(12.0f, 12.0f, "Hello from WASM!", 14.0f, sdk.theme_color(.TextPrimary));
+   @sdk.PluginRender
+   render :: (self: &MyPlugin, window_id: u32, ctx: &abi.FrameContext) {
+       v := sdk.vstack(12.0f, 12.0f, ctx.width - 24.0f, 8.0f);
+       cy := v->next(72.0f);
+       sdk.card(12.0f, cy, v.w, 72.0f, "My Plugin") {
+           sdk.draw_text(22.0f, cy + 36.0f, "Hello from WASM!", 14.0f, sdk.theme_color(.TextPrimary));
+       }
+       by := v->next(28.0f);
+       sdk.on_click(1, 12.0f, by, 120.0f, 28.0f, "Greet", .Primary) {
+           self.greeting_count += 1;
+           sdk.notify(.Info, "Hello from WASM!");
+       }
    }
    ```
+   - `sdk/plugin_sdk.onyx` automatically exports `odit_plugin_manifest`, `odit_plugin_init`, `odit_plugin_shutdown`, `odit_plugin_event`, and `odit_plugin_render` (and calls `sdk.begin_frame()` automatically before render).
+   - Available scoped trailing `Code`-block macros: `sdk.card`, `sdk.scroll_area`, `sdk.clipped`, `sdk.table`, `sdk.on_click`, and `sdk.each_json_object`.
+   - Available layout & hit-testing helpers: `sdk.vstack` (`VStack`), `sdk.row_hit`, and `sdk.table_row`.
+   - Legacy manual `#export "odit_plugin_*"` plugins remain 100% supported automatically.
 2. Run `nu build.nu plugins` (or `nu build.nu install` to update your global install) — every `plugins/*/main.onyx` is compiled automatically to `build/plugins/<my_plugin>.wasm`.
 3. Inside `odit`, press `Ctrl+P` → `Plugin: Open my_plugin.wasm` (or `Plugins: Reload All .wasm Plugins`).

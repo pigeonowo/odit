@@ -69,12 +69,11 @@ Adding a new ABI call across Phases 2–4 requires only:
 ### 3. Plugin Sandboxing & Compilation Flags
 Onyx plugins compile with:
 ```bash
-onyx build -r custom -DComponent_Build --wasm-mvp -o build/plugins/<name>.wasm plugins/<name>/main.onyx
+onyx build -r js --wasm-mvp -o build/plugins/<name>.wasm plugins/<name>/main.onyx
 ```
-- `-r custom -DComponent_Build` omits OS/WASI imports while keeping `core.conv`, `core.string`, `core.encoding.json`, `Array`, and `Map` available.
-- `sdk/plugin_sdk.onyx` explicitly exports `_initialize`, `odit_abi_version`, `odit_alloc`, and `odit_free`.
-- Note that `-DComponent_Build` names the exported WASM linear memory `"cm32p2_memory"`. `native/wasm_host.c` accepts `"memory"`, `"cm32p2_memory"`, or any exported memory instance.
-- `native/wasm_host.c` rejects any plugin that attempts to import from a module other than `"odit_host"`.
+- `-r js --wasm-mvp` enables full Onyx runtime type info (`runtime.info.type_table` & `tagged_procedures`, powering `@sdk.Plugin`, `@sdk.PluginInit`, `@sdk.PluginEvent`, `@sdk.PluginRender` as well as `core.conv.format` / `core.encoding.json`) while keeping zero OS/filesystem/WASI imports.
+- `sdk/plugin_sdk.onyx` automatically exports `odit_abi_version`, `odit_alloc`, `odit_free`, and (for decorator-based plugins) all 5 `odit_plugin_*` lifecycle exports.
+- `native/wasm_host.c` only permits `"odit_host"` imports (plus sandboxed `"host"` print/no-op stubs from `-r js`) and rejects any WASI or unknown external import.
 
 ### 4. Window Manager & Immediate UI Renderer
 - **`src/wm/layout.onyx`**: Full draggable, dockable, and floating window manager managing the top bar, bottom status bar, center Core Code Editor, and four pane modes: **LeftSide** (vertical stack), **RightGrid** (1- or 2-col tiled grid), **Bottom** (horizontal strip), and **Floating** (z-ordered, shadow-elevated, corner-resizable overlays). Supports title-bar drag-and-drop with live dock/swap/float preview overlays, active splitters for every occupied dock zone, non-occluding hit-testing (`wm_content_pane_at`), and automatic persistence in `odit-layout.json`.

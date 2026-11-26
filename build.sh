@@ -31,7 +31,7 @@ build_plugins() {
             local name
             name="$(basename "$dir")"
             echo "Building WASM plugin ${name} -> build/plugins/${name}.wasm"
-            onyx build -r custom -DComponent_Build --wasm-mvp \
+            onyx build -r js --wasm-mvp \
                 -o "build/plugins/${name}.wasm" "${dir}main.onyx"
         fi
     done

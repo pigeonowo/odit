@@ -47,7 +47,7 @@ export def "main plugins" [] {
             let out = ($"build/plugins/($name).wasm")
             print $"Building WASM plugin ($name) -> ($out)"
             with-env { ONYX_PATH: (onyx-path) } {
-                ^$onyx build -r custom -DComponent_Build --wasm-mvp -o $out $entry
+                ^$onyx build -r js --wasm-mvp -o $out $entry
             }
         }
     }
