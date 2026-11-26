@@ -66,11 +66,11 @@ This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolc
 - [x] **Live Debugger WASM Plugin (`plugins/debugger/main.onyx` → `build/plugins/debugger.wasm`)**:
   - Declarative `@sdk.Plugin` split view showing Onyx source lines (with clickable breakpoint gutter) alongside syntax-colored mapped `.wat` instructions, active range highlighting, single WAT-instruction stepping, and a bottom Locals/Params inspector.
 
-## Next: Phase 4.2 — Domain-Specific Mini-Apps
+## Completed: Phase 4.2 — Domain-Specific Mini-Apps & Distribution Readiness
 
-### Plugins to Build (`plugins/*/main.onyx`)
-1. `plugins/http_routes/main.onyx` — Scans workspace `.onyx` files via `workspace_find_files` + `workspace_read_file` for HTTP route registrations and renders a `Handler | Method (pill) | Path` table; clicking a row jumps to the handler definition.
-2. `plugins/orm_schema/main.onyx` — Scans structs annotated/mapped to database tables and renders visual schema cards (`Table Name`, field names, and Onyx types).
+- [x] **Portable Tool Discovery**: Removed all hardcoded local user paths; `wasm2wat` resolves via `$WASM2WAT`, `./tools/wasm2wat`, `$ODIT_HOME/tools/wasm2wat`, `~/.local/bin/wasm2wat`, `/usr/bin`, `/usr/local/bin`, or `PATH`, and `README.md` documents installation & search paths for every prerequisite.
+- [x] **HTTP-Server Route Viewer (`plugins/http_routes/main.onyx` → `build/plugins/http_routes.wasm`)**: Scans workspace `.onyx` files for `onyx pkg add http-server` routes (`->get/post/put/patch/delete`, `->route(...)`, `@http.route`/`@route`), displays a filterable `Method | Path | Handler | Location` table with color-coded method pills, and jumps to definitions on click.
+- [x] **Postgres-ORM Schema Viewer (`plugins/orm_schema/main.onyx` → `build/plugins/orm_schema.wasm`)**: Scans workspace `.onyx` files for `onyx pkg add postgres-orm` `@orm.model` structs and renders visual schema cards (`Table Name`, `StructName`, Onyx types, and `PK`/`AUTO`/`NN`/`UNQ`/`FK` constraint badges) with click-to-jump.
 
 ---
 
@@ -78,7 +78,7 @@ This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolc
 
 Keep these in mind when extending the codebase:
 1. **Onyx 2611 + `pkg-raylib` 0.0.8**: `lib/github.com/onyx-lang/pkg-raylib/build.onyx` used deprecated `string.concat`. Replaced with `str.concat` (automated in `nu build.nu sync-raylib`).
-2. **Nushell PATH**: `onyx` lives at `~/.onyx/bin/onyx` with `ONYX_PATH=~/.onyx`, and `wasm2wat` lives in `~/Downloads/wabt-1.0.42/bin`. Both `build.nu` and `build.sh` configure `ONYX_PATH` automatically.
+2. **Toolchain Discovery**: `onyx` is resolved via `$ONYX_PATH/bin/onyx` (defaulting to `~/.onyx/bin/onyx`), `libwasmer.so` via `$WASMER_DIR/lib` / `~/.wasmer/lib` / system library paths, and `wasm2wat` via `$WASM2WAT`, `./tools/wasm2wat`, `$ODIT_HOME/tools/wasm2wat`, `~/.local/bin/wasm2wat`, or `PATH`. Both `build.nu` and `build.sh` configure `ONYX_PATH` automatically.
 3. **WASM Plugin Target & Type Info**: Plugins compile with `onyx build -r js --wasm-mvp` (the only built-in zero-WASI Onyx runtime with `Supports_Type_Info :: true`, enabling `@sdk.Plugin` / `@sdk.Plugin*` reflection tags, `core.conv.format`, and `core.encoding.json`). `build.nu` and `build.sh` delete the unused `.wasm.js` glue file immediately after compiling. `native/wasm_host.c` also still supports legacy `-r custom -DComponent_Build` modules (`"cm32p2_memory"`).
 4. **Wasmer C API Callback Result Kind**: Wasmer requires host callbacks (`wasm_func_callback_with_env_t`) to explicitly assign `results->data[0].kind = env->ret_kind` before returning. Handled automatically in `native/wasm_host.c`.
 5. **Onyx 2611 Syntax & Stdlib Notes**:

@@ -1,0 +1,433 @@
+// =============================================================================
+// ODIT Plugin: Postgres-ORM Schema Viewer (`build/plugins/orm_schema.wasm`)
+// =============================================================================
+// Scans workspace `.onyx` files for `onyx pkg add postgres-orm` annotated model
+// structs (`@orm.model.{"table"}`, `@orm.primary_key`, `@orm.auto_increment`,
+// `@orm.not_null`, `@orm.unique`, `@orm.foreign_key`, `@orm.column`) and renders
+// interactive visual database schema cards. Clicking any table or column jumps
+// directly to its definition in the editor.
+
+#load "../../abi/abi.onyx"
+#load "../../sdk/plugin_sdk.onyx"
+
+use core { package, Array, tprintf }
+use odit.abi
+use odit.sdk
+
+OrmColumn :: struct {
+    name:     str;
+    col_name: str;
+    type_str: str;
+    line:     u32;
+    is_pk:    bool;
+    is_auto:  bool;
+    is_nn:    bool;
+    is_uniq:  bool;
+    is_fk:    bool;
+}
+
+OrmTable :: struct {
+    table_name:  str;
+    struct_name: str;
+    file:        str;
+    line:        u32;
+    columns:     [..] OrmColumn;
+}
+
+@sdk.Plugin.{
+    id             = "odit.orm_schema",
+    title          = "ORM Schema",
+    version        = "0.1.0",
+    default_slot   = 0,
+    default_width  = 480.0f,
+    default_height = 420.0f,
+    event_mask     = 579, // ActiveFileChanged (1) | BufferModified (2) | CommandInvoked (64) | WorkspaceChanged (512)
+    allow_multiple = false,
+}
+OrmSchemaPlugin :: struct {
+    tables:       [..] OrmTable;
+    filter_buf:   [128] u8;
+    filter_len:   u32;
+    scroll_y:     f32;
+    needs_scan:   bool;
+    total_cols:   i32;
+}
+
+#local
+trim_s :: (s: str) -> str {
+    a := 0;
+    b := s.count;
+    while a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n') do a += 1;
+    while b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n') do b -= 1;
+    return s[a .. b];
+}
+
+#local
+contains_ci :: (haystack: str, needle: str) -> bool {
+    if needle.count == 0 do return true;
+    if haystack.count < needle.count do return false;
+    for i in 0 .. (haystack.count - needle.count + 1) {
+        ok := true;
+        for j in 0 .. needle.count {
+            a := haystack[i + j];
+            b := needle[j];
+            if a >= 'A' && a <= 'Z' do a += 32;
+            if b >= 'A' && b <= 'Z' do b += 32;
+            if a != b { ok = false; break; }
+        }
+        if ok do return true;
+    }
+    return false;
+}
+
+#local
+find_sub :: (s: str, sub: str, start: i32 = 0) -> i32 {
+    if sub.count == 0 || start < 0 || s.count < start + sub.count do return -1;
+    for i in start .. (s.count - sub.count + 1) {
+        ok := true;
+        for j in 0 .. sub.count {
+            if s[i + j] != sub[j] { ok = false; break; }
+        }
+        if ok do return i;
+    }
+    return -1;
+}
+
+#local
+extract_quoted :: (s: str, start: i32 = 0) -> (val: str, end_pos: i32, ok: bool) {
+    i := start;
+    while i < s.count && s[i] != '"' do i += 1;
+    if i >= s.count do return "", start, false;
+    s0 := i + 1;
+    i = s0;
+    while i < s.count && s[i] != '"' {
+        if s[i] == '\\' && i + 1 < s.count do i += 2;
+        else do i += 1;
+    }
+    if i >= s.count do return "", start, false;
+    return s[s0 .. i], i + 1, true;
+}
+
+#local
+clear_tables :: (self: &OrmSchemaPlugin) {
+    for &t in self.tables {
+        sdk.free_str(t.table_name);
+        sdk.free_str(t.struct_name);
+        sdk.free_str(t.file);
+        for &c in t.columns {
+            sdk.free_str(c.name);
+            sdk.free_str(c.col_name);
+            sdk.free_str(c.type_str);
+        }
+        delete(&t.columns);
+    }
+    Array.clear(&self.tables);
+    self.total_cols = 0;
+}
+
+#local
+strip_comment_and_semi :: (raw: str) -> str {
+    end := raw.count;
+    for i in 0 .. (raw.count - 1) {
+        if raw[i] == '/' && raw[i + 1] == '/' { end = i; break; }
+    }
+    t := trim_s(raw[0 .. end]);
+    while t.count > 0 && t[t.count - 1] == ';' do t = trim_s(t[0 .. (t.count - 1)]);
+    return t;
+}
+
+#local
+scan_file_for_models :: (self: &OrmSchemaPlugin, rel_path: str) {
+    src := sdk.workspace_read_file(rel_path, context.temp_allocator);
+    if src.count == 0 do return;
+
+    lines := make([..] str, 64, context.temp_allocator);
+    s0 := 0;
+    for i in 0 .. (src.count + 1) {
+        if i == src.count || src[i] == '\n' {
+            e := i;
+            if e > s0 && src[e - 1] == '\r' do e -= 1;
+            lines << src[s0 .. e];
+            s0 = i + 1;
+        }
+    }
+
+    i := 0;
+    while i < lines.count {
+        ln := trim_s(lines[i]);
+        // Detect `@orm.model.{"table"}`, `@orm.model`, `@postgres.orm.model.{"table"}`, `@orm.table.{"table"}`
+        is_model := ln.count > 0 && ln[0] == '@' &&
+                    (contains_ci(ln, "orm.model") || contains_ci(ln, "orm.table"));
+        if !is_model {
+            i += 1;
+            continue;
+        }
+
+        tname, _, has_tname := extract_quoted(ln, 0);
+
+        // Find the `StructName :: struct {` declaration within the next 4 lines
+        si := i + 1;
+        found_struct := false;
+        sname := "";
+        while si < lines.count && si <= i + 4 {
+            sln := trim_s(lines[si]);
+            cp := find_sub(sln, "::");
+            if cp > 0 && contains_ci(sln, "struct") {
+                sname = trim_s(sln[0 .. cp]);
+                found_struct = true;
+                break;
+            }
+            si += 1;
+        }
+        if !found_struct {
+            i += 1;
+            continue;
+        }
+
+        eff_table := tname if (has_tname && tname.count > 0) else sname;
+        tbl: OrmTable;
+        tbl.table_name  = sdk.copy_str(eff_table);
+        tbl.struct_name = sdk.copy_str(sname);
+        tbl.file        = sdk.copy_str(rel_path);
+        tbl.line        = cast(u32) (si + 1);
+        tbl.columns     = make([..] OrmColumn);
+
+        // Parse struct body fields & `@orm.*` field annotations until matching `}`
+        depth := 0;
+        j := si;
+        p_pk := false; p_auto := false; p_nn := false; p_uniq := false; p_fk := false;
+        p_col_override := "";
+
+        while j < lines.count {
+            raw := lines[j];
+            for k in 0 .. raw.count {
+                if raw[k] == '/' && k + 1 < raw.count && raw[k + 1] == '/' do break;
+                if raw[k] == '{' do depth += 1;
+                elseif raw[k] == '}' do depth -= 1;
+            }
+
+            if j > si && depth >= 1 {
+                fl := strip_comment_and_semi(raw);
+                if fl.count > 0 {
+                    if fl[0] == '@' {
+                        if contains_ci(fl, "primary_key")    do p_pk   = true;
+                        if contains_ci(fl, "auto_increment") do p_auto = true;
+                        if contains_ci(fl, "not_null")       do p_nn   = true;
+                        if contains_ci(fl, "unique")         do p_uniq = true;
+                        if contains_ci(fl, "foreign_key")    do p_fk   = true;
+                        if contains_ci(fl, "column") {
+                            cn, _, ok_c := extract_quoted(fl, 0);
+                            if ok_c do p_col_override = cn;
+                        }
+                    } elseif !str.starts_with(fl, "use ") && find_sub(fl, "::") < 0 {
+                        // Field: `name: Type` (optional `= default`)
+                        colon := find_sub(fl, ":");
+                        if colon > 0 {
+                            fname := trim_s(fl[0 .. colon]);
+                            rest  := trim_s(fl[(colon + 1) .. fl.count]);
+                            eq := find_sub(rest, "=");
+                            if eq > 0 do rest = trim_s(rest[0 .. eq]);
+                            if fname.count > 0 && rest.count > 0 {
+                                col_n := p_col_override if p_col_override.count > 0 else fname;
+                                tbl.columns << .{
+                                    name     = sdk.copy_str(fname),
+                                    col_name = sdk.copy_str(col_n),
+                                    type_str = sdk.copy_str(rest),
+                                    line     = cast(u32) (j + 1),
+                                    is_pk    = p_pk,
+                                    is_auto  = p_auto,
+                                    is_nn    = p_nn,
+                                    is_uniq  = p_uniq,
+                                    is_fk    = p_fk,
+                                };
+                                self.total_cols += 1;
+                            }
+                            p_pk = false; p_auto = false; p_nn = false; p_uniq = false; p_fk = false;
+                            p_col_override = "";
+                        }
+                    }
+                }
+            }
+
+            j += 1;
+            if depth <= 0 && j > si do break;
+        }
+
+        self.tables << tbl;
+        i = j;
+    }
+}
+
+#local
+rescan_workspace :: (self: &OrmSchemaPlugin) {
+    clear_tables(self);
+    files_js := sdk.workspace_find_files_json(".onyx", context.temp_allocator);
+    if files_js.count == 0 do return;
+
+    pos := 0;
+    while pos < files_js.count {
+        fp, next_pos, ok := extract_quoted(files_js, pos);
+        if !ok do break;
+        pos = next_pos;
+        if str.starts_with(fp, "lib/") || str.starts_with(fp, "build/") || str.starts_with(fp, "plugins/") do continue;
+        scan_file_for_models(self, fp);
+    }
+}
+
+#local
+table_matches_filter :: (self: &OrmSchemaPlugin, t: &OrmTable) -> bool {
+    if self.filter_len == 0 do return true;
+    q := str.{ &self.filter_buf[0], cast(i32) self.filter_len };
+    if contains_ci(t.table_name, q) || contains_ci(t.struct_name, q) || contains_ci(t.file, q) do return true;
+    for &c in t.columns {
+        if contains_ci(c.name, q) || contains_ci(c.col_name, q) || contains_ci(c.type_str, q) do return true;
+    }
+    return false;
+}
+
+@sdk.PluginInit
+init :: (self: &OrmSchemaPlugin, window_id: u32) -> i32 {
+    self.tables     = make([..] OrmTable);
+    self.needs_scan = true;
+    sdk.register_command("orm_schema.refresh", "ORM Schema: Rescan Workspace", "");
+    return 0;
+}
+
+@sdk.PluginEvent
+on_event :: (self: &OrmSchemaPlugin, window_id: u32, event: sdk.Event) {
+    switch event {
+        case .BufferModified as bm {
+            if bm.saved do self.needs_scan = true;
+        }
+        case .WorkspaceChanged {
+            self.needs_scan = true;
+        }
+        case .Command as cmd {
+            if str.equal(cmd, "orm_schema.refresh") do self.needs_scan = true;
+        }
+        case _ {}
+    }
+}
+
+@sdk.PluginRender
+render :: (self: &OrmSchemaPlugin, window_id: u32, ctx: &abi.FrameContext) {
+    if self.needs_scan {
+        self.needs_scan = false;
+        rescan_workspace(self);
+    }
+
+    bg_surface := sdk.theme_color(.BgSurface);
+    bg_header  := sdk.theme_color(.BgHeader);
+    bg_hover   := sdk.theme_color(.BgHover);
+    border     := sdk.theme_color(.Border);
+    txt_pri    := sdk.theme_color(.TextPrimary);
+    txt_sec    := sdk.theme_color(.TextSecondary);
+    txt_dis    := sdk.theme_color(.TextDisabled);
+    accent     := sdk.theme_color(.Accent);
+    c_ok       := sdk.theme_color(.Success);
+    c_warn     := sdk.theme_color(.Warning);
+    c_err      := sdk.theme_color(.Error);
+    c_info     := sdk.theme_color(.Info);
+
+    pad: f32 = 8.0f;
+    w := ctx.width;
+    h := ctx.height;
+
+    // 1. Top Search & Refresh Bar
+    in_w := w - pad * 2.0f - 70.0f;
+    if in_w < 80.0f do in_w = 80.0f;
+    sdk.input_text(10, pad, pad, in_w, 26.0f, self.filter_buf, &self.filter_len, "Filter tables or columns...");
+    sdk.on_click(11, pad + in_w + 6.0f, pad, 64.0f, 26.0f, "Refresh", .Ghost) {
+        self.needs_scan = true;
+    };
+
+    summary := tprintf("{} tables  |  {} columns  (postgres-orm)", self.tables.count, self.total_cols);
+    sdk.draw_text(pad, pad + 32.0f, summary, 11.5f, txt_sec);
+
+    area_y := pad + 52.0f;
+    area_h := h - area_y - pad;
+    if area_h < 60.0f do area_h = 60.0f;
+
+    vis := make([..] i32, 16, context.temp_allocator);
+    for i in 0 .. self.tables.count {
+        if table_matches_filter(self, &self.tables[i]) do vis << i;
+    }
+
+    if vis.count == 0 {
+        sdk.draw_rect(pad, area_y, w - pad * 2.0f, area_h, bg_surface, 6.0f, border, 1.0f);
+        sdk.draw_text(pad + 12.0f, area_y + 14.0f, "No Postgres ORM models found in this workspace.", 13.0f, txt_sec, .Bold);
+        sdk.draw_text(pad + 12.0f, area_y + 38.0f, "Using `onyx pkg add postgres-orm`? Annotate structs like:", 12.0f, txt_dis);
+        sdk.draw_text(pad + 12.0f, area_y + 58.0f, "  @orm.model.{\"users\"}", 12.0f, accent, .Mono);
+        sdk.draw_text(pad + 12.0f, area_y + 76.0f, "  User :: struct {", 12.0f, txt_pri, .Mono);
+        sdk.draw_text(pad + 12.0f, area_y + 94.0f, "      @orm.primary_key  id: u32;", 12.0f, c_info, .Mono);
+        sdk.draw_text(pad + 12.0f, area_y + 112.0f, "      @orm.not_null     username: str;", 12.0f, c_info, .Mono);
+        sdk.draw_text(pad + 12.0f, area_y + 130.0f, "  }", 12.0f, txt_pri, .Mono);
+        return;
+    }
+
+    row_h: f32  = 24.0f;
+    hdr_h: f32  = 30.0f;
+    card_gap: f32 = 10.0f;
+
+    total_h: f32 = 8.0f;
+    for vi in vis {
+        t := &self.tables[vi];
+        total_h += hdr_h + cast(f32)(t.columns.count if t.columns.count > 0 else 1) * row_h + 8.0f + card_gap;
+    }
+
+    card_w := w - pad * 2.0f - 4.0f;
+    sdk.scroll_area(20, pad, area_y, w - pad * 2.0f, area_h, total_h, &self.scroll_y) {
+        cy := area_y + 2.0f;
+        for vi in vis {
+            t := &self.tables[vi];
+            nrows := t.columns.count if t.columns.count > 0 else 1;
+            card_h := hdr_h + cast(f32) nrows * row_h + 6.0f;
+
+            // Card frame & header
+            sdk.draw_rect(pad + 2.0f, cy, card_w, card_h, bg_surface, 6.0f, border, 1.0f);
+            sdk.draw_rect(pad + 2.0f, cy, card_w, hdr_h, bg_header, 6.0f);
+
+            hhov, hclk := sdk.row_hit(ctx, pad + 2.0f, cy, card_w, hdr_h, self.scroll_y);
+            if hclk do sdk.editor_open(t.file, cast(i32) t.line, 1);
+            if hhov do sdk.draw_rect(pad + 2.0f, cy, card_w, hdr_h, bg_hover, 6.0f);
+
+            sdk.draw_text(pad + 12.0f, cy + 7.0f, t.table_name, 13.0f, accent, .Bold);
+            tw := sdk.measure_text(t.table_name, 13.0f);
+            sdk.draw_text(pad + 18.0f + tw, cy + 8.0f, tprintf("({})", t.struct_name), 11.5f, txt_sec);
+
+            loc := tprintf("{}:{}", t.file, t.line);
+            lw := sdk.measure_text(loc, 10.5f);
+            if pad + 24.0f + tw + lw < pad + card_w - 8.0f {
+                sdk.draw_text(pad + card_w - lw - 10.0f, cy + 9.0f, loc, 10.5f, txt_dis, .Mono);
+            }
+
+            // Columns
+            ry := cy + hdr_h + 3.0f;
+            if t.columns.count == 0 {
+                sdk.draw_text(pad + 14.0f, ry + 4.0f, "(no fields)", 11.5f, txt_dis);
+            } else {
+                for &c in t.columns {
+                    rhov, rclk := sdk.row_hit(ctx, pad + 4.0f, ry, card_w - 4.0f, row_h, self.scroll_y);
+                    if rclk do sdk.editor_open(t.file, cast(i32) c.line, 1);
+                    if rhov do sdk.draw_rect(pad + 4.0f, ry, card_w - 4.0f, row_h - 1.0f, bg_hover, 3.0f);
+
+                    sdk.draw_text(pad + 14.0f, ry + 4.0f, c.col_name, 12.0f, txt_pri, .Mono);
+                    type_x := pad + card_w * 0.42f;
+                    sdk.draw_text(type_x, ry + 4.0f, c.type_str, 11.5f, c_info, .Mono);
+
+                    // Constraint badges (right side)
+                    bx := pad + card_w * 0.66f;
+                    if c.is_pk   do bx += sdk.pill(bx, ry + 3.0f, "PK",   0xF9E2AF28, c_warn) + 4.0f;
+                    if c.is_auto do bx += sdk.pill(bx, ry + 3.0f, "AUTO", 0xA6E3A128, c_ok)   + 4.0f;
+                    if c.is_nn   do bx += sdk.pill(bx, ry + 3.0f, "NN",   0xF38BA828, c_err)  + 4.0f;
+                    if c.is_uniq do bx += sdk.pill(bx, ry + 3.0f, "UNQ",  0xCBA6F728, accent) + 4.0f;
+                    if c.is_fk   do bx += sdk.pill(bx, ry + 3.0f, "FK",   0x89B4FA28, c_info) + 4.0f;
+
+                    ry += row_h;
+                }
+            }
+
+            cy += card_h + card_gap;
+        }
+    };
+}

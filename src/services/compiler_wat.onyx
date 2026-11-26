@@ -23,13 +23,26 @@ g_wat_cache: WatCache;
 
 #local
 resolve_wasm2wat :: () -> str {
-    if home := os.env("HOME"); home {
-        c1 := core.tprintf("{}/Downloads/wabt-1.0.42/bin/wasm2wat", home->unwrap());
-        if os.file_exists(c1) do return str.copy(c1, context.temp_allocator);
+    // 1. Explicit environment variable override (`WASM2WAT=/path/to/wasm2wat`)
+    if env_w := os.env("WASM2WAT", context.temp_allocator); env_w && env_w->unwrap().count > 0 {
+        p := env_w->unwrap();
+        if os.file_exists(p) do return str.copy(p, context.temp_allocator);
     }
-    for cand in str.[ "/usr/bin/wasm2wat", "/usr/local/bin/wasm2wat", "/home/linuxbrew/.linuxbrew/bin/wasm2wat" ] {
+    // 2. Bundled repo/install tools directory (`./tools/wasm2wat` or `$ODIT_HOME/tools/wasm2wat`)
+    if os.file_exists("tools/wasm2wat") do return "tools/wasm2wat";
+    if oh := os.env("ODIT_HOME", context.temp_allocator); oh && oh->unwrap().count > 0 {
+        c_oh := core.tprintf("{}/tools/wasm2wat", oh->unwrap());
+        if os.file_exists(c_oh) do return str.copy(c_oh, context.temp_allocator);
+    }
+    // 3. Standard user & system install locations
+    if home := os.env("HOME", context.temp_allocator); home && home->unwrap().count > 0 {
+        c_local := core.tprintf("{}/.local/bin/wasm2wat", home->unwrap());
+        if os.file_exists(c_local) do return str.copy(c_local, context.temp_allocator);
+    }
+    for cand in str.[ "/usr/bin/wasm2wat", "/usr/local/bin/wasm2wat" ] {
         if os.file_exists(cand) do return cand;
     }
+    // 4. Fallback to `wasm2wat` on PATH
     return "wasm2wat";
 }
 

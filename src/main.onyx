@@ -750,6 +750,35 @@ run_headless_selftest :: () {
     services.dbg_command(.Stop, 1);
     println("[odit] PASS: Live Debugger WASM plugin started, mapped WAT & rendered with 0 traps!");
 
+    // 7) HTTP Routes & ORM Schema domain plugins: spawn & render with 0 traps
+    wid_http := spawn_plugin_from_wasm("build/plugins/http_routes.wasm");
+    wid_orm  := spawn_plugin_from_wasm("build/plugins/orm_schema.wasm");
+    if wid_http == 0 || wid_orm == 0 {
+        println("[odit] FAIL: could not spawn http_routes.wasm or orm_schema.wasm");
+        os.exit(1);
+    }
+    for wid_d in u32.[ wid_http, wid_orm ] {
+        if dp := wm.wm_find_pane(&g_app.window_mgr, wid_d); dp != null {
+            if lp := find_loaded_plugin(dp.plugin_handle); lp != null {
+                ui.ui_begin_pane(wid_d, 0, 0, 500, 400, true, true);
+                fctx := abi.FrameContext.{
+                    window_id = wid_d, width = 500, height = 400,
+                    mouse_x = 10, mouse_y = 10, flags = abi.FRAME_FLAG_FOCUSED | abi.FRAME_FLAG_HOVERED,
+                    delta_time = 0.016f,
+                };
+                plugin.plugin_render_with_ctx(lp, wid_d, &fctx);
+                ui.ui_end_pane();
+                if err := plugin.host_last_error(); err.count > 0 {
+                    printf("[odit] FAIL: Domain plugin '{}' trapped on render: {}\n", dp.title, err);
+                    os.exit(1);
+                }
+            }
+        }
+    }
+    println("[odit] PASS: HTTP Routes & Postgres-ORM Schema WASM plugins spawned & rendered with 0 traps!");
+
+    close_plugin_window(wid_orm);
+    close_plugin_window(wid_http);
     close_plugin_window(wid_dbg);
     close_plugin_window(wid_aoc);
     close_plugin_window(wid_w);
@@ -758,7 +787,7 @@ run_headless_selftest :: () {
     close_plugin_window(wid_br);
     close_plugin_window(wid_fe);
     lsp.lsp_shutdown(&g_app.lsp_client);
-    println("[odit] PASS: All 7 WASM plugins + Onyx LSP + WAT Disassembly + Live Debugger self-test succeeded!");
+    println("[odit] PASS: All 9 WASM plugins + Onyx LSP + WAT Disassembly + Live Debugger self-test succeeded!");
 }
 
 render_plugin_pane :: (

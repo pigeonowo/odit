@@ -15,7 +15,9 @@
   - **Build & Run** — Persistent per-project `odit-build.json`, OBV-inspired compiler flags drawer, extra `compiler_args` (e.g. `-DComponent_Build`), 2-stage Build → Run pipeline (capable of building & running `odit` inside `odit`), clickable `file.onyx:line:col` error jumps, and **interactive `stdin`** with live unflushed prompt rendering.
   - **WASM Inspector (`.wat`)** — Lists functions from the active file via Onyx LSP and disassembles them to syntax-colored WebAssembly Text Format (`.wat`) with horizontal scrolling & pan controls.
   - **Onyx Docs & Core Browser** — Live searchable reference indexing `~/.onyx/core` packages/procs/types and built-in `#` compiler directives.
-  - **Live Debugger (`Onyx <-> .wat`)** — Toggle breakpoints via editor gutter clicks or `F9`, then step through Onyx lines (`F10`) or individual WebAssembly `.wat` instructions (`F11`) in a synchronized side-by-side split view with parameter & WASM local slot inspection.
+  - **Live Debugger (`Onyx <-> .wat`)** — Toggle breakpoints via editor gutter clicks or `F9`, customize run commands (`--param ...`), step through Onyx lines (`F10`), local/indirect calls (`In`/`Out`), or individual `.wat` instructions (`F11`), and inspect live variable & WASM local slot values.
+  - **HTTP Routes Viewer (`http-server`)** — Scans `onyx pkg add http-server` projects (`router->get/post/put/patch/delete`, `router->route`, `@http.route`) into a filterable `Method | Path | Handler | Location` table with click-to-jump.
+  - **Postgres-ORM Schema Viewer (`postgres-orm`)** — Scans `onyx pkg add postgres-orm` `@orm.model` structs and renders visual database schema cards (`PK`, `AUTO`, `NN`, `UNQ`, `FK` badges + Onyx types) with click-to-jump.
   - **Advent of Code Runner** — Day-by-day `test`/`real` runner with `.odit/aoc_state.json` persistence, expected vs. actual comparison, clipboard copy, and per-day boilerplate generator.
 - **Command-First & Configurable:** Fuzzy Command Palette (`Ctrl+P`), Fuzzy File Finder (`Ctrl+O`), live Settings panel (`Ctrl+,`) with 4 built-in themes (`mocha`, `tokyo_night`, `gruvbox`, `light`), font size & UI scaling, and global CLI install (`odit [dir_or_file]`).
 
@@ -29,19 +31,27 @@
 | **Phase 2** | Non-blocking Onyx LSP client (`onyx lsp`): diagnostics, hover (`K`), go-to-definition (`F12`/`gd`), completion (`Ctrl+Space`), `ast_get_*` Host ABI | **Complete** |
 | **Phase 3.1** | Fuzzy File Finder (`Ctrl+O`), **File Explorer** `.wasm` plugin, **Build & Run** `.wasm` plugin (`odit-build.json`, flags drawer, clickable errors, interactive `stdin`) | **Complete** |
 | **Phase 3.2** | **WASM Inspector** (`.wat` disassembly `.wasm` plugin) & **Onyx Docs / Core Browser** `.wasm` plugin | **Complete** |
-| **Phase 4.1** | **Live Side-by-Side Onyx/WASM Debugger** (`F5`/`F9`/`F10`/`F11`, gutter breakpoints, mapped `.wat` stepping, `debugger.wasm`) + **Advent of Code** (`aoc.wasm`) | **Complete** |
-| **Phase 4.2** | Domain Plugins (HTTP-Server Route Viewer, ORM Schema Viewer) | Planned |
+| **Phase 4.1** | **Live Side-by-Side Onyx/WASM Debugger** (`F5`/`F9`/`F10`/`F11`, custom run command, live value inspection, `debugger.wasm`) + **Advent of Code** (`aoc.wasm`) | **Complete** |
+| **Phase 4.2** | Domain Plugins: **HTTP Routes Viewer** (`http_routes.wasm` for `http-server`) & **Postgres-ORM Schema Viewer** (`orm_schema.wasm` for `postgres-orm`) | **Complete** |
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-- **Onyx Toolchain** (tested on `2611`, `ONYX_PATH=~/.onyx`)
-- **Wasmer** shared library (`~/.wasmer/lib/libwasmer.so`, loaded dynamically via `dlopen`)
-- **GCC / Clang** (to compile `bin/odit_wasm_host.so` and `bin/onyx_raylib.so`)
-- **WABT (`wasm2wat`)** (used by the WASM Inspector plugin for `.wat` disassembly)
-- **Nushell** (`nu`) or **Bash**
+### Prerequisites & Tool Installation
+
+ODIT contains no hardcoded user paths and discovers external tools automatically via environment variables and standard locations:
+
+1. **Onyx Toolchain** (`onyx`, tested on `2611`):
+   - Install from [onyxlang.io](https://onyxlang.io) (`curl https://get.onyxlang.io -sSfL | sh`).
+   - Searched at `$ONYX_PATH/bin/onyx` (defaults to `~/.onyx/bin/onyx`).
+2. **Wasmer C Library (`libwasmer.so`)** (loaded dynamically via `dlopen` to sandbox `.wasm` plugins):
+   - Install from [wasmer.io](https://wasmer.io) (`curl https://get.wasmer.io -sSfL | sh`).
+   - Searched at `$WASMER_DIR/lib/libwasmer.so`, `~/.wasmer/lib/libwasmer.so`, `/usr/local/lib/libwasmer.so`, `/usr/lib/libwasmer.so`, or system `LD_LIBRARY_PATH`.
+3. **WABT (`wasm2wat`)** *(required for WASM Inspector & Live Debugger `.wat` disassembly)*:
+   - Install via your package manager (`sudo apt install wabt`, `brew install wabt`, `sudo pacman -S wabt`) **or** place the `wasm2wat` binary into `./tools/wasm2wat`, `~/.local/share/odit/tools/wasm2wat`, `~/.local/bin/wasm2wat`, or point `$WASM2WAT=/path/to/wasm2wat`.
+4. **C Compiler (`gcc` or `clang`)** — used to compile `bin/odit_wasm_host.so` and `bin/onyx_raylib.so`.
+5. **Nushell (`nu`)** or **Bash** — to run `build.nu` or `build.sh`.
 
 ### Build, Test & Run (Nushell)
 ```nu
@@ -137,6 +147,8 @@ odit/
 │   ├── wasm_inspector/main.onyx  # Live `.wat` WebAssembly Inspector WASM plugin
 │   ├── docs_browser/main.onyx    # Onyx Core & `#` Directives Docs Browser WASM plugin
 │   ├── debugger/main.onyx        # Live Side-by-Side Onyx <-> WAT Debugger WASM plugin
+│   ├── http_routes/main.onyx     # HTTP-Server Route Viewer WASM plugin (`http-server`)
+│   ├── orm_schema/main.onyx      # Postgres-ORM Schema Viewer WASM plugin (`postgres-orm`)
 │   ├── aoc/main.onyx             # Advent of Code Runner & Dashboard WASM plugin
 │   └── welcome/main.onyx         # Minimal reference/verification WASM plugin
 ├── tests/

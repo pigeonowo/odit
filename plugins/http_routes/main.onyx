@@ -1,0 +1,421 @@
+// =============================================================================
+// ODIT Plugin: HTTP-Server Route Viewer (`build/plugins/http_routes.wasm`)
+// =============================================================================
+// Scans workspace `.onyx` files for `onyx pkg add http-server` route
+// registrations (`router->get/post/put/patch/delete(...)`, `router->route(...)`,
+// and `@http.route` / `@route` decorators) and renders a filterable table.
+// Clicking any route jumps directly to its handler definition in the editor.
+
+#load "../../abi/abi.onyx"
+#load "../../sdk/plugin_sdk.onyx"
+
+use core { package, Array, tprintf }
+use odit.abi
+use odit.sdk
+
+RouteEntry :: struct {
+    method:  str;
+    path:    str;
+    handler: str;
+    file:    str;
+    line:    u32;
+}
+
+@sdk.Plugin.{
+    id             = "odit.http_routes",
+    title          = "HTTP Routes",
+    version        = "0.1.0",
+    default_slot   = 0,
+    default_width  = 520.0f,
+    default_height = 360.0f,
+    event_mask     = 579, // ActiveFileChanged (1) | BufferModified (2) | CommandInvoked (64) | WorkspaceChanged (512)
+    allow_multiple = false,
+}
+HttpRoutesPlugin :: struct {
+    routes:        [..] RouteEntry;
+    filter_buf:    [128] u8;
+    filter_len:    u32;
+    method_filter: i32; // 0=ALL, 1=GET, 2=POST, 3=PUT, 4=DELETE
+    scroll_y:      f32;
+    selected_idx:  i32;
+    needs_scan:    bool;
+    files_scanned: i32;
+}
+
+#local
+trim_s :: (s: str) -> str {
+    a := 0;
+    b := s.count;
+    while a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n') do a += 1;
+    while b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n') do b -= 1;
+    return s[a .. b];
+}
+
+#local
+contains_ci :: (haystack: str, needle: str) -> bool {
+    if needle.count == 0 do return true;
+    if haystack.count < needle.count do return false;
+    for i in 0 .. (haystack.count - needle.count + 1) {
+        ok := true;
+        for j in 0 .. needle.count {
+            a := haystack[i + j];
+            b := needle[j];
+            if a >= 'A' && a <= 'Z' do a += 32;
+            if b >= 'A' && b <= 'Z' do b += 32;
+            if a != b { ok = false; break; }
+        }
+        if ok do return true;
+    }
+    return false;
+}
+
+#local
+find_sub :: (s: str, sub: str, start: i32 = 0) -> i32 {
+    if sub.count == 0 || start < 0 || s.count < start + sub.count do return -1;
+    for i in start .. (s.count - sub.count + 1) {
+        ok := true;
+        for j in 0 .. sub.count {
+            if s[i + j] != sub[j] { ok = false; break; }
+        }
+        if ok do return i;
+    }
+    return -1;
+}
+
+#local
+extract_quoted :: (s: str, start: i32 = 0) -> (val: str, end_pos: i32, ok: bool) {
+    i := start;
+    while i < s.count && s[i] != '"' do i += 1;
+    if i >= s.count do return "", start, false;
+    s0 := i + 1;
+    i = s0;
+    while i < s.count && s[i] != '"' {
+        if s[i] == '\\' && i + 1 < s.count do i += 2;
+        else do i += 1;
+    }
+    if i >= s.count do return "", start, false;
+    return s[s0 .. i], i + 1, true;
+}
+
+#local
+extract_handler_after :: (s: str, pos: i32) -> str {
+    i := pos;
+    while i < s.count && (s[i] == ' ' || s[i] == '\t' || s[i] == ',') do i += 1;
+    if i >= s.count do return "(inline)";
+    if s[i] == '(' do return "(inline)";
+    s0 := i;
+    while i < s.count {
+        c := s[i];
+        ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.';
+        if !ok do break;
+        i += 1;
+    }
+    if i > s0 do return s[s0 .. i];
+    return "(inline)";
+}
+
+#local
+normalize_method :: (raw: str) -> str {
+    t := trim_s(raw);
+    if str.starts_with(t, ".") do t = t[1 .. t.count];
+    if contains_ci(t, "DELETE")  do return "DELETE";
+    if contains_ci(t, "POST")    do return "POST";
+    if contains_ci(t, "PATCH")   do return "PATCH";
+    if contains_ci(t, "PUT")     do return "PUT";
+    if contains_ci(t, "HEAD")    do return "HEAD";
+    if contains_ci(t, "OPTIONS") do return "OPTIONS";
+    if contains_ci(t, "GET")     do return "GET";
+    return "ANY";
+}
+
+#local
+clear_routes :: (self: &HttpRoutesPlugin) {
+    for &r in self.routes {
+        sdk.free_str(r.method);
+        sdk.free_str(r.path);
+        sdk.free_str(r.handler);
+        sdk.free_str(r.file);
+    }
+    Array.clear(&self.routes);
+}
+
+#local
+add_route :: (self: &HttpRoutesPlugin, method: str, path: str, handler: str, file: str, line: u32) {
+    self.routes << .{
+        method  = sdk.copy_str(method),
+        path    = sdk.copy_str(path),
+        handler = sdk.copy_str(handler),
+        file    = sdk.copy_str(file),
+        line    = line,
+    };
+}
+
+#local
+scan_file_for_routes :: (self: &HttpRoutesPlugin, rel_path: str) {
+    src := sdk.workspace_read_file(rel_path, context.temp_allocator);
+    if src.count == 0 do return;
+
+    // Split into lines
+    lines := make([..] str, 64, context.temp_allocator);
+    s0 := 0;
+    for i in 0 .. (src.count + 1) {
+        if i == src.count || src[i] == '\n' {
+            e := i;
+            if e > s0 && src[e - 1] == '\r' do e -= 1;
+            lines << src[s0 .. e];
+            s0 = i + 1;
+        }
+    }
+
+    for li in 0 .. lines.count {
+        raw := trim_s(lines[li]);
+        if raw.count == 0 || str.starts_with(raw, "//") do continue;
+        line_1 := cast(u32) (li + 1);
+
+        // 1. Decorator-based routes: `@http.route.{ .GET, "/path" }`, `@route.{ .POST, "/path" }`, `@http.get.{"/path"}`
+        if raw[0] == '@' && (contains_ci(raw, "route") || contains_ci(raw, ".get") || contains_ci(raw, ".post") || contains_ci(raw, ".put") || contains_ci(raw, ".delete") || contains_ci(raw, ".patch")) {
+            rpath, _, ok_p := extract_quoted(raw, 0);
+            if ok_p && rpath.count > 0 {
+                meth := normalize_method(raw);
+                // Look ahead 1-2 lines for handler procedure name
+                hname := "(handler)";
+                for look in 1 .. 3 {
+                    if li + look < lines.count {
+                        nxt := trim_s(lines[li + look]);
+                        cp := find_sub(nxt, "::");
+                        if cp > 0 {
+                            hname = trim_s(nxt[0 .. cp]);
+                            break;
+                        }
+                    }
+                }
+                add_route(self, meth, rpath, hname, rel_path, line_1);
+                continue;
+            }
+        }
+
+        // 2. Generic `->route(.METHOD, "/path", handler)` or `.route(.METHOD, "/path", handler)`
+        ridx := find_sub(raw, "->route(");
+        if ridx < 0 do ridx = find_sub(raw, ".route(");
+        if ridx >= 0 {
+            arg_s := ridx + (8 if raw[ridx] == '-' else 7);
+            rpath, q_end, ok_p := extract_quoted(raw, arg_s);
+            if ok_p {
+                meth := normalize_method(raw[arg_s .. q_end]);
+                hname := extract_handler_after(raw, q_end);
+                add_route(self, meth, rpath, hname, rel_path, line_1);
+                continue;
+            }
+        }
+
+        // 3. Method helper shortcuts: `->get("/path", handler)`, `->post(...)`, `->put(...)`, `->patch(...)`, `->delete(...)`
+        meth_pats := str.[ "->get(", "->post(", "->put(", "->patch(", "->delete(", "->head(", "->options(" ];
+        meth_lbls := str.[ "GET",    "POST",    "PUT",    "PATCH",    "DELETE",    "HEAD",    "OPTIONS"    ];
+        for mi in 0 .. meth_pats.count {
+            pidx := find_sub(raw, meth_pats[mi]);
+            if pidx >= 0 {
+                arg_s := pidx + meth_pats[mi].count;
+                rpath, q_end, ok_p := extract_quoted(raw, arg_s);
+                if ok_p {
+                    hname := extract_handler_after(raw, q_end);
+                    add_route(self, meth_lbls[mi], rpath, hname, rel_path, line_1);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#local
+rescan_workspace :: (self: &HttpRoutesPlugin) {
+    clear_routes(self);
+    self.files_scanned = 0;
+
+    files_js := sdk.workspace_find_files_json(".onyx", context.temp_allocator);
+    if files_js.count == 0 do return;
+
+    // Parse JSON array of strings: ["src/main.onyx", ...]
+    pos := 0;
+    while pos < files_js.count {
+        fp, next_pos, ok := extract_quoted(files_js, pos);
+        if !ok do break;
+        pos = next_pos;
+        // Skip third-party packages under `lib/` and build outputs
+        if str.starts_with(fp, "lib/") || str.starts_with(fp, "build/") || str.starts_with(fp, "plugins/") do continue;
+        self.files_scanned += 1;
+        scan_file_for_routes(self, fp);
+    }
+}
+
+#local
+method_colors :: (method: str) -> (bg: u32, fg: u32) {
+    if str.equal(method, "GET")    do return 0xA6E3A128, sdk.theme_color(.Success);
+    if str.equal(method, "POST")   do return 0x89B4FA28, sdk.theme_color(.Info);
+    if str.equal(method, "PUT")    do return 0xF9E2AF28, sdk.theme_color(.Warning);
+    if str.equal(method, "PATCH")  do return 0xF9E2AF28, sdk.theme_color(.Warning);
+    if str.equal(method, "DELETE") do return 0xF38BA828, sdk.theme_color(.Error);
+    return 0xCBA6F728, sdk.theme_color(.Accent);
+}
+
+#local
+route_matches_filter :: (self: &HttpRoutesPlugin, r: &RouteEntry) -> bool {
+    if self.method_filter == 1 && !str.equal(r.method, "GET")    do return false;
+    if self.method_filter == 2 && !str.equal(r.method, "POST")   do return false;
+    if self.method_filter == 3 && !str.equal(r.method, "PUT") && !str.equal(r.method, "PATCH") do return false;
+    if self.method_filter == 4 && !str.equal(r.method, "DELETE") do return false;
+
+    if self.filter_len > 0 {
+        q := str.{ &self.filter_buf[0], cast(i32) self.filter_len };
+        if !contains_ci(r.path, q) && !contains_ci(r.handler, q) && !contains_ci(r.file, q) && !contains_ci(r.method, q) {
+            return false;
+        }
+    }
+    return true;
+}
+
+@sdk.PluginInit
+init :: (self: &HttpRoutesPlugin, window_id: u32) -> i32 {
+    self.routes       = make([..] RouteEntry);
+    self.selected_idx = -1;
+    self.needs_scan   = true;
+    sdk.register_command("http_routes.refresh", "HTTP Routes: Rescan Workspace", "");
+    return 0;
+}
+
+@sdk.PluginEvent
+on_event :: (self: &HttpRoutesPlugin, window_id: u32, event: sdk.Event) {
+    switch event {
+        case .BufferModified as bm {
+            if bm.saved do self.needs_scan = true;
+        }
+        case .WorkspaceChanged {
+            self.needs_scan = true;
+        }
+        case .Command as cmd {
+            if str.equal(cmd, "http_routes.refresh") do self.needs_scan = true;
+        }
+        case _ {}
+    }
+}
+
+@sdk.PluginRender
+render :: (self: &HttpRoutesPlugin, window_id: u32, ctx: &abi.FrameContext) {
+    if self.needs_scan {
+        self.needs_scan = false;
+        rescan_workspace(self);
+    }
+
+    bg_surface := sdk.theme_color(.BgSurface);
+    bg_header  := sdk.theme_color(.BgHeader);
+    bg_hover   := sdk.theme_color(.BgHover);
+    bg_sel     := sdk.theme_color(.BgSelection);
+    border     := sdk.theme_color(.Border);
+    txt_pri    := sdk.theme_color(.TextPrimary);
+    txt_sec    := sdk.theme_color(.TextSecondary);
+    txt_dis    := sdk.theme_color(.TextDisabled);
+    accent     := sdk.theme_color(.Accent);
+
+    pad: f32 = 8.0f;
+    w := ctx.width;
+    h := ctx.height;
+
+    // 1. Top Search & Refresh Bar
+    in_w := w - pad * 2.0f - 70.0f;
+    if in_w < 80.0f do in_w = 80.0f;
+    sdk.input_text(10, pad, pad, in_w, 26.0f, self.filter_buf, &self.filter_len, "Filter routes (path, handler, file)...");
+    sdk.on_click(11, pad + in_w + 6.0f, pad, 64.0f, 26.0f, "Refresh", .Ghost) {
+        self.needs_scan = true;
+    };
+
+    // 2. Method Filter Pills
+    py: f32 = pad + 32.0f;
+    px: f32 = pad;
+    pills := str.[ "ALL", "GET", "POST", "PUT", "DEL" ];
+    for pi in 0 .. pills.count {
+        st := abi.ButtonFlags.Primary if self.method_filter == pi else abi.ButtonFlags.Ghost;
+        bw: f32 = 44.0f;
+        sdk.on_click(cast(u32)(20 + pi), px, py, bw, 22.0f, pills[pi], st) {
+            self.method_filter = pi;
+        };
+        px += bw + 4.0f;
+    }
+
+    cnt_lbl := tprintf("{} routes", self.routes.count);
+    cw := sdk.measure_text(cnt_lbl, 11.5f);
+    if px + cw + 8.0f < w {
+        sdk.draw_text(w - pad - cw, py + 4.0f, cnt_lbl, 11.5f, txt_sec);
+    }
+
+    // 3. Table Header
+    tbl_y: f32 = py + 28.0f;
+    hdr_h: f32 = 24.0f;
+    sdk.draw_rect(pad, tbl_y, w - pad * 2.0f, hdr_h, bg_header, 4.0f);
+    col_m := pad + 8.0f;
+    col_p := pad + 72.0f;
+    col_h := pad + (w - pad * 2.0f) * 0.52f;
+    col_f := pad + (w - pad * 2.0f) * 0.76f;
+
+    sdk.draw_text(col_m, tbl_y + 5.0f, "METHOD",  11.0f, txt_sec, .Bold);
+    sdk.draw_text(col_p, tbl_y + 5.0f, "PATH",    11.0f, txt_sec, .Bold);
+    sdk.draw_text(col_h, tbl_y + 5.0f, "HANDLER", 11.0f, txt_sec, .Bold);
+    if w > 380.0f do sdk.draw_text(col_f, tbl_y + 5.0f, "LOCATION", 11.0f, txt_sec, .Bold);
+
+    list_y := tbl_y + hdr_h + 2.0f;
+    list_h := h - list_y - pad;
+    if list_h < 40.0f do list_h = 40.0f;
+
+    // Collect filtered indices
+    vis := make([..] i32, 16, context.temp_allocator);
+    for i in 0 .. self.routes.count {
+        if route_matches_filter(self, &self.routes[i]) do vis << i;
+    }
+
+    if vis.count == 0 {
+        sdk.draw_rect(pad, list_y, w - pad * 2.0f, list_h, bg_surface, 4.0f, border, 1.0f);
+        sdk.draw_text(pad + 12.0f, list_y + 14.0f, "No HTTP routes found in this workspace.", 13.0f, txt_sec, .Bold);
+        sdk.draw_text(pad + 12.0f, list_y + 38.0f, "Using `onyx pkg add http-server`? Register routes like:", 12.0f, txt_dis);
+        sdk.draw_text(pad + 12.0f, list_y + 58.0f, "  router->get(\"/users\", get_users);", 12.0f, accent, .Mono);
+        sdk.draw_text(pad + 12.0f, list_y + 76.0f, "  router->route(.POST, \"/login\", handle_login);", 12.0f, accent, .Mono);
+        return;
+    }
+
+    row_h: f32 = 28.0f;
+    content_h := cast(f32) vis.count * row_h + 8.0f;
+    sdk.draw_rect(pad, list_y, w - pad * 2.0f, list_h, bg_surface, 4.0f, border, 1.0f);
+
+    sdk.scroll_area(30, pad + 1.0f, list_y + 1.0f, w - pad * 2.0f - 2.0f, list_h - 2.0f, content_h, &self.scroll_y) {
+        for vi in 0 .. vis.count {
+            ri := vis[vi];
+            r := &self.routes[ri];
+            ry := list_y + 2.0f + cast(f32) vi * row_h;
+
+            hov, clk := sdk.row_hit(ctx, pad + 2.0f, ry, w - pad * 2.0f - 4.0f, row_h, self.scroll_y);
+            if clk {
+                self.selected_idx = ri;
+                sdk.editor_open(r.file, cast(i32) r.line, 1);
+            }
+
+            if ri == self.selected_idx {
+                sdk.draw_rect(pad + 2.0f, ry, w - pad * 2.0f - 4.0f, row_h - 1.0f, bg_sel, 3.0f);
+            } elseif hov {
+                sdk.draw_rect(pad + 2.0f, ry, w - pad * 2.0f - 4.0f, row_h - 1.0f, bg_hover, 3.0f);
+            }
+
+            mbg, mfg := method_colors(r.method);
+            sdk.pill(col_m, ry + 4.0f, r.method, mbg, mfg);
+
+            sdk.clipped(col_p, ry, col_h - col_p - 6.0f, row_h) {
+                sdk.draw_text(col_p, ry + 6.0f, r.path, 12.5f, txt_pri, .Mono);
+            };
+            loc_limit := (col_f - col_h - 6.0f) if w > 380.0f else (w - pad - col_h - 6.0f);
+            sdk.clipped(col_h, ry, loc_limit, row_h) {
+                sdk.draw_text(col_h, ry + 6.0f, r.handler, 12.0f, txt_sec, .Mono);
+            };
+            if w > 380.0f {
+                sdk.clipped(col_f, ry, w - pad - col_f - 6.0f, row_h) {
+                    sdk.draw_text(col_f, ry + 6.0f, tprintf("{}:{}", r.file, r.line), 11.0f, txt_dis, .Mono);
+                };
+            }
+        }
+    };
+}
