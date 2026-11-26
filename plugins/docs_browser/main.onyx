@@ -187,7 +187,7 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
     y += 28.0f;
 
     // Detail card height reserved at bottom
-    detail_h: f32 = 104.0f;
+    detail_h: f32 = 136.0f;
     list_h := ctx.height - y - detail_h - pad - 8.0f;
     if list_h < 60.0f do list_h = 60.0f;
 
@@ -239,18 +239,29 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
         sel := &g_rows[g_selected];
         blbl, bcol := kind_badge(sel.kind);
         pw := sdk.pill(pad + 10.0f, dy + 8.0f, blbl, bcol, 0x11111BFF);
-        sdk.draw_text(pad + 18.0f + pw, dy + 10.0f, sel.name, 13.5f, sdk.theme_color(.TextPrimary), .Bold);
-
         // Open-in-editor button for any symbol with a backing file (project, deps, or core stdlib)
+        name_max_w := w - 24.0f - pw;
         if sel.file.count > 0 && sel.line > 0 {
             if sdk.button(40, pad + w - 66.0f, dy + 6.0f, 56.0f, 22.0f, "Open", .Primary) & .Clicked {
                 sdk.editor_open(sel.file, cast(i32) sel.line, 1);
             }
+            name_max_w -= 66.0f;
+        }
+        if name_max_w > 20.0f {
+            sdk.clipped(pad + 18.0f + pw, dy + 6.0f, name_max_w, 22.0f) {
+                sdk.draw_text(pad + 18.0f + pw, dy + 10.0f, sel.name, 13.5f, sdk.theme_color(.TextPrimary), .Bold);
+            };
         }
 
-        sdk.draw_text(pad + 10.0f, dy + 36.0f, sel.signature, 12.0f, sdk.theme_color(.Info), .Mono);
-        sum := sel.summary if sel.summary.count > 0 else (sel.file if sel.file.count > 0 else "Onyx symbol.");
-        sdk.draw_text(pad + 10.0f, dy + 60.0f, sum, 12.0f, sdk.theme_color(.TextSecondary));
+        inner_w := w - 20.0f;
+        sdk.clipped(pad + 10.0f, dy + 32.0f, inner_w, detail_h - 38.0f) {
+            sig_end_y := draw_wrapped_text(pad + 10.0f, dy + 34.0f, inner_w, 34.0f, sel.signature, 11.5f, sdk.theme_color(.Info), .Mono);
+            sum := sel.summary if sel.summary.count > 0 else (sel.file if sel.file.count > 0 else "Onyx symbol.");
+            rem_h := (dy + detail_h - 6.0f) - (sig_end_y + 4.0f);
+            if rem_h > 10.0f {
+                draw_wrapped_text(pad + 10.0f, sig_end_y + 4.0f, inner_w, rem_h, sum, 12.0f, sdk.theme_color(.TextSecondary), .{});
+            }
+        };
     } else {
         sdk.draw_text(pad + 10.0f, dy + 12.0f, "Select an item above to inspect its signature and docs.", 12.5f, sdk.theme_color(.TextDisabled));
     }
@@ -268,4 +279,60 @@ str_has :: (haystack: str, needle: str) -> bool {
         if ok do return true;
     }
     return false;
+}
+
+
+#local
+draw_wrapped_text :: (x, y, max_w, max_h: f32, text: str, font_size: f32, color: u32, flags: abi.TextFlags) -> f32 {
+    if text.count == 0 || max_w < 20.0f do return y;
+    lh := font_size * 1.35f;
+    cy := y;
+    max_y := y + max_h;
+
+    // Split by explicit newlines first, then word-wrap each paragraph
+    p_start := 0;
+    for pi in 0 .. (text.count + 1) {
+        if pi == text.count || text[pi] == '\n' {
+            para := text[p_start .. pi];
+            p_start = pi + 1;
+            if cy + lh * 0.7f > max_y do break;
+
+            if para.count == 0 {
+                cy += lh * 0.6f;
+                continue;
+            }
+
+            ls := 0;
+            while ls < para.count {
+                if cy + lh * 0.7f > max_y do break;
+                while ls < para.count && para[ls] == ' ' do ls += 1;
+                if ls >= para.count do break;
+
+                // Find longest slice fitting in `max_w`
+                best_end := ls;
+                last_space := -1;
+                i := ls;
+                while i < para.count {
+                    if para[i] == ' ' do last_space = i;
+                    w := sdk.measure_text(para[ls .. (i + 1)], font_size, flags);
+                    if w > max_w {
+                        if last_space > ls {
+                            best_end = last_space;
+                        } elseif i > ls {
+                            best_end = i;
+                        } else {
+                            best_end = ls + 1;
+                        }
+                        break;
+                    }
+                    best_end = i + 1;
+                    i += 1;
+                }
+                sdk.draw_text(x, cy, para[ls .. best_end], font_size, color, flags);
+                cy += lh;
+                ls = best_end;
+            }
+        }
+    }
+    return cy;
 }

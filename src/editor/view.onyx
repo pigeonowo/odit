@@ -833,21 +833,54 @@ draw_hover_popup :: (rect: wm.PaneRect, cx, cy, line_h: f32, text: str) {
     fs := 13.0f * s;
     lh := fs * 1.35f;
 
-    // Split into up to 8 lines & measure box width
-    lines: [8] str;
+    max_text_w := 520.0f * s;
+    if max_text_w > rect.w - 44.0f do max_text_w = rect.w - 44.0f;
+    if max_text_w < 140.0f do max_text_w = 140.0f;
+
+    // Word-wrap into up to 16 lines & measure exact box width
+    lines: [16] str;
     n_lines := 0;
     max_w: f32 = 160.0f;
-    start := 0;
-    for i in 0 .. (text.count + 1) {
-        if i == text.count || text[i] == '\n' {
-            if n_lines < 8 {
-                ln := text[start .. i];
-                lines[n_lines] = ln;
+    p_start := 0;
+    for pi in 0 .. (text.count + 1) {
+        if pi == text.count || text[pi] == '\n' {
+            para := text[p_start .. pi];
+            p_start = pi + 1;
+            if n_lines >= 16 do break;
+
+            if para.count == 0 {
+                lines[n_lines] = "";
                 n_lines += 1;
-                w := theme.measure_text(ln, fs);
-                if w > max_w do max_w = w;
+                continue;
             }
-            start = i + 1;
+
+            ls := 0;
+            while ls < para.count && n_lines < 16 {
+                while ls < para.count && para[ls] == ' ' do ls += 1;
+                if ls >= para.count do break;
+
+                best_end := ls;
+                last_space := -1;
+                i := ls;
+                while i < para.count {
+                    if para[i] == ' ' do last_space = i;
+                    w := theme.measure_text(para[ls .. (i + 1)], fs);
+                    if w > max_text_w {
+                        if last_space > ls      do best_end = last_space;
+                        elseif i > ls           do best_end = i;
+                        else                    do best_end = ls + 1;
+                        break;
+                    }
+                    best_end = i + 1;
+                    i += 1;
+                }
+                seg := para[ls .. best_end];
+                lines[n_lines] = seg;
+                n_lines += 1;
+                sw := theme.measure_text(seg, fs);
+                if sw > max_w do max_w = sw;
+                ls = best_end;
+            }
         }
     }
     if n_lines == 0 do return;
@@ -862,11 +895,17 @@ draw_hover_popup :: (rect: wm.PaneRect, cx, cy, line_h: f32, text: str) {
 
     by := cy - box_h - 6.0f;
     if by < rect.y + 6.0f do by = cy + line_h + 4.0f;
+    if by + box_h > rect.y + rect.h - 6.0f do by = rect.y + rect.h - box_h - 6.0f;
+    if by < rect.y + 6.0f do by = rect.y + 6.0f;
 
     theme.draw_rect(bx, by, box_w, box_h, theme.get_color(.BgSurface), 6.0f, theme.get_color(.BorderFocused), 1.5f);
+    raylib.BeginScissorMode(cast(i32) (bx + 6.0f), cast(i32) (by + 4.0f), cast(i32) (box_w - 12.0f), cast(i32) (box_h - 8.0f));
     for i in 0 .. n_lines {
-        theme.draw_text(bx + 10.0f, by + 8.0f + cast(f32) i * lh, lines[i], fs, theme.get_color(.TextPrimary));
+        if lines[i].count > 0 {
+            theme.draw_text(bx + 10.0f, by + 8.0f + cast(f32) i * lh, lines[i], fs, theme.get_color(.TextPrimary));
+        }
     }
+    raylib.BeginScissorMode(cast(i32) rect.x, cast(i32) rect.y, cast(i32) rect.w, cast(i32) rect.h);
 }
 
 #local

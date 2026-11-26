@@ -121,8 +121,8 @@ index_onyx_file :: (full_path: str, rel_label: str, source_tag: str) {
 
         if str.starts_with(trimmed, "///") {
             comment := trim_left(trimmed[3 .. trimmed.count]);
-            if doc_buf.count > 0 && doc_buf.count < 180 do Array.concat(&doc_buf, " ");
-            if doc_buf.count < 180 do Array.concat(&doc_buf, comment);
+            if doc_buf.count > 0 && doc_buf.count < 600 do Array.concat(&doc_buf, "\n");
+            if doc_buf.count < 600 do Array.concat(&doc_buf, comment);
             continue;
         }
 
