@@ -143,6 +143,7 @@ odit/
 │   └── odit_test.onyx            # Unit test suite powered by `onyx_testing_framework`
 ├── docs/
 │   ├── architecture.md           # Host, Wasmer isolation, WM, LSP & Editor internals
+│   ├── debugging.md              # Quick-start guide for the Live Onyx <-> WASM Debugger
 │   ├── plugin-abi.md             # Complete ABI v1.0 opcode reference & plugin authoring guide
 │   └── roadmap.md                # Phase 1–4 roadmap & Onyx 2611 / Wasmer engineering notes
 ├── build.nu                      # Nushell build/test/run/install script
@@ -154,5 +155,6 @@ odit/
 ## Documentation
 
 - **[`docs/architecture.md`](docs/architecture.md)** — How the native Onyx host, `dlopen`-isolated Wasmer C bridge, draggable window manager, Onyx LSP client, UI renderer, and code editor fit together.
+- **[`docs/debugging.md`](docs/debugging.md)** — How to get started with breakpoints, Onyx line stepping, and `.wat` instruction stepping in the Live Debugger.
 - **[`docs/plugin-abi.md`](docs/plugin-abi.md)** — Complete ABI v1.0 contract (`abi/abi.onyx`), opcode map, memory safety guidelines, and a quickstart template for authoring your own `.wasm` plugin.
 - **[`docs/roadmap.md`](docs/roadmap.md)** — Phase 1–4 status, Phase 4 design notes, and Onyx 2611 / Wasmer toolchain quirks already solved.
