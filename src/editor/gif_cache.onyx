@@ -175,18 +175,22 @@ gif_cache_request :: (url: str) -> &GifEntry {
     entry.cache_path = str.copy(cpath);
     entry.state      = .Downloading;
 
-    // Fast path: already downloaded to disk cache
+    // Fast path: already downloaded to disk cache (delete stale/corrupt non-GIF files)
     if os.file_exists(entry.cache_path) {
         if load_gif_from_disk(&entry) {
             g_gif_cache << entry;
             return &g_gif_cache[g_gif_cache.count - 1];
         }
+        os.remove_file(entry.cache_path);
     }
 
-    // Spawn non-blocking background curl script (supports direct .gif AND tenor.com/view/... pages)
+    // Spawn non-blocking background curl script:
+    // Downloads URL to a temp file, checks for actual `GIF8` magic header, and if
+    // it's an HTML page (like `tenor.com/<id>.gif` or `tenor.com/view/...`), scrapes
+    // the real `media.tenor.com/...gif` URL and downloads the actual animated GIF!
     safe_url := sanitize_shell_url(url, context.temp_allocator);
     script := core.tprintf(
-        "U='{}'; O='{}'; if echo \"$U\" | grep -qiE '\\.gif(\\?|$)'; then curl -sSL --max-time 12 \"$U\" -o \"$O\"; else G=$(curl -sSL --max-time 12 -A 'Mozilla/5.0' \"$U\" | grep -oE 'https://media[0-9]*\\.tenor\\.com/[^\" ]+\\.gif' | head -n 1); if [ -z \"$G\" ]; then G=$(curl -sSL --max-time 12 -A 'Mozilla/5.0' \"$U\" | grep -oE 'https://c\\.tenor\\.com/[^\" ]+\\.gif' | head -n 1); fi; if [ -n \"$G\" ]; then curl -sSL --max-time 12 \"$G\" -o \"$O\"; else exit 1; fi; fi",
+        "U='{}'; O='{}'; T=\"$O.tmp\"; curl -sSL --max-time 12 -A 'Mozilla/5.0' \"$U\" -o \"$T\" || exit 1; if head -c 4 \"$T\" | grep -q '^GIF8'; then mv \"$T\" \"$O\"; exit 0; fi; G=$(grep -oE 'https://media[0-9]*\\.tenor\\.com/[^\"<> ]+\\.gif' \"$T\" | head -n 1); if [ -z \"$G\" ]; then G=$(grep -oE 'https://c\\.tenor\\.com/[^\"<> ]+\\.gif' \"$T\" | head -n 1); fi; rm -f \"$T\"; if [ -n \"$G\" ]; then curl -sSL --max-time 12 -A 'Mozilla/5.0' \"$G\" -o \"$O\" && head -c 4 \"$O\" | grep -q '^GIF8'; else exit 1; fi",
         safe_url, entry.cache_path
     );
     sh_cmd := "sh";
