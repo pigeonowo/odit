@@ -66,9 +66,15 @@ This document summarizes the implemented subsystems of **Onyx Editor (`odit`)** 
 - [x] **Live Debugger WASM Plugin (`plugins/debugger/main.onyx` → `build/plugins/debugger.wasm`)**:
   - Declarative `@sdk.Plugin` split view showing Onyx source lines (with clickable breakpoint gutter) alongside syntax-colored mapped `.wat` instructions, active range highlighting, single WAT-instruction stepping, and a bottom Locals/Params inspector.
 
-## Domain-Specific Mini-Apps, Audio, Plugin Settings & Distribution Readiness
+## Domain-Specific Mini-Apps, Authoring DX, Audio & Polish
 
 - [x] **Portable Tool Discovery**: Removed all hardcoded local user paths; `wasm2wat` resolves via `$WASM2WAT`, `./tools/wasm2wat`, `$ODIT_HOME/tools/wasm2wat`, `~/.local/bin/wasm2wat`, `/usr/bin`, `/usr/local/bin`, or `PATH`, and `README.md` documents installation & search paths for every prerequisite.
+- [x] **Plugin Authoring DX & Multi-Language SDKs**:
+  - Multi-directory plugin discovery (`.odit/plugins` → `~/.config/odit/plugins` → `$ODIT_HOME/plugins`) with basename re-resolution on reload.
+  - Standalone Onyx SDK (`odit_onyx_sdk`), native `onyx new odit-plugin` template (`templates/odit-plugin.json`) with `build.onyx`, built-in **Plugin Dev** core plugin (`plugins/plugin_dev/main.onyx`), and standalone Rust SDK (`odit_rust_sdk` with `#[odit_plugin]` proc-macros).
+- [x] **Plugin Settings & Audio API**: Opcodes `9–11` (`host_register_setting`/`get`/`set`) rendered in a scrollable `Ctrl+,` Settings modal and persisted in `odit.json` (`plugin_settings`); opcodes `41–44` (`audio_load`, `audio_load_memory`, `audio_play`, `audio_unload`) supporting `.mp3`/`.wav`/`.ogg`/`.flac` from files or embedded memory.
+- [x] **Editor Find (`Ctrl+F`), LSP Symbol Search (`Ctrl+T`), Multi-Line Doc Wrapping & Inline GIFs**: Unified find/symbol overlay (`src/ui/find_overlay.onyx`), generalized Project + `./lib/` Deps + Core Docs Browser with `Open` jump and multi-line wrapping, multi-line wrapped LSP hover tooltips, and inline animated `// [TENOR](...)` / `// [GIF](...)` comments (`src/editor/gif_cache.onyx`).
+- [x] **Fast Async Startup**: Non-blocking parent stdin pipe (`O_NONBLOCK`) + `tx_buf` queue in `src/lsp/client.onyx` and 1-plugin-per-frame startup queue cut startup time from ~6.7s to ~0.3s on large files.
 - [x] **HTTP-Server Route Viewer (`plugins/http_routes/main.onyx` → `build/plugins/http_routes.wasm`)**: Scans workspace `.onyx` files for `onyx pkg add http-server` routes (`->get/post/put/patch/delete`, `->route(...)`, `@http.route`/`@route`), displays a filterable `Method | Path | Handler | Location` table with color-coded method pills, and jumps to definitions on click.
 - [x] **Postgres-ORM Schema Viewer (`plugins/orm_schema/main.onyx` → `build/plugins/orm_schema.wasm`)**: Scans workspace `.onyx` files for `onyx pkg add postgres-orm` `@orm.model` structs and renders visual schema cards (`Table Name`, `StructName`, Onyx types, and `PK`/`AUTO`/`NN`/`UNQ`/`FK` constraint badges) with click-to-jump.
 

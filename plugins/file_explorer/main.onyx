@@ -1,5 +1,5 @@
 // =============================================================================
-// Onyx Editor ("odit") — File Explorer WASM Plugin (Phase 3.1 Improved)
+// Onyx Editor ("odit") — File Explorer WASM Plugin
 // =============================================================================
 // Sandboxed `.wasm` mini-app communicating exclusively through `odit_host`:
 //   - Expandable directory tree covering ALL workspace folders (only skips `.git`)

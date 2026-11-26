@@ -1,5 +1,5 @@
 // =============================================================================
-// Onyx Editor ("odit") — Build & Run WASM Plugin (Phase 3.1 Improved, OBV-inspired)
+// Onyx Editor ("odit") — Build & Run WASM Plugin (OBV-inspired)
 // =============================================================================
 // Features:
 //   - Persistent project build configuration stored in `odit-build.json`

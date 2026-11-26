@@ -107,7 +107,33 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
 
 ---
 
-## Authoring a New WASM Plugin (Modern Declarative SDK)
+## Authoring a New WASM Plugin
+
+### Option A: Standalone Onyx Plugin (`onyx new odit-plugin`) — Recommended
+Scaffold a standalone plugin outside the `odit` repo using the installed template and `odit_onyx_sdk`:
+```bash
+onyx new odit-plugin my_plugin
+cd my_plugin
+onyx run build.onyx -- install   # installs to ~/.config/odit/plugins/my_plugin.wasm
+# or:
+onyx run build.onyx -- dev       # installs to .odit/plugins/my_plugin.wasm (workspace override)
+```
+Inside `odit`, open the built-in **Plugin Dev** pane (`Ctrl+P` → `Plugin: Open plugin_dev.wasm`) for one-click **Dev + Reload** / **Install + Reload** with clickable compiler errors.
+
+### Option B: Standalone Rust Plugin (`odit_rust_sdk`)
+Because the ABI is a flat WebAssembly scalar boundary, you can also author plugins in Rust (`wasm32-unknown-unknown`) using the **`odit_rust_sdk`** crate (`#[odit_plugin(...)]` proc-macro + safe Rust wrappers for all ABI opcodes):
+```bash
+cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/my_plugin.wasm ~/.config/odit/plugins/
+```
+
+### Plugin Discovery Order
+ODIT scans `.wasm` plugins in priority order (first match wins, so local dev builds override installed plugins):
+1. `.odit/plugins/` (workspace-local dev overrides)
+2. `~/.config/odit/plugins/` (user-installed plugins — survives `odit` upgrades)
+3. `$ODIT_HOME/plugins/` or `build/plugins/` (built-in core plugins)
+
+### Option C: Built-In Onyx Plugin (Inside `odit/plugins/`)
 
 1. Create `plugins/<my_plugin>/main.onyx`:
    ```onyx
@@ -124,7 +150,7 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
        default_slot   = 0,
        default_width  = 360.0f,
        default_height = 240.0f,
-       event_mask     = 67, // ActiveFileChanged | BufferModified | CommandInvoked
+       event_mask     = 0xFFFFFFFF, // Subscribe to all IDE events
        allow_multiple = false,
    }
    MyPlugin :: struct {
@@ -134,6 +160,7 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
    @sdk.PluginInit
    init :: (self: &MyPlugin, window_id: u32) -> i32 {
        sdk.register_command("my_plugin.hello", "My Plugin: Say Hello", "");
+       sdk.register_setting("my_plugin.greeting", "My Plugin: Greeting", .String, "Hello from WASM!");
        return 0;
    }
 
@@ -153,12 +180,12 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
        cy := v->next(72.0f);
        sdk.card(12.0f, cy, v.w, 72.0f, "My Plugin") {
            sdk.draw_text(22.0f, cy + 36.0f, "Hello from WASM!", 14.0f, sdk.theme_color(.TextPrimary));
-       }
+       };
        by := v->next(28.0f);
        sdk.on_click(1, 12.0f, by, 120.0f, 28.0f, "Greet", .Primary) {
            self.greeting_count += 1;
            sdk.notify(.Info, "Hello from WASM!");
-       }
+       };
    }
    ```
    - `sdk/plugin_sdk.onyx` automatically exports `odit_plugin_manifest`, `odit_plugin_init`, `odit_plugin_shutdown`, `odit_plugin_event`, and `odit_plugin_render` (and calls `sdk.begin_frame()` automatically before render).

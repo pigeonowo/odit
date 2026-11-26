@@ -1,5 +1,5 @@
 // =============================================================================
-// Onyx Editor ("odit") — Main Native Host Application (Phase 1)
+// Onyx Editor ("odit") — Main Native Host Application
 // =============================================================================
 // Architecture: "Window = WASM Plugin"
 //   - Left pane:  Core Onyx Code Editor (syntax highlighting, modal + Ctrl+S/Z)

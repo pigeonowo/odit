@@ -1,5 +1,5 @@
 // =============================================================================
-// Onyx Editor ("odit") — WASM Inspector (`.wat`) WASM Plugin (Phase 3.2)
+// Onyx Editor ("odit") — WASM Inspector (`.wat`) WASM Plugin
 // =============================================================================
 // Select any function from the active Onyx file (sourced live from Onyx LSP
 // `ast_get_symbols`, or typed manually) and view its real compiled WebAssembly

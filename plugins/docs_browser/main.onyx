@@ -1,5 +1,5 @@
 // =============================================================================
-// Onyx Editor ("odit") — Onyx Docs / Core Browser WASM Plugin (Phase 3.2)
+// Onyx Editor ("odit") — Project, Dependencies & Onyx Core Docs Browser Plugin
 // =============================================================================
 // Searchable reference panel for Onyx core standard library packages, procs,
 // structs/enums, and compiler `#` directives (e.g. `core.conv.format`, `#format`,

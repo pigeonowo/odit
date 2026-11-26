@@ -6,20 +6,21 @@
 
 ## Highlights
 
-- **Sandboxed WASM Plugin Architecture:** Every panel (`File Explorer`, `Build & Run`, `WASM Inspector`, `Onyx Docs & Core`, and any custom plugin you drop in `plugins/`) compiles to standalone WebAssembly (`-r js --wasm-mvp`) with zero OS/WASI imports and communicates exclusively through a versioned Host ABI ([`abi/abi.onyx`](abi/abi.onyx)) and declarative `@sdk.Plugin` SDK ([`sdk/plugin_sdk.onyx`](sdk/plugin_sdk.onyx)).
+- **Sandboxed WASM Plugin Architecture:** Every panel (`File Explorer`, `Build & Run`, `Plugin Dev`, `WASM Inspector`, `Docs & Symbols`, `Live Debugger`, and any custom plugin in `.odit/plugins/`, `~/.config/odit/plugins/`, or `plugins/`) compiles to standalone WebAssembly (`onyx build -r js --wasm-mvp` or Rust `wasm32-unknown-unknown`) with zero OS/WASI imports and communicates exclusively through a versioned Host ABI ([`abi/abi.onyx`](abi/abi.onyx)). Author external plugins in **Onyx** (`onyx new odit-plugin`, `odit_onyx_sdk`) or **Rust** (`odit_rust_sdk`).
 - **Draggable, Dockable & Floating Window Manager:** Drag any plugin title bar to **swap** panes, snap into **Left**, **Right**, or **Bottom** dock zones with live drop previews, or pop out into z-ordered, corner-resizable **floating windows**. Layout persists automatically in `odit-layout.json`.
-- **Core Onyx Code Editor:** Custom line buffer with multi-step undo, per-line Onyx syntax highlighting, modal Normal/Insert editing (toggleable), pixel-accurate cursor & click alignment, gutter markers, and horizontal scrolling (`Shift+Wheel` + auto-scroll).
-- **Onyx LSP Integration:** Non-blocking JSON-RPC client for `onyx lsp` powering live diagnostic underlines, inline error messages, gutter dots, hover tooltips (`K`), go-to-definition (`F12` / `gd`), autocomplete (`Ctrl+Space`), and symbol feeds to WASM plugins.
+- **Core Onyx Code Editor:** Custom line buffer with multi-step undo, per-line Onyx syntax highlighting, selection & copy/cut/paste, modal Normal/Insert editing (toggleable), pixel-accurate cursor & click alignment, gutter markers, horizontal scrolling (`Shift+Wheel` + auto-scroll), Find & Symbol Search (`Ctrl+F` / `Ctrl+T`), and inline animated Tenor/GIF comments (`// [TENOR](...)` / `// [GIF](...)`).
+- **Onyx LSP Integration:** Non-blocking JSON-RPC client for `onyx lsp` (with async write queue so startup never stalls) powering live diagnostic underlines, inline error messages, gutter dots, multi-line wrapped hover tooltips (`K`), go-to-definition (`F12` / `gd`), autocomplete (`Ctrl+Space`), `Ctrl+T` symbol search, and symbol feeds to WASM plugins.
 - **Built-In Core Mini-Apps (`.wasm` Plugins):**
   - **File Explorer** — Full workspace directory tree with live filter, single-click folder expand/collapse, and instant file opening.
   - **Build & Run** — Persistent per-project `odit-build.json`, OBV-inspired compiler flags drawer, extra `compiler_args` (e.g. `-DComponent_Build`), 2-stage Build → Run pipeline (capable of building & running `odit` inside `odit`), clickable `file.onyx:line:col` error jumps, and **interactive `stdin`** with live unflushed prompt rendering.
+  - **Plugin Dev** — One-click plugin authoring workflow (`Dev + Reload`, `Install + Reload`, `Reload`, `Open <plugin>`, `Build`), auto-detecting `build.onyx` & `onyx-pkg.kdl`, streaming color-coded output with clickable compiler error jumps.
   - **WASM Inspector (`.wat`)** — Lists functions from the active file via Onyx LSP and disassembles them to syntax-colored WebAssembly Text Format (`.wat`) with horizontal scrolling & pan controls.
-  - **Onyx Docs & Core Browser** — Live searchable reference indexing `~/.onyx/core` packages/procs/types and built-in `#` compiler directives.
+  - **Docs & Symbols Browser** — Live searchable reference indexing the **current project**, `./lib/` **dependencies**, `~/.onyx/core` **stdlib**, and built-in `#` compiler directives, with scope/category filters, multi-line doc wrapping, and an **Open** button to jump to definitions.
   - **Live Debugger (`Onyx <-> .wat`)** — Toggle breakpoints via editor gutter clicks or `F9`, customize run commands (`--param ...`), step through Onyx lines (`F10`), local/indirect calls (`In`/`Out`), or individual `.wat` instructions (`F11`), and inspect live variable & WASM local slot values.
   - **HTTP Routes Viewer (`http-server`)** — Scans `onyx pkg add http-server` projects (`router->get/post/put/patch/delete`, `router->route`, `@http.route`) into a filterable `Method | Path | Handler | Location` table with click-to-jump.
   - **Postgres-ORM Schema Viewer (`postgres-orm`)** — Scans `onyx pkg add postgres-orm` `@orm.model` structs and renders visual database schema cards (`PK`, `AUTO`, `NN`, `UNQ`, `FK` badges + Onyx types) with click-to-jump.
   - **Advent of Code Runner** — Day-by-day `test`/`real` runner with `.odit/aoc_state.json` persistence, expected vs. actual comparison, clipboard copy, and per-day boilerplate generator.
-- **Command-First & Configurable:** Fuzzy Command Palette (`Ctrl+P`), Fuzzy File Finder (`Ctrl+O`), live Settings panel (`Ctrl+,`) with 4 built-in themes (`mocha`, `tokyo_night`, `gruvbox`, `light`), font size & UI scaling, and global CLI install (`odit [dir_or_file]`).
+- **Command-First & Configurable:** Fuzzy Command Palette (`Ctrl+P`), Fuzzy File Finder (`Ctrl+O`), scrollable Settings panel (`Ctrl+,`) with 4 built-in themes (`mocha`, `tokyo_night`, `gruvbox`, `light`), font size & UI scaling, plugin-registered settings, and global CLI install (`odit [dir_or_file]`).
 
 ---
 
@@ -128,14 +129,17 @@ odit/
 │   │   ├── workspace.onyx        # Recursive workspace file indexer
 │   │   ├── compiler_wat.onyx     # `onyx --generate-name-section` + `wasm2wat` disassembly service
 │   │   ├── debugger.onyx         # Live Onyx <-> WASM breakpoint & stepping service (opcodes 90-94)
-│   │   └── docs_index.onyx       # Onyx `~/.onyx/core` & `#` directive documentation indexer
+│   │   ├── debugger_eval.onyx    # Live Onyx local expression & WAT slot evaluator
+│   │   └── docs_index.onyx       # Project, `./lib/` deps, `~/.onyx/core`, & `#` directive indexer
 │   ├── ui/
 │   │   ├── renderer.onyx         # Host Raylib immediate UI renderer for WASM plugins (+ headless mode)
 │   │   ├── palette.onyx          # Command-first `Ctrl+P` fuzzy command palette
 │   │   ├── file_finder.onyx      # `Ctrl+O` fuzzy file finder
-│   │   └── settings_view.onyx    # `Ctrl+,` interactive settings modal
+│   │   ├── find_overlay.onyx     # `Ctrl+F` text find & `Ctrl+T` LSP symbol search overlay
+│   │   └── settings_view.onyx    # `Ctrl+,` scrollable interactive settings modal (core + plugin settings)
 │   ├── editor/
-│   │   ├── buffer.onyx           # Line buffer, file I/O, undo stack, gutter markers
+│   │   ├── buffer.onyx           # Line buffer, selection, clipboard, undo stack, gutter markers
+│   │   ├── gif_cache.onyx        # Async Tenor/GIF fetcher & animated frame player for comments
 │   │   ├── lexer.onyx            # Per-line Onyx syntax highlighter
 │   │   └── view.onyx             # Editor viewport, horizontal/vertical scroll, modal & standard editing
 │   └── plugin/
@@ -144,13 +148,16 @@ odit/
 ├── plugins/
 │   ├── file_explorer/main.onyx   # File Explorer WASM plugin
 │   ├── build_run/main.onyx       # Build & Run WASM plugin (persistent config + interactive stdin)
+│   ├── plugin_dev/main.onyx      # Plugin Dev WASM plugin (one-click Dev/Install + hot-reload)
 │   ├── wasm_inspector/main.onyx  # Live `.wat` WebAssembly Inspector WASM plugin
-│   ├── docs_browser/main.onyx    # Onyx Core & `#` Directives Docs Browser WASM plugin
+│   ├── docs_browser/main.onyx    # Project, Deps & Onyx Core Docs Browser WASM plugin
 │   ├── debugger/main.onyx        # Live Side-by-Side Onyx <-> WAT Debugger WASM plugin
 │   ├── http_routes/main.onyx     # HTTP-Server Route Viewer WASM plugin (`http-server`)
 │   ├── orm_schema/main.onyx      # Postgres-ORM Schema Viewer WASM plugin (`postgres-orm`)
 │   ├── aoc/main.onyx             # Advent of Code Runner & Dashboard WASM plugin
 │   └── welcome/main.onyx         # Minimal reference/verification WASM plugin
+├── templates/
+│   └── odit-plugin.json          # `onyx new odit-plugin` project scaffold template
 ├── tests/
 │   └── odit_test.onyx            # Unit test suite powered by `onyx_testing_framework`
 ├── docs/
