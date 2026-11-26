@@ -165,19 +165,26 @@ load_plugin_settings_from_json :: (contents: str) {
         while pos < contents.count && contents[pos] != ':' do pos += 1;
         if pos < contents.count do pos += 1;
         while pos < contents.count && (contents[pos] == ' ' || contents[pos] == '\t') do pos += 1;
-        if pos >= contents.count || contents[pos] != '"' do break;
+        if pos >= contents.count do break;
 
-        // Read value
-        pos += 1;
+        // Read value (supports both quoted strings `"0.5"` and unquoted JSON primitives `0.5`, `true`, `10`)
         vbuf := make([..] u8, 32, context.temp_allocator);
-        while pos < contents.count && contents[pos] != '"' {
-            if contents[pos] == '\\' && pos + 1 < contents.count {
+        if contents[pos] == '"' {
+            pos += 1;
+            while pos < contents.count && contents[pos] != '"' {
+                if contents[pos] == '\\' && pos + 1 < contents.count {
+                    pos += 1;
+                }
+                vbuf << contents[pos];
                 pos += 1;
             }
-            vbuf << contents[pos];
-            pos += 1;
+            if pos < contents.count do pos += 1;
+        } else {
+            while pos < contents.count && contents[pos] != ',' && contents[pos] != '}' && contents[pos] != '\n' && contents[pos] != '\r' && contents[pos] != ' ' && contents[pos] != '\t' {
+                vbuf << contents[pos];
+                pos += 1;
+            }
         }
-        if pos < contents.count do pos += 1;
         val := str.{ vbuf.data, vbuf.count };
 
         // Store or update

@@ -142,7 +142,26 @@ settings_view_update_and_draw :: (sv: &SettingsView, screen_w, screen_h: f32) ->
     }
     cy += 34.0f * s;
     raylib.DrawLine(cast(i32) ix, cast(i32) cy, cast(i32) (ix + iw), cast(i32) cy, theme.get_rl(.Border));
-    cy += 10.0f * s;
+    cy += 8.0f * s;
+
+    // Scrollable body region between header and pinned footer
+    btn_h := 30.0f * s;
+    footer_y := py + ph - pad - btn_h;
+    body_top := cy;
+    body_h := footer_y - 10.0f * s - body_top;
+    if body_h < 60.0f do body_h = 60.0f;
+
+    // Handle mouse-wheel scrolling inside the Settings modal
+    if mpos.x >= px && mpos.x <= (px + pw) && mpos.y >= body_top && mpos.y <= (body_top + body_h) {
+        wheel := raylib.GetMouseWheelMove();
+        if wheel != 0.0f {
+            sv.scroll_y -= wheel * row_h * 2.0f;
+            if sv.scroll_y < 0.0f do sv.scroll_y = 0.0f;
+        }
+    }
+
+    raylib.BeginScissorMode(cast(i32) px, cast(i32) body_top, cast(i32) pw, cast(i32) body_h);
+    cy = body_top - sv.scroll_y;
 
     action := SettingsAction.None;
     cfg := &settings.g_settings;
@@ -237,7 +256,6 @@ settings_view_update_and_draw :: (sv: &SettingsView, screen_w, screen_h: f32) ->
         for pi in 0 .. settings.g_plugin_settings.count {
             ps := &settings.g_plugin_settings[pi];
             if !ps.registered do continue;
-            if cy + row_h > py + ph - 52.0f * s do break;
 
             if ps.kind == 1 {
                 // Bool toggle
@@ -309,12 +327,18 @@ settings_view_update_and_draw :: (sv: &SettingsView, screen_w, screen_h: f32) ->
         cy += 8.0f;
     }
 
-    // Footer buttons (anchored near bottom of modal)
-    btn_h := 30.0f * s;
-    footer_y := py + ph - pad - btn_h;
-    if cy > footer_y do footer_y = cy;
+    // Clamp scroll_y to actual content height & end body scissor
+    content_h := (cy + sv.scroll_y) - body_top;
+    max_scroll := content_h - body_h;
+    if max_scroll < 0.0f do max_scroll = 0.0f;
+    if sv.scroll_y > max_scroll do sv.scroll_y = max_scroll;
+    raylib.EndScissorMode();
+
+    // Pinned footer buttons
+    raylib.DrawLine(cast(i32) ix, cast(i32) (footer_y - 6.0f * s), cast(i32) (ix + iw), cast(i32) (footer_y - 6.0f * s), theme.get_rl(.Border));
     bw := (iw - gap * 2.0f) / 3.0f;
     if btn_rect(ix, footer_y, bw, btn_h, "Edit odit.json", fs) {
+        settings.settings_save();
         sv.open = false;
         action = .OpenJsonFile;
     }
