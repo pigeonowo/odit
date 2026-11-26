@@ -46,7 +46,9 @@ BuildConfig :: struct {
     entry_len:      u32;
     out_buf:        [128] u8;
     out_len:        u32;
-    args_buf:       [128] u8;
+    cargs_buf:      [128] u8; // Extra compiler args (e.g. -DComponent_Build)
+    cargs_len:      u32;
+    args_buf:       [128] u8; // Runtime args passed after `--`
     args_len:       u32;
 
     // OBV-inspired compiler flags
@@ -104,6 +106,7 @@ cfg_defaults :: () {
     g_cfg.runtime_idx    = 0; // onyx
     set_buf(g_cfg.entry_buf, &g_cfg.entry_len, "src/main.onyx");
     set_buf(g_cfg.out_buf,   &g_cfg.out_len,   "build/odit.wasm");
+    set_buf(g_cfg.cargs_buf, &g_cfg.cargs_len, "");
     set_buf(g_cfg.args_buf,  &g_cfg.args_len,  "");
     g_cfg.debug          = false;
     g_cfg.stack_trace    = true;
@@ -161,6 +164,9 @@ cfg_load :: () -> bool {
     out := sdk.json_get_str(js, "output", context.temp_allocator);
     if out.count > 0 do set_buf(g_cfg.out_buf, &g_cfg.out_len, out);
 
+    ca := sdk.json_get_str(js, "compiler_args", context.temp_allocator);
+    set_buf(g_cfg.cargs_buf, &g_cfg.cargs_len, ca);
+
     ra := sdk.json_get_str(js, "run_args", context.temp_allocator);
     set_buf(g_cfg.args_buf, &g_cfg.args_len, ra);
 
@@ -182,14 +188,16 @@ cfg_save :: () {
     out := make([..] u8, 512, context.temp_allocator);
     ent := str.{ &g_cfg.entry_buf[0], cast(i32) g_cfg.entry_len };
     of  := str.{ &g_cfg.out_buf[0],   cast(i32) g_cfg.out_len };
+    ca  := str.{ &g_cfg.cargs_buf[0], cast(i32) g_cfg.cargs_len };
     ra  := str.{ &g_cfg.args_buf[0],  cast(i32) g_cfg.args_len };
 
     Array.concat(&out, "{\n");
-    Array.concat(&out, "    \"mode\": \"");      Array.concat(&out, mode_to_str(g_cfg.mode_idx));       Array.concat(&out, "\",\n");
-    Array.concat(&out, "    \"runtime\": \"");   Array.concat(&out, runtime_to_str(g_cfg.runtime_idx)); Array.concat(&out, "\",\n");
-    Array.concat(&out, "    \"entry\": \"");     Array.concat(&out, ent);                               Array.concat(&out, "\",\n");
-    Array.concat(&out, "    \"output\": \"");    Array.concat(&out, of);                                Array.concat(&out, "\",\n");
-    Array.concat(&out, "    \"run_args\": \"");  Array.concat(&out, ra);                                Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"mode\": \"");          Array.concat(&out, mode_to_str(g_cfg.mode_idx));       Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"runtime\": \"");       Array.concat(&out, runtime_to_str(g_cfg.runtime_idx)); Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"entry\": \"");         Array.concat(&out, ent);                               Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"output\": \"");        Array.concat(&out, of);                                Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"compiler_args\": \""); Array.concat(&out, ca);                                Array.concat(&out, "\",\n");
+    Array.concat(&out, "    \"run_args\": \"");      Array.concat(&out, ra);                                Array.concat(&out, "\",\n");
     Array.concat(&out, "    \"debug\": ");           Array.concat(&out, "true,\n" if g_cfg.debug else "false,\n");
     Array.concat(&out, "    \"stack_trace\": ");     Array.concat(&out, "true,\n" if g_cfg.stack_trace else "false,\n");
     Array.concat(&out, "    \"name_section\": ");    Array.concat(&out, "true,\n" if g_cfg.name_section else "false,\n");
@@ -456,6 +464,16 @@ start_build_job :: (run_after: bool, force_check: bool) {
     if g_cfg.show_all_errs  do add_arg("--show-all-errors");
     if g_cfg.doc            do add_arg("--doc");
 
+    // Append any extra user compiler arguments (whitespace-separated, e.g. `-DComponent_Build`)
+    extra := str.{ &g_cfg.cargs_buf[0], cast(i32) g_cfg.cargs_len };
+    ei := 0;
+    while ei < extra.count {
+        while ei < extra.count && (extra[ei] == ' ' || extra[ei] == '\t') do ei += 1;
+        es := ei;
+        while ei < extra.count && extra[ei] != ' ' && extra[ei] != '\t' do ei += 1;
+        if ei > es do add_arg(extra[es .. ei]);
+    }
+
     add_arg(entry);
 
     append_log(.Command, str.{ cmd_disp.data, cmd_disp.count });
@@ -695,20 +713,27 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
     }
     y += 32.0f;
 
-    // Row 4: Run Args + Flags drawer toggle + Clear
-    clr_w: f32 = 56.0f;
-    flg_w: f32 = 96.0f;
-    arg_w := w - clr_w - flg_w - 12.0f;
-    if sdk.input_text(15, pad, y, arg_w, 26.0f, g_cfg.args_buf, &g_cfg.args_len, "Run args (e.g. --self-test)") & .Changed {
+    // Row 4: Extra Compiler Args + Run Args + Flags drawer toggle + Clear
+    clr_w: f32 = 54.0f;
+    flg_w: f32 = 90.0f;
+    args_tot := w - clr_w - flg_w - 18.0f;
+    if args_tot < 100.0f do args_tot = 100.0f;
+    ca_w := args_tot * 0.52f;
+    ra_w := args_tot - ca_w;
+
+    if sdk.input_text(18, pad, y, ca_w, 26.0f, g_cfg.cargs_buf, &g_cfg.cargs_len, "Compiler args (-D...)") & .Changed {
+        cfg_changed = true;
+    }
+    if sdk.input_text(15, pad + ca_w + 6.0f, y, ra_w, 26.0f, g_cfg.args_buf, &g_cfg.args_len, "Run args (--...)") & .Changed {
         cfg_changed = true;
     }
 
     fb: [24] u8;
     flbl := format_flags_btn(&fb, count_active_flags(), g_show_flags);
-    if sdk.button(16, pad + arg_w + 6.0f, y, flg_w, 26.0f, flbl, .Active if g_show_flags else .Ghost) & .Clicked {
+    if sdk.button(16, pad + ca_w + ra_w + 12.0f, y, flg_w, 26.0f, flbl, .Active if g_show_flags else .Ghost) & .Clicked {
         g_show_flags = !g_show_flags;
     }
-    if sdk.button(17, pad + arg_w + flg_w + 12.0f, y, clr_w, 26.0f, "Clear", .Ghost) & .Clicked {
+    if sdk.button(17, pad + ca_w + ra_w + flg_w + 18.0f, y, clr_w, 26.0f, "Clear", .Ghost) & .Clicked {
         clear_logs();
     }
     y += 32.0f;

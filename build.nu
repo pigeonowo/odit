@@ -49,6 +49,8 @@ export def "main plugins" [] {
             with-env { ONYX_PATH: (onyx-path) } {
                 ^$onyx build -r js --wasm-mvp -o $out $entry
             }
+            let js_file = $"($out).js"
+            if ($js_file | path exists) { rm -f $js_file }
         }
     }
 }

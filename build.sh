@@ -33,6 +33,7 @@ build_plugins() {
             echo "Building WASM plugin ${name} -> build/plugins/${name}.wasm"
             onyx build -r js --wasm-mvp \
                 -o "build/plugins/${name}.wasm" "${dir}main.onyx"
+            rm -f "build/plugins/${name}.wasm.js"
         fi
     done
 }
