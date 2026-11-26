@@ -23,9 +23,13 @@ ODIT includes a **Live Side-by-Side Onyx <-> WASM Debugger** (`debugger.wasm`) t
    - Move the cursor to a line and press **`F9`**, **or**
    - Click any line directly inside the left pane of the Live Debugger plugin.
    - A red dot appears in both the editor gutter and the Live Debugger.
-4. **Start debugging**:
-   - Press **`F5`** (or click **`Start`** in the Live Debugger toolbar).
-   - ODIT compiles your target with `--generate-name-section`, disassembles the active function to `.wat`, pauses at your breakpoint, and highlights:
+4. **Configure the Run Command (optional) & Start debugging**:
+   - Use the **`Cmd:`** input bar at the top of the Live Debugger to customize the command and compiler flags—for example, in an Advent of Code project:
+     ```text
+     onyx run --param 'aoc.day=1' --param 'aoc.test=true' src/day1.onyx
+     ```
+   - Press **`Enter`** in the `Cmd:` box, press **`F5`**, or click **`Start`** in the toolbar.
+   - ODIT compiles your target with your flags plus `--generate-name-section`, disassembles the active function to `.wat`, pauses at your breakpoint, and highlights:
      - The active **Onyx line** on the left (and in the main editor gutter),
      - The corresponding **WAT instruction range** and active instruction (`>`) on the right,
      - The function's **parameters and WASM `(local ...)` slots** in the bottom strip.

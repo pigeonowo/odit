@@ -13,6 +13,7 @@ use core { package, os, io, Array }
 WatCache :: struct {
     valid:       bool;
     entry:       str;
+    extra_key:   str;
     version:     u32;
     wat_full:    str;
     last_error:  str;
@@ -61,14 +62,21 @@ run_cmd_capture :: (exe: str, args: [] str) -> (bool, str) {
 }
 
 /// Ensures `g_wat_cache.wat_full` is compiled & disassembled for `entry`.
-wat_ensure_compiled :: (file_path: str, buf_version: u32) -> bool {
-    // Choose compilation entry: project files under `src/` compile via `src/main.onyx`
+wat_ensure_compiled :: (file_path: str, buf_version: u32, extra_args: [] str = .[], explicit_entry: bool = false) -> bool {
+    // Choose compilation entry: project files under `src/` compile via `src/main.onyx` unless explicitly specified
     entry := file_path;
-    if entry.count == 0 || str.starts_with(entry, "src/") || str.starts_with(entry, "abi/") {
+    if !explicit_entry && (entry.count == 0 || str.starts_with(entry, "src/") || str.starts_with(entry, "abi/")) {
         if os.file_exists("src/main.onyx") do entry = "src/main.onyx";
     }
 
-    if g_wat_cache.valid && str.equal(g_wat_cache.entry, entry) && g_wat_cache.version == buf_version {
+    extra_key_buf := make(dyn_str, 64, context.temp_allocator);
+    for a in extra_args {
+        Array.concat(&extra_key_buf, a);
+        extra_key_buf << '\n';
+    }
+    extra_key := str.{ extra_key_buf.data, extra_key_buf.count };
+
+    if g_wat_cache.valid && str.equal(g_wat_cache.entry, entry) && str.equal(g_wat_cache.extra_key, extra_key) && g_wat_cache.version == buf_version {
         return true;
     }
 
@@ -79,17 +87,30 @@ wat_ensure_compiled :: (file_path: str, buf_version: u32) -> bool {
     onyx_exe := resolve_onyx_executable();
     is_plugin := str.starts_with(entry, "plugins/");
 
-    ok := false;
-    err_txt := "";
+    cmd_args := make([..] str, 16, context.temp_allocator);
+    cmd_args << "build";
     if is_plugin {
-        ok, err_txt = run_cmd_capture(onyx_exe, .[
-            "build", "-r", "js", "--wasm-mvp",
-            "--generate-name-section", "--no-colors", "-o", wasm_out, entry
-        ]);
-    } else {
-        ok, err_txt = run_cmd_capture(onyx_exe, .[
-            "build", "--generate-name-section", "--no-colors", "-o", wasm_out, entry
-        ]);
+        cmd_args << "-r";
+        cmd_args << "js";
+        cmd_args << "--wasm-mvp";
+    }
+    cmd_args << "--generate-name-section";
+    cmd_args << "--no-colors";
+    for a in extra_args {
+        cmd_args << a;
+    }
+    cmd_args << "-o";
+    cmd_args << wasm_out;
+    cmd_args << entry;
+
+    ok, err_txt := run_cmd_capture(onyx_exe, cmd_args);
+
+    // If an explicit non-main file failed because `main.main` lives in `src/main.onyx`, retry via `src/main.onyx` with the same extra_args
+    if (!ok || !os.file_exists(wasm_out)) && explicit_entry && !str.equal(entry, "src/main.onyx") && os.file_exists("src/main.onyx") {
+        if str.contains(err_txt, "main.main") || str.contains(err_txt, "Package 'main' not found") {
+            cmd_args[cmd_args.count - 1] = "src/main.onyx";
+            ok, err_txt = run_cmd_capture(onyx_exe, cmd_args);
+        }
     }
 
     if !ok || !os.file_exists(wasm_out) {
@@ -113,9 +134,12 @@ wat_ensure_compiled :: (file_path: str, buf_version: u32) -> bool {
         return false;
     }
 
-    if g_wat_cache.wat_full.count > 0 do str.free(g_wat_cache.wat_full);
+    if g_wat_cache.wat_full.count > 0  do str.free(g_wat_cache.wat_full);
+    if g_wat_cache.entry.count > 0     do str.free(g_wat_cache.entry);
+    if g_wat_cache.extra_key.count > 0 do str.free(g_wat_cache.extra_key);
     g_wat_cache.wat_full   = wat_contents;
     g_wat_cache.entry      = str.copy(entry);
+    g_wat_cache.extra_key  = str.copy(extra_key);
     g_wat_cache.version    = buf_version;
     g_wat_cache.valid      = true;
     g_wat_cache.last_error = "";
@@ -210,8 +234,8 @@ extract_wat_function :: (wat: str, func_name: str) -> (str, i32) {
 }
 
 /// Returns raw extracted WAT text and function index for `(file_path, func_name)`.
-wat_get_function_raw :: (file_path: str, func_name: str, buf_version: u32) -> (wat_text: str, func_idx: i32, ok: bool, err: str) {
-    if !wat_ensure_compiled(file_path, buf_version) {
+wat_get_function_raw :: (file_path: str, func_name: str, buf_version: u32, extra_args: [] str = .[], explicit_entry: bool = false) -> (wat_text: str, func_idx: i32, ok: bool, err: str) {
+    if !wat_ensure_compiled(file_path, buf_version, extra_args, explicit_entry) {
         return "", -1, false, g_wat_cache.last_error;
     }
     wat_slice, fidx := extract_wat_function(g_wat_cache.wat_full, func_name);

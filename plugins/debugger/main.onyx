@@ -56,6 +56,9 @@ DebuggerPlugin :: struct {
     src_scroll_x:     f32;
     wat_scroll_y:     f32;
     wat_scroll_x:     f32;
+    cmd_buf:          [256] u8;
+    cmd_len:          u32;
+    cmd_user_edited:  bool;
     needs_sync:       bool;
     auto_scroll_req:  bool;
 }
@@ -102,8 +105,26 @@ has_bp :: (self: &DebuggerPlugin, line: u32) -> bool {
 }
 
 #local
+set_default_cmd :: (self: &DebuggerPlugin, path: str) {
+    if self.cmd_user_edited || path.count == 0 do return;
+    def := tprintf("onyx run {}", path);
+    n := def.count if def.count < 255 else 255;
+    for i in 0 .. n do self.cmd_buf[i] = def[i];
+    self.cmd_len = cast(u32) n;
+}
+
+#local
+current_run_cmd :: (self: &DebuggerPlugin) -> str {
+    if self.cmd_len > 0 {
+        return str.{ &self.cmd_buf[0], cast(i32) self.cmd_len };
+    }
+    return self.source_path;
+}
+
+#local
 reload_source_file :: (self: &DebuggerPlugin, path: str) {
     if path.count == 0 do return;
+    set_default_cmd(self, path);
     src := sdk.workspace_read_file(path, context.temp_allocator);
     split_into_lines(&self.src_lines, src);
 }
@@ -257,7 +278,7 @@ on_event :: (self: &DebuggerPlugin, window_id: u32, event: sdk.Event) {
         case .Command as cmd {
             if str.equal(cmd, "debugger.start") {
                 if self.status == .Paused do sdk.debug_command(.Continue);
-                else                      do sdk.debug_start(self.source_path);
+                else                      do sdk.debug_start(current_run_cmd(self));
                 self.needs_sync = true;
             } elseif str.equal(cmd, "debugger.step_over") {
                 sdk.debug_command(.StepOver);
@@ -323,7 +344,7 @@ render :: (self: &DebuggerPlugin, window_id: u32, ctx: &abi.FrameContext) {
     start_lbl := "Cont" if is_paused else "Start";
     sdk.on_click(100, cx, tb_y, 52.0f, tb_h, start_lbl, .Primary) {
         if is_paused do sdk.debug_command(.Continue);
-        else         do sdk.debug_start(self.source_path);
+        else         do sdk.debug_start(current_run_cmd(self));
         self.needs_sync = true;
     };
     cx += 56.0f;
@@ -362,10 +383,32 @@ render :: (self: &DebuggerPlugin, window_id: u32, ctx: &abi.FrameContext) {
     sdk.draw_line(0.0f, 38.0f, w, 38.0f, 1.0f, border);
 
     // -------------------------------------------------------------------------
+    // 1b. Run Command Input Bar (supports `onyx run --param ... file.onyx`)
+    // -------------------------------------------------------------------------
+    cmd_y: f32 = 42.0f;
+    cmd_h: f32 = 24.0f;
+    sdk.draw_text(pad, cmd_y + 5.0f, "Cmd:", 11.5f, txt_sec, .Bold);
+    cmd_x := pad + 36.0f;
+    cmd_w := w - cmd_x - pad;
+    if cmd_w < 80.0f do cmd_w = 80.0f;
+    cmd_st := sdk.input_text(
+        110, cmd_x, cmd_y, cmd_w, cmd_h,
+        self.cmd_buf, &self.cmd_len,
+        "onyx run --param aoc.day=1 src/day1.onyx"
+    );
+    if cmd_st & .Changed {
+        self.cmd_user_edited = true;
+    }
+    if cmd_st & .Submitted {
+        sdk.debug_start(current_run_cmd(self));
+        self.needs_sync = true;
+    }
+
+    // -------------------------------------------------------------------------
     // 2. Side-by-Side Split View: Onyx Source (Left) | Mapped WAT (Right)
     // -------------------------------------------------------------------------
     bottom_h: f32 = 82.0f;
-    split_y:  f32 = 42.0f;
+    split_y:  f32 = 72.0f;
     split_h:  f32 = h - split_y - bottom_h - 6.0f;
     if split_h < 80.0f do split_h = 80.0f;
 

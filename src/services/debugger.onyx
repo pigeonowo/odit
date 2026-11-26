@@ -34,6 +34,8 @@ ParsedProc :: struct {
 DebuggerState :: struct {
     status:           abi.DebugStatus;
     entry_path:       str;
+    explicit_entry:   bool;
+    extra_args:       [..] str;
     source_path:      str;
     current_line:     u32;
     current_func:     str;
@@ -57,6 +59,8 @@ g_dbg: DebuggerState;
 dbg_init :: () {
     g_dbg.status           = .Idle;
     g_dbg.entry_path       = "";
+    g_dbg.explicit_entry   = false;
+    g_dbg.extra_args       = make([..] str);
     g_dbg.source_path      = "";
     g_dbg.current_line     = 0;
     g_dbg.current_func     = "";
@@ -316,7 +320,7 @@ load_function_into_debugger :: (source_path: str, func_name: str, target_line: u
         found_proc = true;
     }
 
-    wat_raw, _, ok, err := wat_get_function_raw(g_dbg.entry_path, chosen.name, buf_version);
+    wat_raw, _, ok, err := wat_get_function_raw(g_dbg.entry_path, chosen.name, buf_version, g_dbg.extra_args, g_dbg.explicit_entry);
     if !ok {
         g_dbg.status = .Error;
         if g_dbg.last_error.count > 0 do str.free(g_dbg.last_error);
@@ -421,17 +425,129 @@ sync_onyx_line_from_wat :: () {
     }
 }
 
-/// Starts a debug session on `entry_path` (compiling & pausing at first breakpoint or entry proc).
-dbg_start :: (entry_path: str, active_file: str, cursor_line: u32, buf_version: u32) -> i32 {
-    eff_entry := entry_path if entry_path.count > 0 else active_file;
+/// Parses a user run command (e.g. `onyx run --param 'aoc.day=1' --param aoc.test=true src/day1.onyx`)
+/// or bare file path into `(entry_file, compiler_extra_args, is_explicit_cmd)`.
+dbg_parse_run_command :: (cmd_line: str, allocator := context.temp_allocator) -> (entry_file: str, extra_args: [..] str, is_explicit_cmd: bool) {
+    tokens := make([..] str, 16, context.temp_allocator);
+    i := 0;
+    n := cmd_line.count;
+    while i < n {
+        while i < n && (cmd_line[i] == ' ' || cmd_line[i] == '\t' || cmd_line[i] == '\r' || cmd_line[i] == '\n') do i += 1;
+        if i >= n do break;
+        buf := make([..] u8, 32, allocator);
+        quote: u8 = 0;
+        while i < n {
+            c := cmd_line[i];
+            if quote != 0 {
+                if c == quote {
+                    quote = 0;
+                    i += 1;
+                    continue;
+                }
+                buf << c;
+                i += 1;
+            } else {
+                if c == ' ' || c == '\t' || c == '\r' || c == '\n' do break;
+                if c == '\'' || c == '"' {
+                    quote = c;
+                    i += 1;
+                    continue;
+                }
+                buf << c;
+                i += 1;
+            }
+        }
+        if buf.count > 0 do tokens << str.{ buf.data, buf.count };
+    }
+
+    out_entry := "";
+    out_args := make([..] str, 8, allocator);
+    explicit := false;
+
+    ti := 0;
+    // Skip leading `onyx` binary and subcommand (`run`, `build`, `build-exe`, `check`)
+    if ti < tokens.count && (str.equal(tokens[ti], "onyx") || str.ends_with(tokens[ti], "/onyx")) {
+        explicit = true;
+        ti += 1;
+    }
+    if ti < tokens.count && (str.equal(tokens[ti], "run") || str.equal(tokens[ti], "build") || str.equal(tokens[ti], "build-exe") || str.equal(tokens[ti], "check")) {
+        explicit = true;
+        ti += 1;
+    }
+
+    while ti < tokens.count {
+        tok := tokens[ti];
+        if str.equal(tok, "--") do break; // Program runtime args follow `--`
+        if str.equal(tok, "-o") || str.equal(tok, "--output") {
+            ti += 2; // Skip output file (WAT disassembly uses build/.odit_inspect.wasm)
+            continue;
+        }
+        if str.equal(tok, "--param") || str.equal(tok, "-r") || str.equal(tok, "--runtime") || str.equal(tok, "-I") {
+            out_args << tok;
+            if ti + 1 < tokens.count {
+                out_args << tokens[ti + 1];
+                ti += 2;
+                continue;
+            }
+            ti += 1;
+            continue;
+        }
+        if str.starts_with(tok, "-") {
+            out_args << tok;
+            ti += 1;
+            continue;
+        }
+        if str.ends_with(tok, ".onyx") || out_entry.count == 0 {
+            out_entry = tok;
+        } else {
+            out_args << tok;
+        }
+        ti += 1;
+    }
+
+    if out_args.count > 0 do explicit = true;
+    return out_entry, out_args, explicit;
+}
+
+#local
+find_next_breakpoint :: (cur_path: str, cur_line: u32) -> (path: str, line: u32, found: bool) {
+    // 1. Prefer next breakpoint later in the same file
+    best_line: u32 = 0;
+    for &bp in g_dbg.breakpoints {
+        if str.equal(bp.path, cur_path) && bp.line > cur_line {
+            if best_line == 0 || bp.line < best_line do best_line = bp.line;
+        }
+    }
+    if best_line > 0 do return cur_path, best_line, true;
+
+    // 2. Otherwise jump to the first breakpoint in any other file
+    for &bp in g_dbg.breakpoints {
+        if !str.equal(bp.path, cur_path) {
+            return bp.path, bp.line, true;
+        }
+    }
+    return "", 0, false;
+}
+
+/// Starts a debug session on `run_cmd_or_entry` (a bare `.onyx` path OR a full `onyx run ...` command).
+dbg_start :: (run_cmd_or_entry: str, active_file: str, cursor_line: u32, buf_version: u32) -> i32 {
+    parsed_entry, parsed_args, is_explicit := dbg_parse_run_command(run_cmd_or_entry, context.temp_allocator);
+
+    eff_entry := parsed_entry if parsed_entry.count > 0 else active_file;
     if eff_entry.count == 0 do eff_entry = "src/main.onyx";
 
     if g_dbg.entry_path.count > 0 do str.free(g_dbg.entry_path);
-    g_dbg.entry_path = str.copy(eff_entry);
+    g_dbg.entry_path     = str.copy(eff_entry);
+    g_dbg.explicit_entry = is_explicit && parsed_entry.count > 0;
+
+    for a in g_dbg.extra_args do if a.count > 0 do str.free(a);
+    Array.clear(&g_dbg.extra_args);
+    for a in parsed_args do g_dbg.extra_args << str.copy(a);
+
     Array.clear(&g_dbg.call_stack);
     if g_dbg.last_error.count > 0 { str.free(g_dbg.last_error); g_dbg.last_error = ""; }
 
-    // Prefer pausing at the first breakpoint (in active file, or any file), else cursor/main
+    // Prefer pausing at the first breakpoint (in active file, or parsed entry, or any file), else cursor/main
     target_file := active_file if active_file.count > 0 else eff_entry;
     target_line: u32 = 0;
     for &bp in g_dbg.breakpoints {
@@ -439,11 +555,28 @@ dbg_start :: (entry_path: str, active_file: str, cursor_line: u32, buf_version: 
             if target_line == 0 || bp.line < target_line do target_line = bp.line;
         }
     }
+    if target_line == 0 && parsed_entry.count > 0 && !str.equal(parsed_entry, target_file) {
+        for &bp in g_dbg.breakpoints {
+            if str.equal(bp.path, parsed_entry) {
+                if target_line == 0 || bp.line < target_line {
+                    target_file = parsed_entry;
+                    target_line = bp.line;
+                }
+            }
+        }
+    }
     if target_line == 0 && g_dbg.breakpoints.count > 0 {
         target_file = g_dbg.breakpoints[0].path;
         target_line = g_dbg.breakpoints[0].line;
     }
-    if target_line == 0 do target_line = cursor_line;
+    if target_line == 0 {
+        if parsed_entry.count > 0 {
+            target_file = parsed_entry;
+            target_line = cursor_line if str.equal(parsed_entry, active_file) else 0;
+        } else {
+            target_line = cursor_line;
+        }
+    }
 
     if !load_function_into_debugger(target_file, "", target_line, buf_version) {
         return cast(i32) abi.AbiError.ProcessFailed;
@@ -485,13 +618,18 @@ dbg_command :: (cmd: abi.DebugCommand, buf_version: u32) -> i32 {
                 }
             }
             if !advanced {
-                // End of function: pop call stack if nested, else mark Exited
+                // End of function: pop call stack if nested, else jump to next breakpoint if any, else Exited
                 if g_dbg.call_stack.count > 0 {
                     return dbg_command(.StepOut, buf_version);
                 }
-                g_dbg.status           = .Exited;
-                g_dbg.current_line     = 0;
-                g_dbg.current_wat_line = -1;
+                bp_path, bp_line, has_next := find_next_breakpoint(g_dbg.source_path, g_dbg.current_line);
+                if has_next {
+                    load_function_into_debugger(bp_path, "", bp_line, buf_version);
+                } else {
+                    g_dbg.status           = .Exited;
+                    g_dbg.current_line     = 0;
+                    g_dbg.current_wat_line = -1;
+                }
             }
         }
 
@@ -503,9 +641,14 @@ dbg_command :: (cmd: abi.DebugCommand, buf_version: u32) -> i32 {
                 if g_dbg.call_stack.count > 0 {
                     return dbg_command(.StepOut, buf_version);
                 }
-                g_dbg.status           = .Exited;
-                g_dbg.current_line     = 0;
-                g_dbg.current_wat_line = -1;
+                bp_path, bp_line, has_next := find_next_breakpoint(g_dbg.source_path, g_dbg.current_line);
+                if has_next {
+                    load_function_into_debugger(bp_path, "", bp_line, buf_version);
+                } else {
+                    g_dbg.status           = .Exited;
+                    g_dbg.current_line     = 0;
+                    g_dbg.current_wat_line = -1;
+                }
             }
         }
 
@@ -556,15 +699,10 @@ dbg_command :: (cmd: abi.DebugCommand, buf_version: u32) -> i32 {
         }
 
         case .Continue {
-            // Jump to next breakpoint after current_line in same file, else finish
-            next_bp: u32 = 0;
-            for &bp in g_dbg.breakpoints {
-                if str.equal(bp.path, g_dbg.source_path) && bp.line > g_dbg.current_line {
-                    if next_bp == 0 || bp.line < next_bp do next_bp = bp.line;
-                }
-            }
-            if next_bp > 0 {
-                load_function_into_debugger(g_dbg.source_path, "", next_bp, buf_version);
+            // Jump to next breakpoint (same file after current_line, or any other file), else finish
+            bp_path, bp_line, has_next := find_next_breakpoint(g_dbg.source_path, g_dbg.current_line);
+            if has_next {
+                load_function_into_debugger(bp_path, "", bp_line, buf_version);
             } else {
                 g_dbg.status           = .Exited;
                 g_dbg.current_line     = 0;

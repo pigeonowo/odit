@@ -312,6 +312,22 @@ use odit.services
     t->expect_eq(cast(u32) services.g_dbg.status, cast(u32) abi.DebugStatus.Idle);
 }
 
+@test.tag.{"debugger"}
+@test.it.{"Debugger parses full onyx run commands with --param flags and entry file"}
+(t: &test.T) {
+    entry, args, explicit := services.dbg_parse_run_command(
+        "onyx run --param 'aoc.day=1' --param aoc.test=true src/day1.onyx",
+        context.temp_allocator
+    );
+    t->expect_eq(entry, "src/day1.onyx");
+    t->expect_true(explicit);
+    t->expect_eq(args.count, 4);
+    t->expect_eq(args[0], "--param");
+    t->expect_eq(args[1], "aoc.day=1");
+    t->expect_eq(args[2], "--param");
+    t->expect_eq(args[3], "aoc.test=true");
+}
+
 main :: () {
     test.run();
 }

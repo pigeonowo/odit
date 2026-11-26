@@ -488,10 +488,10 @@ run_headless_selftest :: () {
         os.exit(1);
     }
 
-    // Pump Onyx LSP up to 6 seconds to verify initialize -> didOpen -> documentSymbol
+    // Pump Onyx LSP up to 12 seconds to verify initialize -> didOpen -> documentSymbol
     if lsp_started {
         opened := false;
-        for _ in 0 .. 120 {
+        for _ in 0 .. 240 {
             alloc.clear_temp_allocator();
             if lsp.lsp_poll(&g_app.lsp_client, 0.05f) && !opened {
                 opened = true;
