@@ -226,12 +226,7 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
             scol := sdk.theme_color(.Success) if str.equal(r.source, "project") else (sdk.theme_color(.Warning) if str.equal(r.source, "dep") else sdk.theme_color(.TextDisabled));
             sdk.draw_text(pad + w - 42.0f, ry + 6.0f, stag, 10.0f, scol);
 
-            if hov && lclick {
-                g_selected = i;
-                if r.file.count > 0 && r.line > 0 {
-                    sdk.editor_open(r.file, cast(i32) r.line, 1);
-                }
-            }
+            if hov && lclick do g_selected = i;
             ry += row_h;
         }
     }
@@ -246,8 +241,8 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
         pw := sdk.pill(pad + 10.0f, dy + 8.0f, blbl, bcol, 0x11111BFF);
         sdk.draw_text(pad + 18.0f + pw, dy + 10.0f, sel.name, 13.5f, sdk.theme_color(.TextPrimary), .Bold);
 
-        // Open-in-editor button for project & dependency symbols
-        if sel.file.count > 0 && !str.equal(sel.source, "core") && sel.line > 0 {
+        // Open-in-editor button for any symbol with a backing file (project, deps, or core stdlib)
+        if sel.file.count > 0 && sel.line > 0 {
             if sdk.button(40, pad + w - 66.0f, dy + 6.0f, 56.0f, 22.0f, "Open", .Primary) & .Clicked {
                 sdk.editor_open(sel.file, cast(i32) sel.line, 1);
             }
