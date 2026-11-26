@@ -37,8 +37,8 @@ This document explains how **Onyx Editor (`odit`)** runs native Onyx + Raylib on
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │        Sandboxed WASM Plugins (`build/plugins/*.wasm`)                  │
-│   Compiled with `onyx build -r custom -DComponent_Build --wasm-mvp`     │
-│   Zero OS/WASI imports — only imports from module `"odit_host"`         │
+│          Compiled with `onyx build -r js --wasm-mvp`                    │
+│   Zero OS/WASI imports — communicates via `"odit_host"` ABI             │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -71,7 +71,7 @@ Onyx plugins compile with:
 ```bash
 onyx build -r js --wasm-mvp -o build/plugins/<name>.wasm plugins/<name>/main.onyx
 ```
-- `-r js --wasm-mvp` enables full Onyx runtime type info (`runtime.info.type_table` & `tagged_procedures`, powering `@sdk.Plugin`, `@sdk.PluginInit`, `@sdk.PluginEvent`, `@sdk.PluginRender` as well as `core.conv.format` / `core.encoding.json`) while keeping zero OS/filesystem/WASI imports.
+- `-r js --wasm-mvp` enables full Onyx runtime type info (`runtime.info.type_table` & `tagged_procedures`, powering `@sdk.Plugin`, `@sdk.PluginInit`, `@sdk.PluginEvent`, `@sdk.PluginRender` as well as `core.conv.format` / `core.encoding.json`) while keeping zero OS/filesystem/WASI imports. `build.nu` and `build.sh` automatically strip the unused `.wasm.js` glue file after each plugin compiles.
 - `sdk/plugin_sdk.onyx` automatically exports `odit_abi_version`, `odit_alloc`, `odit_free`, and (for decorator-based plugins) all 5 `odit_plugin_*` lifecycle exports.
 - `native/wasm_host.c` only permits `"odit_host"` imports (plus sandboxed `"host"` print/no-op stubs from `-r js`) and rejects any WASI or unknown external import.
 

@@ -6,13 +6,13 @@
 
 ## Highlights
 
-- **Sandboxed WASM Plugin Architecture:** Every panel (`File Explorer`, `Build & Run`, `WASM Inspector`, `Onyx Docs & Core`, and any custom plugin you drop in `plugins/`) compiles to standalone WebAssembly (`-r custom`) with zero OS/WASI imports and communicates exclusively through a versioned Host ABI ([`abi/abi.onyx`](abi/abi.onyx)).
+- **Sandboxed WASM Plugin Architecture:** Every panel (`File Explorer`, `Build & Run`, `WASM Inspector`, `Onyx Docs & Core`, and any custom plugin you drop in `plugins/`) compiles to standalone WebAssembly (`-r js --wasm-mvp`) with zero OS/WASI imports and communicates exclusively through a versioned Host ABI ([`abi/abi.onyx`](abi/abi.onyx)) and declarative `@sdk.Plugin` SDK ([`sdk/plugin_sdk.onyx`](sdk/plugin_sdk.onyx)).
 - **Draggable, Dockable & Floating Window Manager:** Drag any plugin title bar to **swap** panes, snap into **Left**, **Right**, or **Bottom** dock zones with live drop previews, or pop out into z-ordered, corner-resizable **floating windows**. Layout persists automatically in `odit-layout.json`.
 - **Core Onyx Code Editor:** Custom line buffer with multi-step undo, per-line Onyx syntax highlighting, modal Normal/Insert editing (toggleable), pixel-accurate cursor & click alignment, gutter markers, and horizontal scrolling (`Shift+Wheel` + auto-scroll).
 - **Onyx LSP Integration:** Non-blocking JSON-RPC client for `onyx lsp` powering live diagnostic underlines, inline error messages, gutter dots, hover tooltips (`K`), go-to-definition (`F12` / `gd`), autocomplete (`Ctrl+Space`), and symbol feeds to WASM plugins.
 - **Built-In Core Mini-Apps (`.wasm` Plugins):**
   - **File Explorer** — Full workspace directory tree with live filter, single-click folder expand/collapse, and instant file opening.
-  - **Build & Run** — Persistent per-project `odit-build.json`, OBV-inspired compiler flags drawer, 2-stage Build → Run pipeline (capable of building & running `odit` inside `odit`), clickable `file.onyx:line:col` error jumps, and **interactive `stdin`** with live unflushed prompt rendering.
+  - **Build & Run** — Persistent per-project `odit-build.json`, OBV-inspired compiler flags drawer, extra `compiler_args` (e.g. `-DComponent_Build`), 2-stage Build → Run pipeline (capable of building & running `odit` inside `odit`), clickable `file.onyx:line:col` error jumps, and **interactive `stdin`** with live unflushed prompt rendering.
   - **WASM Inspector (`.wat`)** — Lists functions from the active file via Onyx LSP and disassembles them to syntax-colored WebAssembly Text Format (`.wat`) with horizontal scrolling & pan controls.
   - **Onyx Docs & Core Browser** — Live searchable reference indexing `~/.onyx/core` packages/procs/types and built-in `#` compiler directives.
 - **Command-First & Configurable:** Fuzzy Command Palette (`Ctrl+P`), Fuzzy File Finder (`Ctrl+O`), live Settings panel (`Ctrl+,`) with 4 built-in themes (`mocha`, `tokyo_night`, `gruvbox`, `light`), font size & UI scaling, and global CLI install (`odit [dir_or_file]`).

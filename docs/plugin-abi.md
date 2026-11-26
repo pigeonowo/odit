@@ -1,6 +1,6 @@
 # Host-to-WASM Plugin ABI Reference (v1.0.0)
 
-The canonical ABI definition lives in [`abi/abi.onyx`](../abi/abi.onyx). Both the native host (`-r onyx`) and every WASM plugin (`-r custom`) `#load` this exact file.
+The canonical ABI definition lives in [`abi/abi.onyx`](../abi/abi.onyx). Both the native host (`-r onyx`) and every WASM plugin (`-r js --wasm-mvp` or `-r custom`) `#load` this exact file.
 
 ---
 
@@ -23,19 +23,31 @@ The canonical ABI definition lives in [`abi/abi.onyx`](../abi/abi.onyx). Both th
 
 ## Required Plugin Exports (Guest → Host)
 
-When using [`sdk/plugin_sdk.onyx`](../sdk/plugin_sdk.onyx), the first 4 exports are provided automatically. Each plugin only implements the 5 lifecycle hooks:
+When using the declarative decorators in [`sdk/plugin_sdk.onyx`](../sdk/plugin_sdk.onyx) (`@sdk.Plugin.{...}` + `@sdk.PluginInit`/`Shutdown`/`Event`/`Render`), **all 9 WASM exports are generated automatically** (legacy manual `#export "odit_plugin_*"` plugins are also supported automatically whenever `main.plugin_manifest` is defined):
 
 | Export | Provided By | Purpose |
 | :--- | :--- | :--- |
-| `_initialize()` | `sdk/plugin_sdk.onyx` | Initializes Onyx guest heap & runtime |
+| `_initialize()` | Onyx `-r js` / `sdk` | Initializes Onyx guest heap & runtime |
 | `odit_abi_version() -> u32` | `sdk/plugin_sdk.onyx` | Returns `0x00010000` (v1.0.0) |
 | `odit_alloc(size: u32) -> u32` | `sdk/plugin_sdk.onyx` | Allocates guest memory for host writes |
 | `odit_free(ptr: u32)` | `sdk/plugin_sdk.onyx` | Frees guest memory |
-| `odit_plugin_manifest(out_ptr, out_cap) -> i32` | Plugin | Writes JSON `PluginManifest` |
-| `odit_plugin_init(window_id) -> i32` | Plugin | Init state, register `Ctrl+P` commands |
-| `odit_plugin_shutdown(window_id)` | Plugin | Clean up state/textures/processes |
-| `odit_plugin_event(window_id, ev_type, ptr, len)` | Plugin | Handle subscribed `EventMask` events |
-| `odit_plugin_render(window_id, ctx_ptr)` | Plugin | Render immediate UI for this frame |
+| `odit_plugin_manifest(out_ptr, out_cap) -> i32` | Auto (`@sdk.Plugin`) or Manual | Writes JSON `PluginManifest` |
+| `odit_plugin_init(window_id) -> i32` | Auto (`@sdk.PluginInit`) or Manual | Init state, register `Ctrl+P` commands |
+| `odit_plugin_shutdown(window_id)` | Auto (`@sdk.PluginShutdown`) or Manual | Clean up state/textures/processes |
+| `odit_plugin_event(window_id, ev_type, ptr, len)` | Auto (`@sdk.PluginEvent`) or Manual | Handle subscribed `EventMask` events |
+| `odit_plugin_render(window_id, ctx_ptr)` | Auto (`@sdk.PluginRender`) or Manual | Render immediate UI for this frame |
+
+### Modern SDK Primitives (`odit.sdk`)
+
+- **Typed `sdk.Event` union:** `.ActiveFileChanged(str)`, `.BufferModified(BufferModifiedEvent)`, `.CursorMoved(abi.EditorCursor)`, `.DiagnosticsUpdated(str)`, `.SymbolsUpdated(str)`, `.Command(str)` (extracted command ID), `.WorkspaceChanged(str)`, `.KeyInput(abi.KeyEvent)`, `.Raw(RawEvent)`.
+- **Scoped Trailing `Code`-Block Macros:**
+  - `sdk.card(x, y, w, h, title) { ... }` — themed surface card with optional header
+  - `sdk.on_click(id, x, y, w, h, label, style) { ... }` — button + inline click block
+  - `sdk.scroll_area(id, x, y, w, h, content_h, &scroll_y) { ... }` — auto-matched scroll begin/end
+  - `sdk.clipped(x, y, w, h) { ... }` — auto-matched scissor clip push/pop
+  - `sdk.table(id, x, y, w, h, cols, headers, widths) { ... }` + `sdk.table_row(...)`
+  - `sdk.each_json_object(js, [obj] { ... })` — iterate `{...}` objects in host JSON responses
+- **Layout & Hit-Testing Helpers:** `sdk.vstack(x, y, w, gap)` (`VStack.next`, `spacer`, `text`, `button`, `divider`) and `sdk.row_hit(ctx, x, y, w, h, scroll_y)`.
 
 ---
 
