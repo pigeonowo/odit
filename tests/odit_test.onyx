@@ -20,6 +20,7 @@ package main
 #load "./../src/wm/layout.onyx"
 #load "./../src/editor/buffer.onyx"
 #load "./../src/editor/lexer.onyx"
+#load "./../src/editor/gif_cache.onyx"
 
 use core { os, alloc }
 use test
@@ -150,6 +151,21 @@ use odit.services
     t->expect_true(has_dir);
     t->expect_true(has_str);
     t->expect_true(has_cmt);
+}
+
+@test.tag.{"editor"}
+@test.it.{"Inline Tenor/GIF comment parser extracts valid URLs and ignores normal comments"}
+(t: &test.T) {
+    u1, ok1 := editor.parse_inline_gif_url("    // [TENOR](https://tenor.com/view/cat-vibing-gif-12345)");
+    t->expect_true(ok1);
+    t->expect_eq(u1, "https://tenor.com/view/cat-vibing-gif-12345");
+
+    u2, ok2 := editor.parse_inline_gif_url("// [gif](https://media.tenor.com/abc/test.gif)");
+    t->expect_true(ok2);
+    t->expect_eq(u2, "https://media.tenor.com/abc/test.gif");
+
+    _, ok3 := editor.parse_inline_gif_url("// normal comment without gif");
+    t->expect_false(ok3);
 }
 
 // -----------------------------------------------------------------------------

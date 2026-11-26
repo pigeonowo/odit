@@ -1,0 +1,254 @@
+package odit.editor
+
+// =============================================================================
+// Onyx Editor ("odit") — Inline Animated Tenor / GIF Cache for Code Comments
+// =============================================================================
+// Detects comments of the form:
+//     // [TENOR](https://tenor.com/view/...)
+//     // [GIF](https://media.tenor.com/.../foo.gif)
+// Downloads them asynchronously in the background via `curl` (never blocking
+// the 60 FPS UI thread), caches them in `/tmp/odit_gif_cache/`, and plays
+// animated GIF frames natively via Raylib (`LoadImageAnim` + `UpdateTexture`).
+
+use core { package, os, Array }
+use raylib
+use odit.theme
+
+#local
+#foreign "odit_wasm_host" {
+    native_proc_spawn :: (cmd_ptr: [&] u8, cmd_len: i32, args_ptr: [&] u8, args_len: i32, cwd_ptr: [&] u8, cwd_len: i32) -> u32 ---
+    native_proc_poll  :: (handle: u32, out_exit_code: &i32) -> u32 ---
+    native_proc_kill  :: (handle: u32) -> i32 ---
+}
+
+GifState :: enum {
+    Downloading;
+    Ready;
+    Failed;
+}
+
+GifEntry :: struct {
+    url:         str;
+    cache_path:  str;
+    state:       GifState;
+    proc_handle: u32;
+    img:         raylib.Image;
+    tex:         raylib.Texture2D;
+    has_img:     bool;
+    has_tex:     bool;
+    frame_count: i32;
+    cur_frame:   i32;
+    timer:       f32;
+    frame_buf:   [] u8;
+    width:       i32;
+    height:      i32;
+}
+
+#local g_gif_cache: [..] GifEntry;
+#local g_gif_inited: bool = false;
+
+#local
+ensure_gif_init :: () {
+    if !g_gif_inited {
+        g_gif_cache = make([..] GifEntry);
+        g_gif_inited = true;
+    }
+}
+
+#local
+starts_with_ci :: (s: str, prefix: str) -> bool {
+    if s.count < prefix.count do return false;
+    for i in 0 .. prefix.count {
+        a := s[i];
+        b := prefix[i];
+        if a >= 'A' && a <= 'Z' do a += 32;
+        if b >= 'A' && b <= 'Z' do b += 32;
+        if a != b do return false;
+    }
+    return true;
+}
+
+/// Extracts URL from `// [TENOR](https://...)` or `// [GIF](https://...)` comments.
+parse_inline_gif_url :: (line: str) -> (url: str, ok: bool) {
+    i := 0;
+    while i < line.count && (line[i] == ' ' || line[i] == '\t') do i += 1;
+    if i + 2 >= line.count || line[i] != '/' || line[i + 1] != '/' do return "", false;
+    i += 2;
+    while i < line.count && (line[i] == ' ' || line[i] == '\t') do i += 1;
+
+    rest := line[i .. line.count];
+    tag_len := 0;
+    if starts_with_ci(rest, "[tenor](")      do tag_len = 8;
+    elseif starts_with_ci(rest, "[gif](")    do tag_len = 6;
+    else do return "", false;
+
+    u_start := tag_len;
+    u_end := u_start;
+    while u_end < rest.count && rest[u_end] != ')' && rest[u_end] != ' ' && rest[u_end] != '\t' {
+        u_end += 1;
+    }
+    if u_end >= rest.count || rest[u_end] != ')' do return "", false;
+    url = rest[u_start .. u_end];
+    if !starts_with_ci(url, "http://") && !starts_with_ci(url, "https://") do return "", false;
+    return url, true;
+}
+
+#local
+hash_url_hex :: (url: str, allocator := context.temp_allocator) -> str {
+    h: u64 = 14695981039346656037;
+    for i in 0 .. url.count {
+        h ^= cast(u64) url[i];
+        h *= 1099511628211;
+    }
+    hex := "0123456789abcdef";
+    out := make([] u8, 16, allocator);
+    for k in 0 .. 16 {
+        shift := cast(u64) ((15 - k) * 4);
+        out[k] = hex[cast(i32) ((h >> shift) & 0xF)];
+    }
+    return out;
+}
+
+#local
+sanitize_shell_url :: (url: str, allocator := context.temp_allocator) -> str {
+    out := make([..] u8, url.count, allocator);
+    for i in 0 .. url.count {
+        c := url[i];
+        if c != '\'' && c != '"' && c != '`' && c != '$' && c != '\n' && c != '\r' {
+            out << c;
+        }
+    }
+    return str.{ out.data, out.count };
+}
+
+#local
+load_gif_from_disk :: (e: &GifEntry) -> bool {
+    if !os.file_exists(e.cache_path) do return false;
+    cpath := theme.to_temp_cstr(e.cache_path);
+    frames: i32 = 0;
+    img: raylib.Image;
+    raylib.LoadImageAnim(cpath, &frames, &img);
+    if img.width <= 0 || img.height <= 0 || img.data.data == 0 {
+        return false;
+    }
+
+    tex: raylib.Texture2D;
+    raylib.LoadTextureFromImage(img, &tex);
+    if tex.id == 0 {
+        raylib.UnloadImage(img);
+        return false;
+    }
+
+    e.img         = img;
+    e.tex         = tex;
+    e.has_img     = true;
+    e.has_tex     = true;
+    e.frame_count = frames if frames > 0 else 1;
+    e.cur_frame   = 0;
+    e.timer       = 0.0f;
+    e.width       = img.width;
+    e.height      = img.height;
+
+    if e.frame_count > 1 {
+        // RGBA8 = 4 bytes per pixel
+        fsize := img.width * img.height * 4;
+        if fsize > 0 && fsize <= 16 * 1024 * 1024 {
+            e.frame_buf = make([] u8, fsize);
+        }
+    }
+    e.state = .Ready;
+    return true;
+}
+
+gif_cache_request :: (url: str) -> &GifEntry {
+    ensure_gif_init();
+    for &e in g_gif_cache {
+        if str.equal(e.url, url) do return e;
+    }
+
+    os.Directory.create("/tmp/odit_gif_cache");
+    hhex := hash_url_hex(url, context.temp_allocator);
+    cpath := core.tprintf("/tmp/odit_gif_cache/{}.gif", hhex);
+
+    entry: GifEntry;
+    entry.url        = str.copy(url);
+    entry.cache_path = str.copy(cpath);
+    entry.state      = .Downloading;
+
+    // Fast path: already downloaded to disk cache
+    if os.file_exists(entry.cache_path) {
+        if load_gif_from_disk(&entry) {
+            g_gif_cache << entry;
+            return &g_gif_cache[g_gif_cache.count - 1];
+        }
+    }
+
+    // Spawn non-blocking background curl script (supports direct .gif AND tenor.com/view/... pages)
+    safe_url := sanitize_shell_url(url, context.temp_allocator);
+    script := core.tprintf(
+        "U='{}'; O='{}'; if echo \"$U\" | grep -qiE '\\.gif(\\?|$)'; then curl -sSL --max-time 12 \"$U\" -o \"$O\"; else G=$(curl -sSL --max-time 12 -A 'Mozilla/5.0' \"$U\" | grep -oE 'https://media[0-9]*\\.tenor\\.com/[^\" ]+\\.gif' | head -n 1); if [ -z \"$G\" ]; then G=$(curl -sSL --max-time 12 -A 'Mozilla/5.0' \"$U\" | grep -oE 'https://c\\.tenor\\.com/[^\" ]+\\.gif' | head -n 1); fi; if [ -n \"$G\" ]; then curl -sSL --max-time 12 \"$G\" -o \"$O\"; else exit 1; fi; fi",
+        safe_url, entry.cache_path
+    );
+    sh_cmd := "sh";
+    sh_args := core.tprintf("-c\n{}", script);
+    cwd := ".";
+    entry.proc_handle = native_proc_spawn(sh_cmd.data, sh_cmd.count, sh_args.data, sh_args.count, cwd.data, cwd.count);
+    if entry.proc_handle == 0 {
+        entry.state = .Failed;
+    }
+
+    g_gif_cache << entry;
+    return &g_gif_cache[g_gif_cache.count - 1];
+}
+
+gif_cache_update :: (dt: f32) {
+    if !g_gif_inited do return;
+
+    for &e in g_gif_cache {
+        if e.state == .Downloading && e.proc_handle != 0 {
+            code: i32 = 0;
+            st := native_proc_poll(e.proc_handle, &code);
+            if st != 1 { // Finished (Exited / Failed / Killed)
+                e.proc_handle = 0;
+                if code == 0 && load_gif_from_disk(e) {
+                    e.state = .Ready;
+                } else {
+                    e.state = .Failed;
+                }
+            }
+        } elseif e.state == .Ready && e.frame_count > 1 && e.has_img && e.has_tex && e.frame_buf.count > 0 {
+            e.timer += dt;
+            if e.timer >= 0.08f {
+                e.timer = 0.0f;
+                e.cur_frame = (e.cur_frame + 1) % e.frame_count;
+                offset := cast(u64) e.cur_frame * cast(u64) e.frame_buf.count;
+                fp := core.cptr(u8).{ data = e.img.data.data + offset };
+                fp->read(e.frame_buf);
+                raylib.UpdateTexture(e.tex, e.frame_buf.data);
+            }
+        }
+    }
+}
+
+gif_display_dims :: (e: &GifEntry, max_w: f32 = 280.0f, max_h: f32 = 150.0f) -> (w: f32, h: f32) {
+    if e == null || e.state != .Ready || e.width <= 0 || e.height <= 0 {
+        return 190.0f, 30.0f;
+    }
+    fw := cast(f32) e.width;
+    fh := cast(f32) e.height;
+    scale := 1.0f;
+    if fw > max_w do scale = max_w / fw;
+    if fh * scale > max_h do scale = max_h / fh;
+    return fw * scale, fh * scale;
+}
+
+gif_cache_shutdown :: () {
+    if !g_gif_inited do return;
+    for &e in g_gif_cache {
+        if e.proc_handle != 0 do native_proc_kill(e.proc_handle);
+        if e.has_tex do raylib.UnloadTexture(e.tex);
+        if e.has_img do raylib.UnloadImage(e.img);
+        if e.frame_buf.count > 0 do delete(&e.frame_buf);
+    }
+    Array.clear(&g_gif_cache);
+}

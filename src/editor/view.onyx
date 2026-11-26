@@ -78,8 +78,28 @@ editor_mode_label :: (ed: &EditorView) -> str {
     return "INSERT" if ed.mode == .Insert else "NORMAL";
 }
 
+editor_line_extra_h :: (ed: &EditorView, li: i32) -> f32 {
+    if li < 0 || li >= ed.buf.lines.count do return 0.0f;
+    ln := &ed.buf.lines[li];
+    ls := str.{ ln.data, ln.count };
+    url, ok := parse_inline_gif_url(ls);
+    if !ok do return 0.0f;
+    e := gif_cache_request(url);
+    _, gh := gif_display_dims(e);
+    return gh + 14.0f;
+}
+
+editor_line_top_y :: (ed: &EditorView, target_li: i32) -> f32 {
+    y: f32 = 0.0f;
+    lim := target_li if target_li <= ed.buf.lines.count else ed.buf.lines.count;
+    for i in 0 .. lim {
+        y += ed.line_height + editor_line_extra_h(ed, i);
+    }
+    return y;
+}
+
 editor_ensure_cursor_visible :: (ed: &EditorView, view_h: f32) {
-    cy := cast(f32) ed.buf.cursor_line * ed.line_height;
+    cy := editor_line_top_y(ed, ed.buf.cursor_line);
     margin := ed.line_height * 2.0;
     if cy < ed.scroll_y + margin {
         ed.scroll_y = cy - margin;
@@ -137,7 +157,19 @@ clipboard_set_str :: (txt: str) {
 #local
 mouse_pos_to_line_col :: (ed: &EditorView, rect: wm.PaneRect, mpos: raylib.Vector2) -> (line: i32, col: i32) {
     rel_y := (mpos.y - rect.y) + ed.scroll_y - 6.0f;
-    clicked_line := cast(i32) (rel_y / ed.line_height);
+    clicked_line: i32 = 0;
+    if rel_y > 0.0f {
+        acc_y: f32 = 0.0f;
+        clicked_line = ed.buf.lines.count - 1;
+        for li in 0 .. ed.buf.lines.count {
+            row_total := ed.line_height + editor_line_extra_h(ed, li);
+            if rel_y < acc_y + row_total {
+                clicked_line = li;
+                break;
+            }
+            acc_y += row_total;
+        }
+    }
     if clicked_line < 0 do clicked_line = 0;
     if clicked_line >= ed.buf.lines.count do clicked_line = ed.buf.lines.count - 1;
 
@@ -166,6 +198,7 @@ mouse_pos_to_line_col :: (ed: &EditorView, rect: wm.PaneRect, mpos: raylib.Vecto
 editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, block_input: bool, lsp_c: &lsp.LspClient = null) -> EditorUpdateEvents {
     ev: EditorUpdateEvents;
     ed.blink_timer += dt;
+    gif_cache_update(dt);
     editor_sync_settings(ed);
 
     if block_input do return ev;
@@ -183,7 +216,8 @@ editor_update :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, dt: f32, bl
                 if ed.scroll_x < 0.0f do ed.scroll_x = 0.0f;
             } else {
                 ed.scroll_y -= wheel * ed.line_height * 3.0;
-                max_s := cast(f32) ed.buf.lines.count * ed.line_height - rect.h * 0.5;
+                total_h := editor_line_top_y(ed, ed.buf.lines.count);
+                max_s := total_h - rect.h * 0.5;
                 if max_s < 0.0 do max_s = 0.0;
                 if ed.scroll_y < 0.0 do ed.scroll_y = 0.0;
                 if ed.scroll_y > max_s do ed.scroll_y = max_s;
@@ -632,8 +666,14 @@ editor_draw :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, lsp_c: &lsp.L
     max_vis_line_w: f32 = 0.0f;
 
     // Pass 1: Gutter markers & line numbers (never overwritten by horizontally scrolled code)
-    for li in first_vis .. last_vis {
-        ly := rect.y + 6.0f + cast(f32) li * ed.line_height - ed.scroll_y;
+    acc_y1: f32 = 0.0f;
+    for li in 0 .. ed.buf.lines.count {
+        extra_h := editor_line_extra_h(ed, li);
+        ly := rect.y + 6.0f + acc_y1 - ed.scroll_y;
+        acc_y1 += ed.line_height + extra_h;
+        if ly + ed.line_height + extra_h < rect.y do continue;
+        if ly > rect.y + rect.h do break;
+
         line_1 := cast(u32) (li + 1);
         for &m in ed.buf.gutter_markers {
             if m.line == line_1 && (m.path.count == 0 || str.equal(m.path, ed.buf.path)) {
@@ -654,8 +694,14 @@ editor_draw :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, lsp_c: &lsp.L
 
     sel_sl, sel_sc, sel_el, sel_ec, has_sel := buffer_get_selection_bounds(&ed.buf);
 
-    for li in first_vis .. last_vis {
-        ly := rect.y + 6.0f + cast(f32) li * ed.line_height - ed.scroll_y;
+    acc_y2: f32 = 0.0f;
+    for li in 0 .. ed.buf.lines.count {
+        extra_h := editor_line_extra_h(ed, li);
+        ly := rect.y + 6.0f + acc_y2 - ed.scroll_y;
+        acc_y2 += ed.line_height + extra_h;
+        if ly + ed.line_height + extra_h < rect.y do continue;
+        if ly > rect.y + rect.h do break;
+
         line_1 := cast(u32) (li + 1);
 
         // Highlight active line
@@ -714,6 +760,27 @@ editor_draw :: (ed: &EditorView, rect: wm.PaneRect, focused: bool, lsp_c: &lsp.L
                         theme.draw_text(msg_x, ly + (ed.line_height - msg_fs) * 0.5f, core.tprintf("<< {}", d.message), msg_fs, d_col);
                     }
                     break;
+                }
+            }
+        }
+
+        // Inline Tenor / GIF preview card right below `// [TENOR](https://...)` comments
+        if extra_h > 0.0f {
+            gif_url, ok_g := parse_inline_gif_url(line_str);
+            if ok_g {
+                ge := gif_cache_request(gif_url);
+                gw, gh := gif_display_dims(ge);
+                gx := code_x + 4.0f;
+                gy := ly + ed.line_height + 4.0f;
+                theme.draw_rect(gx - 3.0f, gy - 3.0f, gw + 6.0f, gh + 6.0f, theme.get_color(.BgSurface), 6.0f, theme.get_color(.Border), 1.0f);
+                if ge.state == .Ready && ge.has_tex {
+                    src_r := raylib.Rectangle.{ 0, 0, cast(f32) ge.tex.width, cast(f32) ge.tex.height };
+                    dst_r := raylib.Rectangle.{ gx, gy, gw, gh };
+                    raylib.DrawTexturePro(ge.tex, src_r, dst_r, .{ 0, 0 }, 0.0f, .{ 255, 255, 255, 255 });
+                } elseif ge.state == .Downloading {
+                    theme.draw_text(gx + 8.0f, gy + 7.0f, "Loading Tenor GIF...", 13.0f, theme.get_color(.Info));
+                } else {
+                    theme.draw_text(gx + 8.0f, gy + 7.0f, "Could not load GIF", 13.0f, theme.get_color(.Error));
                 }
             }
         }

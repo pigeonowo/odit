@@ -23,6 +23,7 @@
 #load "./ui/settings_view.onyx"
 #load "./editor/buffer.onyx"
 #load "./editor/lexer.onyx"
+#load "./editor/gif_cache.onyx"
 #load "./editor/view.onyx"
 #load "./plugin/loader.onyx"
 #load "./plugin/host_abi.onyx"
@@ -910,6 +911,7 @@ main :: (args: [] cstr) {
     theme.theme_init(settings.g_settings.theme, settings.g_settings.font_path);
     defer theme.theme_shutdown();
     defer ui.ui_audio_shutdown();
+    defer editor.gif_cache_shutdown();
 
     // Paint an immediate first frame & pump GLFW/OS events so the window manager
     // never marks the window "Not Responding" during plugin/LSP startup.
