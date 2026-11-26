@@ -230,6 +230,7 @@ wat_line_color :: (line: str) -> u32 {
     if str.starts_with(t, ";;")                                  do return sdk.theme_color(.TextDisabled);
     if str.starts_with(t, "(func") || str.starts_with(t, ")")    do return sdk.theme_color(.Accent);
     if str.starts_with(t, "(local") || str.starts_with(t, "local.") || str.starts_with(t, "(param") do return sdk.theme_color(.Info);
+    if str.starts_with(t, "call_indirect")                       do return sdk.theme_color(.Error);
     if str.starts_with(t, "call") || str.starts_with(t, "return") || str.starts_with(t, "br") || str.starts_with(t, "if") || str.starts_with(t, "loop") || str.starts_with(t, "block") || str.starts_with(t, "end") {
         return sdk.theme_color(.Success);
     }

@@ -328,6 +328,33 @@ use odit.services
     t->expect_eq(args[3], "aoc.test=true");
 }
 
+@test.tag.{"debugger"}
+@test.it.{"Debugger parses anonymous @aoc.part1/@aoc.part2 procs and generates unnamed WAT hints"}
+(t: &test.T) {
+    lines := str.[
+        "main :: () {",
+        "    aoc.run()",
+        "}",
+        "@aoc.part1",
+        "(input_path: str) -> i32 {",
+        "    return 1",
+        "}",
+        "@aoc.part2",
+        "(input_path: str) -> i32 {",
+        "    return 2",
+        "}",
+    ];
+    procs := services.parse_procs_in_source(lines, "src/day1.onyx", context.temp_allocator);
+    t->expect_eq(procs.count, 3);
+    t->expect_eq(procs[0].name, "main");
+    t->expect_eq(procs[1].name, "@aoc.part1");
+    t->expect_eq(procs[1].wat_hint, "src_day1_onyx_5");
+    t->expect_true(procs[1].is_tagged);
+    t->expect_eq(procs[2].name, "@aoc.part2");
+    t->expect_eq(procs[2].wat_hint, "src_day1_onyx_9");
+    t->expect_true(procs[2].is_tagged);
+}
+
 main :: () {
     test.run();
 }

@@ -159,7 +159,7 @@ name_matches_wat_header :: (header_line: str, func_name: str) -> i32 {
             if header_line[i + j] != func_name[j] { ok = false; break; }
         }
         if ok {
-            before_ok := i > 0 && (header_line[i - 1] == '$' || header_line[i - 1] == '.' || header_line[i - 1] == ':');
+            before_ok := i > 0 && (header_line[i - 1] == '$' || header_line[i - 1] == '.' || header_line[i - 1] == ':' || header_line[i - 1] == '_');
             after_pos := i + func_name.count;
             after_ok  := after_pos >= header_line.count || header_line[after_pos] == ' ' || header_line[after_pos] == '(' || header_line[after_pos] == ')';
             if before_ok && after_ok do return 3;

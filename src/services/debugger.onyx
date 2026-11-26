@@ -26,9 +26,11 @@ CallFrame :: struct {
 
 ParsedProc :: struct {
     name:       str;
-    start_line: u32; // 1-based
-    end_line:   u32; // 1-based inclusive
+    wat_hint:   str;  // Exact WAT symbol name or `unnamed_at` file+line suffix
+    start_line: u32;  // 1-based
+    end_line:   u32;  // 1-based inclusive
     sig_line:   str;
+    is_tagged:  bool; // True for `@tag` anonymous or tagged procedures (e.g. `@aoc.part1`)
 }
 
 DebuggerState :: struct {
@@ -44,11 +46,12 @@ DebuggerState :: struct {
     wat_line_count:   i32;
     last_error:       str;
 
-    breakpoints:      [..] Breakpoint;
-    line_map:         [..] abi.SourceWatMap;
-    locals:           [..] abi.DebugVariable;
-    exec_lines:       [..] u32;
-    call_stack:       [..] CallFrame;
+    breakpoints:        [..] Breakpoint;
+    line_map:           [..] abi.SourceWatMap;
+    locals:             [..] abi.DebugVariable;
+    exec_lines:         [..] u32;
+    call_stack:         [..] CallFrame;
+    visited_tagged_cnt: i32;
 
     dirty:            bool;
     markers_dirty:    bool;
@@ -150,12 +153,66 @@ split_lines :: (src: str, allocator := context.temp_allocator) -> [..] str {
 }
 
 #local
-parse_procs_in_source :: (lines: [] str, allocator := context.temp_allocator) -> [..] ParsedProc {
+make_unnamed_wat_hint :: (source_path: str, line_1: u32, allocator := context.temp_allocator) -> str {
+    // Onyx names anonymous procedures: `$unnamed_at_<sanitized_abs_path>_<1based_line>`
+    // Matching `<sanitized_rel_path>_<line_1>` uniquely matches the suffix!
+    out := make(dyn_str, source_path.count + 16, allocator);
+    for i in 0 .. source_path.count {
+        c := source_path[i];
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+            out << c;
+        } else {
+            out << '_';
+        }
+    }
+    Array.concat(&out, tprintf("_{}", line_1));
+    return out;
+}
+
+#local
+find_brace_block_end :: (lines: [] str, start_i: i32) -> (end_i: i32, found: bool) {
+    depth := 0;
+    found_brace := false;
+    res_end := start_i;
+    j := start_i;
+    while j < lines.count {
+        l := lines[j];
+        for k in 0 .. l.count {
+            if l[k] == '/' && k + 1 < l.count && l[k + 1] == '/' do break;
+            if l[k] == '{' { depth += 1; found_brace = true; }
+            elseif l[k] == '}' { depth -= 1; }
+        }
+        res_end = j;
+        if found_brace && depth <= 0 do break;
+        if !found_brace && j > start_i + 4 do break;
+        j += 1;
+    }
+    return res_end, found_brace;
+}
+
+parse_procs_in_source :: (lines: [] str, source_path: str = "", allocator := context.temp_allocator) -> [..] ParsedProc {
     procs := make([..] ParsedProc, 16, allocator);
+    pending_tag := "";
+    pending_tag_line: i32 = -10;
+
     i := 0;
     while i < lines.count {
         ln := trim_s(lines[i]);
-        // Match `<name> :: (` (top-level or indented proc)
+        if ln.count == 0 || str.starts_with(ln, "//") {
+            i += 1;
+            continue;
+        }
+        // Track `@tag` directives (e.g. `@aoc.part1`, `@test.it.{...}`) attached to the next proc
+        if ln[0] == '@' {
+            pending_tag = ln;
+            pending_tag_line = i;
+            i += 1;
+            continue;
+        }
+
+        has_tag := (i - pending_tag_line) <= 2 && pending_tag.count > 0;
+
+        // 1. Named procedure: `<name> :: (`
         col_pos := -1;
         for k in 0 .. (ln.count - 1) {
             if ln[k] == ':' && ln[k + 1] == ':' {
@@ -172,35 +229,44 @@ parse_procs_in_source :: (lines: [] str, allocator := context.temp_allocator) ->
                 if name[k] == '.' do short_name = name[(k + 1) .. name.count];
             }
             if short_name.count > 0 && rest.count > 0 && rest[0] == '(' {
-                // Find balanced `{ ... }` body end
-                depth := 0;
-                found_brace := false;
-                end_i := i;
-                j := i;
-                while j < lines.count {
-                    l := lines[j];
-                    for k in 0 .. l.count {
-                        if l[k] == '/' && k + 1 < l.count && l[k + 1] == '/' do break;
-                        if l[k] == '{' { depth += 1; found_brace = true; }
-                        elseif l[k] == '}' { depth -= 1; }
-                    }
-                    end_i = j;
-                    if found_brace && depth <= 0 do break;
-                    if !found_brace && j > i + 4 do break;
-                    j += 1;
-                }
+                end_i, found_brace := find_brace_block_end(lines, i);
                 if found_brace {
                     procs << .{
                         name       = short_name,
+                        wat_hint   = short_name,
                         start_line = cast(u32) (i + 1),
                         end_line   = cast(u32) (end_i + 1),
                         sig_line   = ln,
+                        is_tagged  = has_tag,
                     };
+                    pending_tag = "";
                     i = end_i + 1;
                     continue;
                 }
             }
         }
+
+        // 2. Anonymous / tagged procedure: `(...) [-> Ret] { ... }` (e.g. `@aoc.part1` followed by `(input: str) -> i32 {`)
+        if ln[0] == '(' && str.contains(ln, ")") && (str.contains(ln, "{") || str.contains(ln, "->")) {
+            end_i, found_brace := find_brace_block_end(lines, i);
+            if found_brace {
+                line_1 := cast(u32) (i + 1);
+                disp_name := pending_tag if has_tag else tprintf("anon@L{}", line_1);
+                hint := make_unnamed_wat_hint(source_path, line_1, allocator);
+                procs << .{
+                    name       = disp_name,
+                    wat_hint   = hint,
+                    start_line = line_1,
+                    end_line   = cast(u32) (end_i + 1),
+                    sig_line   = ln,
+                    is_tagged  = true,
+                };
+                pending_tag = "";
+                i = end_i + 1;
+                continue;
+            }
+        }
+
         i += 1;
     }
     return procs;
@@ -291,12 +357,12 @@ load_function_into_debugger :: (source_path: str, func_name: str, target_line: u
     src := os.get_contents(source_path);
     defer if src.count > 0 do delete(&src);
     lines := split_lines(src, context.temp_allocator);
-    procs := parse_procs_in_source(lines, context.temp_allocator);
+    procs := parse_procs_in_source(lines, source_path, context.temp_allocator);
 
-    chosen: ParsedProc = .{ name = func_name, start_line = 1, end_line = cast(u32) lines.count, sig_line = "" };
+    chosen: ParsedProc = .{ name = func_name, wat_hint = func_name, start_line = 1, end_line = cast(u32) lines.count, sig_line = "" };
     found_proc := false;
     for &p in procs {
-        if func_name.count > 0 && str.equal(p.name, func_name) {
+        if func_name.count > 0 && (str.equal(p.name, func_name) || str.equal(p.wat_hint, func_name)) {
             chosen = *p;
             found_proc = true;
             break;
@@ -320,7 +386,8 @@ load_function_into_debugger :: (source_path: str, func_name: str, target_line: u
         found_proc = true;
     }
 
-    wat_raw, _, ok, err := wat_get_function_raw(g_dbg.entry_path, chosen.name, buf_version, g_dbg.extra_args, g_dbg.explicit_entry);
+    wat_lookup := chosen.wat_hint if chosen.wat_hint.count > 0 else chosen.name;
+    wat_raw, _, ok, err := wat_get_function_raw(g_dbg.entry_path, wat_lookup, buf_version, g_dbg.extra_args, g_dbg.explicit_entry);
     if !ok {
         g_dbg.status = .Error;
         if g_dbg.last_error.count > 0 do str.free(g_dbg.last_error);
@@ -545,6 +612,7 @@ dbg_start :: (run_cmd_or_entry: str, active_file: str, cursor_line: u32, buf_ver
     for a in parsed_args do g_dbg.extra_args << str.copy(a);
 
     Array.clear(&g_dbg.call_stack);
+    g_dbg.visited_tagged_cnt = 0;
     if g_dbg.last_error.count > 0 { str.free(g_dbg.last_error); g_dbg.last_error = ""; }
 
     // Prefer pausing at the first breakpoint (in active file, or parsed entry, or any file), else cursor/main
@@ -653,18 +721,21 @@ dbg_command :: (cmd: abi.DebugCommand, buf_version: u32) -> i32 {
         }
 
         case .StepInto {
-            // Check if current Onyx line calls another local procedure defined in the same file
+            // Check if current Onyx line calls a local procedure, passes a callback, or performs an indirect/tagged dispatch (e.g. `aoc.run()` or `call_indirect`)
             src := os.get_contents(g_dbg.source_path);
             defer if src.count > 0 do delete(&src);
             lines := split_lines(src, context.temp_allocator);
-            procs := parse_procs_in_source(lines, context.temp_allocator);
+            procs := parse_procs_in_source(lines, g_dbg.source_path, context.temp_allocator);
 
             entered := false;
             li := cast(i32) g_dbg.current_line - 1;
             if li >= 0 && li < lines.count {
                 cur_txt := lines[li];
+
+                // 1. Direct call to another local procedure in the same file: `foo(`
                 for &p in procs {
                     if str.equal(p.name, g_dbg.current_func) do continue;
+                    if str.starts_with(p.name, "@") do continue;
                     call_pat := tprintf("{}(", p.name);
                     if str.contains(cur_txt, call_pat) {
                         g_dbg.call_stack << .{
@@ -676,6 +747,46 @@ dbg_command :: (cmd: abi.DebugCommand, buf_version: u32) -> i32 {
                         load_function_into_debugger(g_dbg.source_path, p.name, 0, buf_version);
                         entered = true;
                         break;
+                    }
+                }
+
+                // 2. Callback / function pointer argument referencing a local procedure: `dispatch(my_fn)`
+                if !entered && str.contains(cur_txt, "(") {
+                    for &p in procs {
+                        if str.equal(p.name, g_dbg.current_func) || str.starts_with(p.name, "@") do continue;
+                        if str.contains(cur_txt, p.name) {
+                            g_dbg.call_stack << .{
+                                source_path = str.copy(g_dbg.source_path),
+                                func_name   = str.copy(g_dbg.current_func),
+                                line        = g_dbg.current_line,
+                                wat_line    = g_dbg.current_wat_line,
+                            };
+                            load_function_into_debugger(g_dbg.source_path, p.name, 0, buf_version);
+                            entered = true;
+                            break;
+                        }
+                    }
+                }
+
+                // 3. Indirect / tagged runtime dispatch (e.g. `aoc.run()`, `test.run()`, or WAT `call_indirect`):
+                //    step into the next tagged/anonymous procedure in the file (e.g. `@aoc.part1` -> `@aoc.part2`)!
+                if !entered && (str.contains(cur_txt, "(") || str.contains(g_dbg.wat_text, "call_indirect")) {
+                    tagged_seen := 0;
+                    for &p in procs {
+                        if !p.is_tagged || str.equal(p.name, g_dbg.current_func) do continue;
+                        if tagged_seen == g_dbg.visited_tagged_cnt {
+                            g_dbg.visited_tagged_cnt += 1;
+                            g_dbg.call_stack << .{
+                                source_path = str.copy(g_dbg.source_path),
+                                func_name   = str.copy(g_dbg.current_func),
+                                line        = g_dbg.current_line,
+                                wat_line    = g_dbg.current_wat_line,
+                            };
+                            load_function_into_debugger(g_dbg.source_path, p.name, 0, buf_version);
+                            entered = true;
+                            break;
+                        }
+                        tagged_seen += 1;
                     }
                 }
             }
