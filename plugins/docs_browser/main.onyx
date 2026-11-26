@@ -16,19 +16,23 @@ DocRow :: struct {
     name:      str;
     pkg:       str;
     kind:      str;
+    source:    str; // "project", "dep", "core"
     signature: str;
     summary:   str;
+    file:      str;
+    line:      u32;
 }
 
 g_query_buf:    [96] u8;
 g_query_len:    u32 = 0;
 g_cat_filter:   i32 = 0; // 0=All, 1=Directives, 2=Packages, 3=Procs, 4=Types
+g_src_filter:   i32 = 0; // 0=All, 1=Project, 2=Deps, 3=Core
 g_rows:         [..] DocRow;
 g_selected:     i32 = 0;
 g_scroll_y:     f32 = 0.0f;
 g_needs_query:  bool = true;
 
-MANIFEST_JSON :: """{"id":"odit.docs_browser","title":"Onyx Docs & Core","version":"0.1.0","default_slot":0,"default_width":420,"default_height":400,"event_mask":64,"allow_multiple":false}"""
+MANIFEST_JSON :: """{"id":"odit.docs_browser","title":"Onyx Docs & Symbols","version":"0.2.0","default_slot":0,"default_width":440,"default_height":420,"event_mask":64,"allow_multiple":false}"""
 
 #export "odit_plugin_manifest" plugin_manifest
 plugin_manifest :: (out_ptr: u32, out_cap: u32) -> i32 {
@@ -76,8 +80,10 @@ run_search :: () {
         sdk.free_str(r.name);
         sdk.free_str(r.pkg);
         sdk.free_str(r.kind);
+        sdk.free_str(r.source);
         sdk.free_str(r.signature);
         sdk.free_str(r.summary);
+        sdk.free_str(r.file);
     }
     Array.clear(&g_rows);
     g_selected = 0;
@@ -91,17 +97,32 @@ run_search :: () {
     obj: str;
     while sdk.json_next_object(js, &pos, &obj) {
         kind := sdk.json_get_str(obj, "kind", context.temp_allocator);
+        src  := sdk.json_get_str(obj, "source", context.temp_allocator);
         if !matches_category(kind) do continue;
+        if !matches_source(src)    do continue;
 
         g_rows << .{
             name      = sdk.copy_str(sdk.json_get_str(obj, "name",      context.temp_allocator)),
             pkg       = sdk.copy_str(sdk.json_get_str(obj, "pkg",       context.temp_allocator)),
             kind      = sdk.copy_str(kind),
+            source    = sdk.copy_str(src),
             signature = sdk.copy_str(sdk.json_get_str(obj, "signature", context.temp_allocator)),
             summary   = sdk.copy_str(sdk.json_get_str(obj, "summary",   context.temp_allocator)),
+            file      = sdk.copy_str(sdk.json_get_str(obj, "file",      context.temp_allocator)),
+            line      = cast(u32) sdk.json_get_i32(obj, "line"),
         };
     }
     g_needs_query = false;
+}
+
+#local
+matches_source :: (src: str) -> bool {
+    return switch g_src_filter {
+        case 1 => str.equal(src, "project");
+        case 2 => str.equal(src, "dep");
+        case 3 => str.equal(src, "core") || src.count == 0;
+        case _ => true;
+    };
 }
 
 #local
@@ -110,7 +131,7 @@ matches_category :: (kind: str) -> bool {
         case 1 => str.equal(kind, "directive");
         case 2 => str.equal(kind, "package");
         case 3 => str.equal(kind, "proc") || str.equal(kind, "macro");
-        case 4 => str.equal(kind, "struct") || str.equal(kind, "enum") || str.equal(kind, "interface");
+        case 4 => str.equal(kind, "struct") || str.equal(kind, "enum") || str.equal(kind, "union") || str.equal(kind, "interface");
         case _ => true;
     };
 }
@@ -136,22 +157,34 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
     y := pad;
 
     // Row 1: Search input
-    if sdk.input_text(1, pad, y, w, 28.0f, g_query_buf, &g_query_len, "Search Onyx core or #directives (e.g. format, #load, Array)...") & .Changed {
+    if sdk.input_text(1, pad, y, w, 28.0f, g_query_buf, &g_query_len, "Search project, deps, core, or #directives...") & .Changed {
         g_needs_query = true;
     }
     y += 34.0f;
 
-    // Row 2: Category filter buttons
+    // Row 2: Scope filter buttons (All / Project / Deps / Core)
+    sw := (w - 12.0f) / 4.0f;
+    srcs := str.[ "All", "Project", "Deps", "Core" ];
+    for si in 0 .. 4 {
+        if sdk.button(cast(u32) (30 + si), pad + cast(f32) si * (sw + 4.0f), y, sw, 22.0f, srcs[si],
+                      .Primary if g_src_filter == si else .Ghost) & .Clicked {
+            g_src_filter = si;
+            g_needs_query = true;
+        }
+    }
+    y += 26.0f;
+
+    // Row 3: Category filter buttons
     cw := (w - 16.0f) / 5.0f;
     cats := str.[ "All", "#Dir", "Pkg", "Procs", "Types" ];
     for ci in 0 .. 5 {
-        if sdk.button(cast(u32) (10 + ci), pad + cast(f32) ci * (cw + 4.0f), y, cw, 24.0f, cats[ci],
+        if sdk.button(cast(u32) (10 + ci), pad + cast(f32) ci * (cw + 4.0f), y, cw, 22.0f, cats[ci],
                       .Active if g_cat_filter == ci else .Ghost) & .Clicked {
             g_cat_filter = ci;
             g_needs_query = true;
         }
     }
-    y += 30.0f;
+    y += 28.0f;
 
     // Detail card height reserved at bottom
     detail_h: f32 = 104.0f;
@@ -188,6 +221,11 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
             sdk.draw_text(pad + 12.0f, ry + 6.0f, blbl, 10.5f, 0x11111BFF, .Bold);
             sdk.draw_text(pad + 52.0f, ry + 5.0f, r.name, 13.0f, sdk.theme_color(.TextPrimary), .Mono);
 
+            // Subtle source tag on right (`PRJ` / `DEP` / `CORE`)
+            stag := "PRJ" if str.equal(r.source, "project") else ("DEP" if str.equal(r.source, "dep") else "CORE");
+            scol := sdk.theme_color(.Success) if str.equal(r.source, "project") else (sdk.theme_color(.Warning) if str.equal(r.source, "dep") else sdk.theme_color(.TextDisabled));
+            sdk.draw_text(pad + w - 42.0f, ry + 6.0f, stag, 10.0f, scol);
+
             if hov && lclick do g_selected = i;
             ry += row_h;
         }
@@ -202,8 +240,16 @@ plugin_render :: (window_id: u32, ctx_ptr: u32) -> void {
         blbl, bcol := kind_badge(sel.kind);
         pw := sdk.pill(pad + 10.0f, dy + 8.0f, blbl, bcol, 0x11111BFF);
         sdk.draw_text(pad + 18.0f + pw, dy + 10.0f, sel.name, 13.5f, sdk.theme_color(.TextPrimary), .Bold);
+
+        // Open-in-editor button for project & dependency symbols
+        if sel.file.count > 0 && !str.equal(sel.source, "core") && sel.line > 0 {
+            if sdk.button(40, pad + w - 66.0f, dy + 6.0f, 56.0f, 22.0f, "Open", .Primary) & .Clicked {
+                sdk.editor_open(sel.file, cast(i32) sel.line, 1);
+            }
+        }
+
         sdk.draw_text(pad + 10.0f, dy + 36.0f, sel.signature, 12.0f, sdk.theme_color(.Info), .Mono);
-        sum := sel.summary if sel.summary.count > 0 else "Core standard library symbol.";
+        sum := sel.summary if sel.summary.count > 0 else (sel.file if sel.file.count > 0 else "Onyx symbol.");
         sdk.draw_text(pad + 10.0f, dy + 60.0f, sum, 12.0f, sdk.theme_color(.TextSecondary));
     } else {
         sdk.draw_text(pad + 10.0f, dy + 12.0f, "Select an item above to inspect its signature and docs.", 12.5f, sdk.theme_color(.TextDisabled));

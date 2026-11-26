@@ -12,7 +12,8 @@ use core { package, os, Array }
 DocItem :: struct {
     name:      str;
     pkg:       str;
-    kind:      str; // "directive", "package", "proc", "struct", "enum", "macro"
+    kind:      str; // "directive", "package", "proc", "struct", "enum", "union", "macro"
+    source:    str; // "core", "project", "dep"
     signature: str;
     summary:   str;
     file:      str;
@@ -28,6 +29,7 @@ add_directive :: (name, sig, summary: str) {
         name      = name,
         pkg       = "directive",
         kind      = "directive",
+        source    = "core",
         signature = sig,
         summary   = summary,
         file      = "",
@@ -80,17 +82,17 @@ trim_right :: (s: str) -> str {
 }
 
 #local
-index_onyx_file :: (full_path: str, rel_label: str) {
+index_onyx_file :: (full_path: str, rel_label: str, source_tag: str) {
     src := os.get_contents(full_path);
     if src.count == 0 do return;
     defer delete(&src);
 
-    pkg := "core";
+    pkg := "main" if !str.equal(source_tag, "core") else "core";
     doc_buf := make(dyn_str, 128, context.temp_allocator);
     line_num: u32 = 0;
 
     pos := 0;
-    while pos < src.count && g_docs_items.count < 2500 {
+    while pos < src.count && g_docs_items.count < 6000 {
         ls := pos;
         while pos < src.count && src[pos] != '\n' do pos += 1;
         raw_line := src[ls .. pos];
@@ -102,13 +104,15 @@ index_onyx_file :: (full_path: str, rel_label: str) {
 
         if str.starts_with(trimmed, "package ") {
             pkg = str.copy(trim_left(trimmed[8 .. trimmed.count]));
+            src_lbl := "Project module" if str.equal(source_tag, "project") else ("Dependency module" if str.equal(source_tag, "dep") else "Onyx core module");
             g_docs_items << .{
                 name      = pkg,
                 pkg       = pkg,
                 kind      = "package",
+                source    = source_tag,
                 signature = str.copy(trimmed),
-                summary   = str.copy(core.tprintf("Onyx core module ({})", rel_label)),
-                file      = str.copy(full_path),
+                summary   = str.copy(core.tprintf("{} ({})", src_lbl, rel_label)),
+                file      = str.copy(rel_label if !str.equal(source_tag, "core") else full_path),
                 line      = line_num,
             };
             Array.clear(&doc_buf);
@@ -147,6 +151,8 @@ index_onyx_file :: (full_path: str, rel_label: str) {
                         kind = "struct";
                     } elseif str.starts_with(rhs, "enum") {
                         kind = "enum";
+                    } elseif str.starts_with(rhs, "union") {
+                        kind = "union";
                     } elseif str.starts_with(rhs, "interface") {
                         kind = "interface";
                     } elseif str.starts_with(rhs, "macro") {
@@ -165,9 +171,10 @@ index_onyx_file :: (full_path: str, rel_label: str) {
                             name      = str.copy(full_name),
                             pkg       = pkg,
                             kind      = kind,
+                            source    = source_tag,
                             signature = str.copy(sig),
                             summary   = str.copy(summary),
-                            file      = str.copy(full_path),
+                            file      = str.copy(rel_label if !str.equal(source_tag, "core") else full_path),
                             line      = line_num,
                         };
                     }
@@ -179,18 +186,23 @@ index_onyx_file :: (full_path: str, rel_label: str) {
 }
 
 #local
-scan_core_dir :: (base_dir: str, rel: str, depth: i32) {
-    if depth > 4 || g_docs_items.count >= 2500 do return;
+scan_onyx_dir :: (base_dir: str, rel: str, source_tag: str, depth: i32, max_depth: i32) {
+    if depth > max_depth || g_docs_items.count >= 6000 do return;
     full := base_dir if rel.count == 0 else core.tprintf("{}/{}", base_dir, rel);
     for entry in os.Directory.list(full) {
         name := entry->name();
-        if str.equal(name, ".") || str.equal(name, "..") do continue;
+        if name.count == 0 || name[0] == '.' do continue;
+        if str.equal(source_tag, "project") {
+            if str.equal(name, "build") || str.equal(name, "bin") || str.equal(name, "lib") ||
+               str.equal(name, "target") || str.equal(name, "node_modules") do continue;
+        }
         child_rel := str.copy(name, context.temp_allocator) if rel.count == 0 else core.tprintf("{}/{}", rel, name);
         child_full := core.tprintf("{}/{}", full, name);
         if entry.type == .Directory {
-            scan_core_dir(base_dir, child_rel, depth + 1);
+            scan_onyx_dir(base_dir, child_rel, source_tag, depth + 1, max_depth);
         } elseif str.ends_with(name, ".onyx") {
-            index_onyx_file(child_full, child_rel);
+            rel_out := child_rel if str.equal(source_tag, "project") else (core.tprintf("lib/{}", child_rel) if str.equal(source_tag, "dep") else child_rel);
+            index_onyx_file(child_full, rel_out, source_tag);
         }
     }
 }
@@ -198,9 +210,18 @@ scan_core_dir :: (base_dir: str, rel: str, depth: i32) {
 docs_ensure_indexed :: () {
     if g_docs_indexed do return;
     g_docs_indexed = true;
-    g_docs_items = make([..] DocItem, 512);
+    g_docs_items = make([..] DocItem, 1024);
     seed_builtin_directives();
 
+    // 1. Current project `.onyx` source files
+    scan_onyx_dir(".", "", "project", 0, 5);
+
+    // 2. Project dependencies (`./lib/**/*.onyx`)
+    if os.Directory.exists("lib") {
+        scan_onyx_dir("lib", "", "dep", 0, 6);
+    }
+
+    // 3. Onyx Core Standard Library (`$ONYX_PATH/core/**/*.onyx`)
     core_dir := "";
     if op := os.env("ONYX_PATH"); op {
         core_dir = core.tprintf("{}/core", op->unwrap());
@@ -211,7 +232,7 @@ docs_ensure_indexed :: () {
     }
 
     if core_dir.count > 0 && os.Directory.exists(core_dir) {
-        scan_core_dir(core_dir, "", 0);
+        scan_onyx_dir(core_dir, "", "core", 0, 4);
     }
 }
 
@@ -246,6 +267,10 @@ score_doc :: (item: &DocItem, q: str) -> i32 {
     if contains_ci(item.pkg, q)       do sc += 15;
     if contains_ci(item.signature, q) do sc += 10;
     if contains_ci(item.summary, q)   do sc += 5;
+    if sc > 0 {
+        if str.equal(item.source, "project") do sc += 8;
+        elseif str.equal(item.source, "dep") do sc += 4;
+    }
     return sc;
 }
 
@@ -262,8 +287,8 @@ docs_search_as_json :: (query: str, allocator := context.temp_allocator) -> str 
         }
     }
 
-    // Sort top 40 hits descending
-    limit := 40 if hits.count > 40 else hits.count;
+    // Sort top 60 hits descending
+    limit := 60 if hits.count > 60 else hits.count;
     for i in 0 .. limit {
         best := i;
         for j in (i + 1) .. hits.count {
@@ -284,6 +309,7 @@ docs_search_as_json :: (query: str, allocator := context.temp_allocator) -> str 
         Array.concat(&out, "{\"name\":\"");      Array.concat(&out, json_esc_wat(it.name));
         Array.concat(&out, "\",\"pkg\":\"");     Array.concat(&out, json_esc_wat(it.pkg));
         Array.concat(&out, "\",\"kind\":\"");    Array.concat(&out, json_esc_wat(it.kind));
+        Array.concat(&out, "\",\"source\":\"");  Array.concat(&out, json_esc_wat(it.source));
         Array.concat(&out, "\",\"signature\":\""); Array.concat(&out, json_esc_wat(it.signature));
         Array.concat(&out, "\",\"summary\":\""); Array.concat(&out, json_esc_wat(it.summary));
         Array.concat(&out, "\",\"file\":\"");    Array.concat(&out, json_esc_wat(it.file));
