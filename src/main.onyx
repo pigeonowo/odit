@@ -907,6 +907,7 @@ main :: (args: [] cstr) {
 
     theme.theme_init(settings.g_settings.theme, settings.g_settings.font_path);
     defer theme.theme_shutdown();
+    defer ui.ui_audio_shutdown();
 
     ui.palette_init(&g_app.palette);
     ui.finder_init(&g_app.file_finder);

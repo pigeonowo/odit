@@ -187,6 +187,15 @@ use odit.services
     t->expect_true(settings.settings_load(tmp_path));
     t->expect_eq(settings.g_settings.editor_font_size, 22.0f);
     t->expect_eq(settings.g_settings.theme, "gruvbox");
+
+    // Plugin settings registration & persistence round-trip
+    settings.settings_set_path(tmp_path);
+    id := settings.settings_register_plugin("boom.volume", "Boom: Volume", cast(u32) abi.SettingKind.Float, "0.8");
+    t->expect_true(id > 0);
+    t->expect_eq(settings.settings_get_plugin("boom.volume"), "0.8");
+    t->expect_true(settings.settings_set_plugin("boom.volume", "0.5"));
+    t->expect_true(settings.settings_load(tmp_path));
+    t->expect_eq(settings.settings_get_plugin("boom.volume"), "0.5");
 }
 
 // -----------------------------------------------------------------------------

@@ -517,6 +517,95 @@ set_clipboard :: (text: str) {
     abi.host_set_clipboard(cast(u32) text.data, cast(u32) text.count);
 }
 
+// ---- Plugin Settings Registration (shown in `Ctrl+,` Settings & saved in `odit.json`) ----
+
+register_setting :: (key: str, label: str, kind: abi.SettingKind = .String, default_val: str = "") -> u32 {
+    return abi.host_register_setting(
+        cast(u32) key.data, cast(u32) key.count,
+        cast(u32) label.data, cast(u32) label.count,
+        cast(u32) kind,
+        cast(u32) default_val.data, cast(u32) default_val.count
+    );
+}
+
+get_setting :: (key: str, allocator := context.temp_allocator) -> str {
+    needed := abi.host_get_setting(cast(u32) key.data, cast(u32) key.count, 0, 0);
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.host_get_setting(cast(u32) key.data, cast(u32) key.count, cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
+    return buf[0 .. got];
+}
+
+get_setting_bool :: (key: str, fallback: bool = false) -> bool {
+    v := get_setting(key, context.temp_allocator);
+    if v.count == 0 do return fallback;
+    return v[0] == 't' || v[0] == 'T' || v[0] == '1';
+}
+
+get_setting_i32 :: (key: str, fallback: i32 = 0) -> i32 {
+    v := get_setting(key, context.temp_allocator);
+    if v.count == 0 do return fallback;
+    neg := false;
+    i := 0;
+    if v[0] == '-' { neg = true; i = 1; }
+    if i >= v.count || v[i] < '0' || v[i] > '9' do return fallback;
+    n: i32 = 0;
+    while i < v.count && v[i] >= '0' && v[i] <= '9' {
+        n = n * 10 + cast(i32)(v[i] - '0');
+        i += 1;
+    }
+    return -n if neg else n;
+}
+
+get_setting_f32 :: (key: str, fallback: f32 = 0.0f) -> f32 {
+    v := get_setting(key, context.temp_allocator);
+    if v.count == 0 do return fallback;
+    neg := false;
+    i := 0;
+    if v[0] == '-' { neg = true; i = 1; }
+    if i >= v.count || ((v[i] < '0' || v[i] > '9') && v[i] != '.') do return fallback;
+    res: f32 = 0.0f;
+    while i < v.count && v[i] >= '0' && v[i] <= '9' {
+        res = res * 10.0f + cast(f32) cast(i32) (v[i] - '0');
+        i += 1;
+    }
+    if i < v.count && v[i] == '.' {
+        i += 1;
+        div: f32 = 10.0f;
+        while i < v.count && v[i] >= '0' && v[i] <= '9' {
+            res += cast(f32) cast(i32) (v[i] - '0') / div;
+            div *= 10.0f;
+            i += 1;
+        }
+    }
+    return -res if neg else res;
+}
+
+set_setting :: (key: str, val: str) -> bool {
+    return abi.host_set_setting(
+        cast(u32) key.data, cast(u32) key.count,
+        cast(u32) val.data, cast(u32) val.count
+    ) >= 0;
+}
+
+// ---- Audio Playback (`.wav`, `.mp3`, `.ogg`, `.flac`) ----
+
+audio_load :: (rel_path: str) -> u32 {
+    return abi.audio_load(cast(u32) rel_path.data, cast(u32) rel_path.count);
+}
+
+audio_play :: (handle: u32, volume: f32 = 1.0f) {
+    abi.audio_play(handle, volume);
+}
+
+audio_unload :: (handle: u32) {
+    abi.audio_unload(handle);
+}
+
 // -----------------------------------------------------------------------------
 // B. UI Primitives & Immediate Widget Wrappers
 // -----------------------------------------------------------------------------

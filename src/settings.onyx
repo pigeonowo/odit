@@ -4,8 +4,17 @@ package odit.settings
 // Onyx Editor ("odit") — Persistent User Settings (`odit.json`)
 // =============================================================================
 
-use core { package, os, printf }
+use core { package, os, printf, Array }
 use core.encoding.json
+
+PluginSetting :: struct {
+    key:         str;
+    label:       str;
+    kind:        u32; // abi.SettingKind: 0=String, 1=Bool, 2=Int, 3=Float
+    default_val: str;
+    value:       str;
+    registered:  bool; // true once a plugin has registered label/kind
+}
 
 Settings :: struct {
     // Typography & Scaling
@@ -31,8 +40,168 @@ Settings :: struct {
 
 SETTINGS_FILE :: "odit.json"
 
-g_settings:      Settings;
-g_settings_path: str = SETTINGS_FILE;
+g_settings:        Settings;
+g_settings_path:   str = SETTINGS_FILE;
+g_plugin_settings: [..] PluginSetting;
+g_ps_inited:       bool = false;
+
+#local
+ensure_ps_init :: () {
+    if !g_ps_inited {
+        g_plugin_settings = make([..] PluginSetting);
+        g_ps_inited = true;
+    }
+}
+
+#local
+json_esc_setting :: (s: str, allocator := context.temp_allocator) -> str {
+    out := make(dyn_str, s.count + 16, allocator);
+    for i in 0 .. s.count {
+        c := s[i];
+        if c == '"'       do Array.concat(&out, "\\\"");
+        elseif c == '\\'  do Array.concat(&out, "\\\\");
+        elseif c == '\n'  do Array.concat(&out, "\\n");
+        elseif c >= 32    do out << c;
+    }
+    return out;
+}
+
+/// Registers a plugin setting (preserving any previously saved value in `odit.json`).
+settings_register_plugin :: (key: str, label: str, kind: u32, default_val: str) -> u32 {
+    ensure_ps_init();
+    if key.count == 0 do return 0;
+    for i in 0 .. g_plugin_settings.count {
+        ps := &g_plugin_settings[i];
+        if str.equal(ps.key, key) {
+            if label.count > 0 {
+                if ps.label.count > 0 do str.free(ps.label);
+                ps.label = str.copy(label);
+            }
+            ps.kind = kind;
+            if ps.default_val.count > 0 do str.free(ps.default_val);
+            ps.default_val = str.copy(default_val);
+            if ps.value.count == 0 && default_val.count > 0 {
+                ps.value = str.copy(default_val);
+            }
+            ps.registered = true;
+            return cast(u32) (i + 1);
+        }
+    }
+    g_plugin_settings << .{
+        key         = str.copy(key),
+        label       = str.copy(label if label.count > 0 else key),
+        kind        = kind,
+        default_val = str.copy(default_val),
+        value       = str.copy(default_val),
+        registered  = true,
+    };
+    return cast(u32) g_plugin_settings.count;
+}
+
+settings_get_plugin :: (key: str) -> str {
+    ensure_ps_init();
+    for &ps in g_plugin_settings {
+        if str.equal(ps.key, key) do return ps.value;
+    }
+    return "";
+}
+
+settings_set_plugin :: (key: str, val: str) -> bool {
+    ensure_ps_init();
+    if key.count == 0 do return false;
+    for &ps in g_plugin_settings {
+        if str.equal(ps.key, key) {
+            if ps.value.count > 0 do str.free(ps.value);
+            ps.value = str.copy(val);
+            settings_save();
+            return true;
+        }
+    }
+    g_plugin_settings << .{
+        key         = str.copy(key),
+        label       = str.copy(key),
+        kind        = 0,
+        default_val = str.copy(val),
+        value       = str.copy(val),
+        registered  = false,
+    };
+    settings_save();
+    return true;
+}
+
+#local
+load_plugin_settings_from_json :: (contents: str) {
+    ensure_ps_init();
+    // Locate `"plugin_settings": { ... }`
+    needle := "\"plugin_settings\"";
+    pos := -1;
+    if contents.count >= needle.count {
+        for i in 0 .. (contents.count - needle.count + 1) {
+            ok := true;
+            for j in 0 .. needle.count {
+                if contents[i + j] != needle[j] { ok = false; break; }
+            }
+            if ok { pos = i + needle.count; break; }
+        }
+    }
+    if pos < 0 do return;
+
+    while pos < contents.count && contents[pos] != '{' do pos += 1;
+    if pos >= contents.count do return;
+    pos += 1; // skip '{'
+
+    while pos < contents.count {
+        while pos < contents.count && (contents[pos] == ' ' || contents[pos] == '\t' || contents[pos] == '\n' || contents[pos] == '\r' || contents[pos] == ',') do pos += 1;
+        if pos >= contents.count || contents[pos] == '}' do break;
+        if contents[pos] != '"' { pos += 1; continue; }
+
+        // Read key
+        pos += 1;
+        ks := pos;
+        while pos < contents.count && contents[pos] != '"' do pos += 1;
+        key := contents[ks .. pos];
+        if pos < contents.count do pos += 1;
+
+        while pos < contents.count && contents[pos] != ':' do pos += 1;
+        if pos < contents.count do pos += 1;
+        while pos < contents.count && (contents[pos] == ' ' || contents[pos] == '\t') do pos += 1;
+        if pos >= contents.count || contents[pos] != '"' do break;
+
+        // Read value
+        pos += 1;
+        vbuf := make([..] u8, 32, context.temp_allocator);
+        while pos < contents.count && contents[pos] != '"' {
+            if contents[pos] == '\\' && pos + 1 < contents.count {
+                pos += 1;
+            }
+            vbuf << contents[pos];
+            pos += 1;
+        }
+        if pos < contents.count do pos += 1;
+        val := str.{ vbuf.data, vbuf.count };
+
+        // Store or update
+        found := false;
+        for &ps in g_plugin_settings {
+            if str.equal(ps.key, key) {
+                if ps.value.count > 0 do str.free(ps.value);
+                ps.value = str.copy(val);
+                found = true;
+                break;
+            }
+        }
+        if !found && key.count > 0 {
+            g_plugin_settings << .{
+                key         = str.copy(key),
+                label       = str.copy(key),
+                kind        = 0,
+                default_val = str.copy(val),
+                value       = str.copy(val),
+                registered  = false,
+            };
+        }
+    }
+}
 
 settings_set_path :: (path: str) {
     if path.count > 0 do g_settings_path = str.copy(path);
@@ -95,6 +264,7 @@ settings_load :: (path: str = "") -> bool {
             g_settings.theme     = str.copy(loaded.theme if loaded.theme.count > 0 else "mocha");
             g_settings.font_path = str.copy(loaded.font_path);
             settings_clamp(&g_settings);
+            load_plugin_settings_from_json(contents);
             return true;
         }
         case .Err {
@@ -105,9 +275,11 @@ settings_load :: (path: str = "") -> bool {
 }
 
 settings_save :: (path: str = "") -> bool {
+    ensure_ps_init();
     eff := path if path.count > 0 else g_settings_path;
     settings_clamp(&g_settings);
-    body := core.tprintf("""{{
+    out := make(dyn_str, 512, context.temp_allocator);
+    Array.concat(&out, core.tprintf("""{{
     "editor_font_size": {},
     "ui_scale": {},
     "line_height_factor": {},
@@ -119,9 +291,7 @@ settings_save :: (path: str = "") -> bool {
     "highlight_current_line": {},
     "auto_indent": {},
     "split_ratio": {},
-    "target_fps": {}
-}}
-""",
+    "target_fps": {}""",
         g_settings.editor_font_size,
         g_settings.ui_scale,
         g_settings.line_height_factor,
@@ -134,8 +304,22 @@ settings_save :: (path: str = "") -> bool {
         "true" if g_settings.auto_indent else "false",
         g_settings.split_ratio,
         g_settings.target_fps,
-    );
-    return os.File.write_contents(eff, body);
+    ));
+    if g_plugin_settings.count > 0 {
+        Array.concat(&out, ",\n    \"plugin_settings\": {\n");
+        for i in 0 .. g_plugin_settings.count {
+            ps := &g_plugin_settings[i];
+            Array.concat(&out, core.tprintf("        \"{}\": \"{}\"{}\n",
+                json_esc_setting(ps.key),
+                json_esc_setting(ps.value),
+                "," if i + 1 < g_plugin_settings.count else ""
+            ));
+        }
+        Array.concat(&out, "    }\n}\n");
+    } else {
+        Array.concat(&out, "\n}\n");
+    }
+    return os.File.write_contents(eff, out);
 }
 
 settings_reset :: () {

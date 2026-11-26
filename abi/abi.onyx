@@ -89,6 +89,13 @@ LogLevel :: enum (u32) {
     Error :: 3;
 }
 
+SettingKind :: enum (u32) {
+    String :: 0;
+    Bool   :: 1;
+    Int    :: 2;
+    Float  :: 3;
+}
+
 DockSlot :: enum (u32) {
     RightGrid :: 0; // Default mini-app grid on the right half
     LeftSide  :: 1; // Left sidebar (e.g. File Explorer)
@@ -431,6 +438,9 @@ DebugState :: struct {
         host_execute_command  :: (id_ptr: u32, id_len: u32, arg_ptr: u32, arg_len: u32) -> i32 ---
         host_spawn_plugin     :: (plugin_id_ptr: u32, plugin_id_len: u32) -> u32 ---
         host_set_clipboard    :: (text_ptr: u32, text_len: u32) -> void ---
+        host_register_setting :: (key_ptr: u32, key_len: u32, label_ptr: u32, label_len: u32, kind: u32, def_ptr: u32, def_len: u32) -> u32 ---
+        host_get_setting      :: (key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        host_set_setting      :: (key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32 ---
 
         // ---- B. UI Drawing Primitives & Immediate Widgets ----
 
@@ -460,6 +470,10 @@ DebugState :: struct {
         ui_texture_load      :: (path_ptr: u32, path_len: u32) -> u32 ---
         ui_texture_unload    :: (handle: u32) -> void ---
         ui_draw_texture      :: (handle: u32, x: f32, y: f32, w: f32, h: f32, tint_rgba: u32) -> void ---
+
+        audio_load           :: (path_ptr: u32, path_len: u32) -> u32 ---
+        audio_play           :: (handle: u32, volume: f32) -> void ---
+        audio_unload         :: (handle: u32) -> void ---
 
         // ---- C. Workspace, Editor Buffer, AST / LSP & Docs ----
 

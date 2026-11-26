@@ -61,7 +61,7 @@ Rather than writing 50 repetitive C wrapper functions in `native/wasm_host.c`, e
 3. Re-fetches `ONYX_PTR(g_host_scratch_offset)` after the call (protecting against host `memory.grow` relocation!).
 4. Sets `results->data[0].kind = env->ret_kind` (required by Wasmer's C API) and writes `scratch[12]` back to the plugin.
 
-Adding a new ABI call across Phases 2–4 requires only:
+Adding a new ABI call requires only:
 1. Declaring it in `abi/abi.onyx` (`#foreign "odit_host"`).
 2. Adding one `{ "fn_name", opcode }` entry in `native/wasm_host.c`.
 3. Adding one `case opcode` handler in `src/plugin/host_abi.onyx`.

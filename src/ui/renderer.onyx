@@ -37,6 +37,11 @@ TableState :: struct {
     row_index:  u32;
 }
 
+SoundSlot :: struct {
+    in_use: bool;
+    sound:  raylib.Sound;
+}
+
 UiContext :: struct {
     headless:      bool;
     // Active plugin pane frame state
@@ -84,7 +89,11 @@ UiContext :: struct {
 
     // Texture & animated GIF pool
     textures:      [64] TextureSlot;
+    audio_ready:   bool;
 }
+
+g_sounds:        [..] SoundSlot;
+g_sounds_inited: bool = false;
 
 g_ui: UiContext;
 
@@ -706,4 +715,81 @@ ui_draw_texture :: (handle: u32, x, y, w, h: f32, tint_rgba: u32) {
     src := raylib.Rectangle.{ 0, 0, cast(f32) slot.texture.width, cast(f32) slot.texture.height };
     dst := raylib.Rectangle.{ to_screen_x(x), to_screen_y(y), w, h };
     raylib.DrawTexturePro(slot.texture, src, dst, .{ 0, 0 }, 0.0, theme.rgba_to_rl(tint_rgba));
+}
+
+
+// -----------------------------------------------------------------------------
+// Plugin Audio Playback Pool (Lazy Raylib Audio Device Init)
+// -----------------------------------------------------------------------------
+
+#local
+ensure_audio_ready :: () -> bool {
+    if !g_sounds_inited {
+        g_sounds = make([..] SoundSlot);
+        g_sounds_inited = true;
+    }
+    if g_ui.headless do return false;
+    if !g_ui.audio_ready {
+        raylib.InitAudioDevice();
+        g_ui.audio_ready = true;
+    }
+    return g_ui.audio_ready;
+}
+
+ui_audio_load :: (full_path: str) -> u32 {
+    if !ensure_audio_ready() do return 0;
+    if full_path.count == 0 do return 0;
+
+    snd: raylib.Sound;
+    raylib.LoadSound(theme.to_temp_cstr(full_path), &snd);
+    if snd.frameCount == 0 do return 0;
+
+    for i in 0 .. g_sounds.count {
+        if !g_sounds[i].in_use {
+            g_sounds[i].in_use = true;
+            g_sounds[i].sound  = snd;
+            return cast(u32) (i + 1);
+        }
+    }
+    g_sounds << .{ in_use = true, sound = snd };
+    return cast(u32) g_sounds.count;
+}
+
+ui_audio_play :: (handle: u32, volume: f32) {
+    if !ensure_audio_ready() do return;
+    if handle == 0 || cast(i32) handle > g_sounds.count do return;
+    slot := &g_sounds[cast(i32) handle - 1];
+    if !slot.in_use do return;
+    vol := volume;
+    if vol < 0.0f do vol = 0.0f;
+    if vol > 1.0f do vol = 1.0f;
+    raylib.SetSoundVolume(slot.sound, vol);
+    raylib.PlaySound(slot.sound);
+}
+
+ui_audio_unload :: (handle: u32) {
+    if !g_sounds_inited || handle == 0 || cast(i32) handle > g_sounds.count do return;
+    slot := &g_sounds[cast(i32) handle - 1];
+    if !slot.in_use do return;
+    if !g_ui.headless && g_ui.audio_ready {
+        raylib.UnloadSound(slot.sound);
+    }
+    slot.in_use = false;
+}
+
+ui_audio_shutdown :: () {
+    if g_sounds_inited {
+        for i in 0 .. g_sounds.count {
+            if g_sounds[i].in_use {
+                if !g_ui.headless && g_ui.audio_ready {
+                    raylib.UnloadSound(g_sounds[i].sound);
+                }
+                g_sounds[i].in_use = false;
+            }
+        }
+    }
+    if g_ui.audio_ready {
+        raylib.CloseAudioDevice();
+    }
+    g_ui.audio_ready = false;
 }

@@ -206,6 +206,9 @@ static const HostOpSpec g_host_ops[] = {
     { "host_execute_command",        6 },
     { "host_spawn_plugin",           7 },
     { "host_set_clipboard",          8 },
+    { "host_register_setting",       9 },
+    { "host_get_setting",            10 },
+    { "host_set_setting",            11 },
 
     // B. UI Drawing Primitives & Immediate Widgets (20..49)
     { "ui_push_clip",                20 },
@@ -229,6 +232,9 @@ static const HostOpSpec g_host_ops[] = {
     { "ui_texture_load",             38 },
     { "ui_texture_unload",           39 },
     { "ui_draw_texture",             40 },
+    { "audio_load",                  41 },
+    { "audio_play",                  42 },
+    { "audio_unload",                43 },
 
     // C. Workspace, Editor, AST/LSP & Docs (50..79)
     { "workspace_get_root",          50 },

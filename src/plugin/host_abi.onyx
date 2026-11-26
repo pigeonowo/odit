@@ -137,6 +137,27 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
             }
         }
 
+        case 9 { // host_register_setting(key_ptr, key_len, label_ptr, label_len, kind, def_ptr, def_len) -> u32
+            key   := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            label := guest_read_str(handle, arg_u32(2), arg_u32(3));
+            kind  := arg_u32(4);
+            defv  := guest_read_str(handle, arg_u32(5), arg_u32(6));
+            ret_u32(settings.settings_register_plugin(key, label, kind, defv));
+        }
+
+        case 10 { // host_get_setting(key_ptr, key_len, out_ptr, out_cap) -> i32
+            key := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            val := settings.settings_get_plugin(key);
+            ret_i32(guest_write_out(handle, val, arg_u32(2), arg_u32(3)));
+        }
+
+        case 11 { // host_set_setting(key_ptr, key_len, val_ptr, val_len) -> i32
+            key := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            val := guest_read_str(handle, arg_u32(2), arg_u32(3));
+            ok := settings.settings_set_plugin(key, val);
+            ret_i32(0 if ok else cast(i32) abi.AbiError.NotFound);
+        }
+
         // ---- B. UI Drawing Primitives & Immediate Widgets (20..49) ----
 
         case 20 { // ui_push_clip(x, y, w, h)
@@ -274,6 +295,30 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
 
         case 40 { // ui_draw_texture(tex_handle, x, y, w, h, tint)
             ui.ui_draw_texture(arg_u32(0), arg_f32(1), arg_f32(2), arg_f32(3), arg_f32(4), arg_u32(5));
+        }
+
+        case 41 { // audio_load(path_ptr, path_len) -> u32
+            rel := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            if full := sanitize_rel_path(rel); full {
+                fp := full->unwrap();
+                if !os.file_exists(fp) {
+                    if oh := os.env("ODIT_HOME", context.temp_allocator); oh && oh->unwrap().count > 0 {
+                        alt := core.tprintf("{}/{}", oh->unwrap(), rel);
+                        if os.file_exists(alt) do fp = alt;
+                    }
+                }
+                ret_u32(ui.ui_audio_load(fp));
+            } else {
+                ret_u32(0);
+            }
+        }
+
+        case 42 { // audio_play(sound_handle, volume)
+            ui.ui_audio_play(arg_u32(0), arg_f32(1));
+        }
+
+        case 43 { // audio_unload(sound_handle)
+            ui.ui_audio_unload(arg_u32(0));
         }
 
         // ---- C. Workspace & Editor Context (50..65) ----

@@ -23,16 +23,14 @@
 
 ---
 
-## Project Status
+## Included Features & Plugins
 
-| Phase | Scope | Status |
-| :--- | :--- | :--- |
-| **Phase 1** | Native Onyx + Raylib host, draggable/dockable/floating window manager, `Ctrl+P` Command Palette, Settings (`Ctrl+,`), Onyx code editor, Wasmer `.wasm` plugin loader, Host ABI v1.0, Guest SDK | **Complete** |
-| **Phase 2** | Non-blocking Onyx LSP client (`onyx lsp`): diagnostics, hover (`K`), go-to-definition (`F12`/`gd`), completion (`Ctrl+Space`), `ast_get_*` Host ABI | **Complete** |
-| **Phase 3.1** | Fuzzy File Finder (`Ctrl+O`), **File Explorer** `.wasm` plugin, **Build & Run** `.wasm` plugin (`odit-build.json`, flags drawer, clickable errors, interactive `stdin`) | **Complete** |
-| **Phase 3.2** | **WASM Inspector** (`.wat` disassembly `.wasm` plugin) & **Onyx Docs / Core Browser** `.wasm` plugin | **Complete** |
-| **Phase 4.1** | **Live Side-by-Side Onyx/WASM Debugger** (`F5`/`F9`/`F10`/`F11`, custom run command, live value inspection, `debugger.wasm`) + **Advent of Code** (`aoc.wasm`) | **Complete** |
-| **Phase 4.2** | Domain Plugins: **HTTP Routes Viewer** (`http_routes.wasm` for `http-server`) & **Postgres-ORM Schema Viewer** (`orm_schema.wasm` for `postgres-orm`) | **Complete** |
+| Area | Capabilities |
+| :--- | :--- |
+| **Core Host & Editor** | Native Onyx + Raylib host, draggable/dockable/floating window manager, `Ctrl+P` Command Palette, `Ctrl+O` Fuzzy File Finder, Settings (`Ctrl+,`) with plugin-registered settings, Onyx code editor with selection & copy/cut/paste, Wasmer `.wasm` plugin loader, Host ABI v1.0, declarative `@sdk.Plugin` SDK (UI, textures, audio, settings) |
+| **Onyx LSP** | Non-blocking JSON-RPC client (`onyx lsp`): diagnostics, hover (`K`), go-to-definition (`F12`/`gd`), completion (`Ctrl+Space`), `ast_get_*` Host ABI |
+| **Core Plugins** | **File Explorer**, **Build & Run** (`odit-build.json`, flags drawer, extra `compiler_args`, clickable errors, interactive `stdin`), **WASM Inspector** (`.wat`), **Onyx Docs & Core Browser** |
+| **Debugging & Domain Plugins** | **Live Side-by-Side Onyx/WASM Debugger** (`F5`/`F9`/`F10`/`F11`, custom run command, live value inspection), **HTTP Routes Viewer** (`http-server`), **Postgres-ORM Schema Viewer** (`postgres-orm`), **Advent of Code Runner** |
 
 ---
 
@@ -158,7 +156,7 @@ odit/
 │   ├── architecture.md           # Host, Wasmer isolation, WM, LSP & Editor internals
 │   ├── debugging.md              # Quick-start guide for the Live Onyx <-> WASM Debugger
 │   ├── plugin-abi.md             # Complete ABI v1.0 opcode reference & plugin authoring guide
-│   └── roadmap.md                # Phase 1–4 roadmap & Onyx 2611 / Wasmer engineering notes
+│   └── roadmap.md                # Feature overview & Onyx 2611 / Wasmer engineering notes
 ├── build.nu                      # Nushell build/test/run/install script
 └── build.sh                      # Bash build/test/run/install script
 ```
@@ -170,4 +168,4 @@ odit/
 - **[`docs/architecture.md`](docs/architecture.md)** — How the native Onyx host, `dlopen`-isolated Wasmer C bridge, draggable window manager, Onyx LSP client, UI renderer, and code editor fit together.
 - **[`docs/debugging.md`](docs/debugging.md)** — How to get started with breakpoints, Onyx line stepping, and `.wat` instruction stepping in the Live Debugger.
 - **[`docs/plugin-abi.md`](docs/plugin-abi.md)** — Complete ABI v1.0 contract (`abi/abi.onyx`), opcode map, memory safety guidelines, and a quickstart template for authoring your own `.wasm` plugin.
-- **[`docs/roadmap.md`](docs/roadmap.md)** — Phase 1–4 status, Phase 4 design notes, and Onyx 2611 / Wasmer toolchain quirks already solved.
+- **[`docs/roadmap.md`](docs/roadmap.md)** — Implemented feature overview and Onyx 2611 / Wasmer engineering notes.

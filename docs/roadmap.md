@@ -1,10 +1,10 @@
-# Implementation Roadmap & Developer Notes
+# Feature Overview & Developer Notes
 
-This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolchain details so humans and AI agents can pick up Phase 2–4 cleanly without re-discovering quirks.
+This document summarizes the implemented subsystems of **Onyx Editor (`odit`)** and captures toolchain details so contributors can extend the IDE cleanly without re-discovering quirks.
 
 ---
 
-## Completed: Phase 1 — Host + Plugin ABI + Core Editor
+## Core Host, Plugin ABI & Editor
 
 - [x] Shared Host/Plugin ABI v1.0.0 (`abi/abi.onyx`), verified in both `-r onyx` and `-r custom` modes.
 - [x] `dlopen`-isolated Wasmer C bridge (`native/wasm_host.c` → `bin/odit_wasm_host.so`).
@@ -18,7 +18,7 @@ This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolc
 
 ---
 
-## Completed: Phase 2 — Onyx LSP Integration
+## Onyx LSP Integration
 
 - [x] Non-blocking POSIX process manager (`native_proc_spawn`/`read`/`write`/`poll`/`kill`) in `native/wasm_host.c` keeping child stdin blocking while parent stdout/stderr are `O_NONBLOCK` (avoids Onyx's `os.Process.spawn` `non_blocking_io` making `onyx lsp` exit on `EAGAIN`).
 - [x] Async JSON-RPC 2.0 `Content-Length` LSP client (`src/lsp/client.onyx`) spawning `onyx lsp`, syncing `didOpen`/`didChange` (debounced 350ms)/`didSave`, and supporting large files via `dyn_str` (avoiding `tprintf`'s 8 KB stack buffer).
@@ -28,7 +28,7 @@ This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolc
 
 ---
 
-## Completed: Phase 3.1 — Fuzzy File Finder + File Explorer & Build/Run WASM Plugins
+## Fuzzy File Finder, File Explorer & Build/Run Plugins
 
 - [x] Workspace recursive file indexer (`src/services/workspace.onyx`), `workspace_find_files` (53), `workspace_write_file` (66), and `file_stat`-backed sorted `workspace_list_dir`.
 - [x] Host ABI opcodes `80–84` (`proc_spawn`, `proc_poll_status`, `proc_read_output`, `proc_kill`, `compiler_build`) backed by `native_proc_*` with `waitpid(..., WNOHANG)`.
@@ -36,7 +36,7 @@ This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolc
 - [x] **File Explorer WASM Plugin** (`plugins/file_explorer/main.onyx` → `build/plugins/file_explorer.wasm`) — expandable tree for all workspace folders, `sdk.begin_frame()` scratch cleanup, filter input, single-click folder toggle & file open.
 - [x] **Build & Run WASM Plugin** (`plugins/build_run/main.onyx` → `build/plugins/build_run.wasm`) — OBV-inspired persistent `odit-build.json`, modes (`build`/`build-exe`/`check`), runtimes (`onyx`/`wasi`/`wasip2`/`js`/`custom`), 10-flag collapsible drawer, 2-stage Build → Run (builds & launches `odit` inside `odit`), elapsed duration timer, and clickable `file.onyx:line:col` error jumps.
 
-## Completed: Phase 3.2 — WASM Inspector & Onyx Docs Browser (WASM Plugins)
+## WASM Inspector & Onyx Docs Browser Plugins
 
 - [x] **WAT Disassembly Service** (`src/services/compiler_wat.onyx`, opcode `85`): compiles with `--generate-name-section`, runs `wasm2wat`, caches disassembled module per buffer version, extracts exact `(func ...)` blocks.
 - [x] **Onyx Core & Directives Docs Index** (`src/services/docs_index.onyx`, opcode `65`): indexes `~/.onyx/core/**/*.onyx` packages/procs/types + 26 built-in `#` directives (`#format`, `#load`, `#export`, `#foreign`, `#match`, etc.).
@@ -45,7 +45,7 @@ This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolc
 
 ---
 
-## Completed: Core Polish & Draggable Window Manager
+## Core Polish & Draggable Window Manager
 
 - [x] **Null-safe WASM Guest String Helpers (`sdk.free_str` / `sdk.copy_str`)**: Fixed WASM out-of-bounds traps caused by calling `str.free("")` (null pointer) or freeing static fallback literals in plugins (e.g., Docs Browser live search).
 - [x] **Plugin Mouse-Event Bitmask Fix**: Replaced `cast(u32) abi.MouseButton.Left if cond else 0` ternary expressions in `src/main.onyx` with explicit `if ... do mask |= ...;` statements so `FrameContext.mouse_pressed`/`mouse_down`/`mouse_released`/`key_mods` always transmit accurate bits to plugins (fixing File Explorer folder expand & file open clicks, Docs Browser row selection, and Build & Run clickable errors).
@@ -57,7 +57,7 @@ This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolc
 
 ---
 
-## Completed: Phase 4.1 — Live Side-by-Side Onyx <-> WASM Debugger
+## Live Side-by-Side Onyx <-> WASM Debugger
 
 - [x] **Host Debugger Service (`src/services/debugger.onyx`) & Opcodes `90–94`**:
   - Line breakpoint management (`debug_toggle_breakpoint`, `debug_get_breakpoints`) synchronized with red gutter dots in the core editor (via gutter click, `F9`, or inside the Debugger plugin).
@@ -66,7 +66,7 @@ This document tracks all 4 phases of **Onyx Editor (`odit`)** and captures toolc
 - [x] **Live Debugger WASM Plugin (`plugins/debugger/main.onyx` → `build/plugins/debugger.wasm`)**:
   - Declarative `@sdk.Plugin` split view showing Onyx source lines (with clickable breakpoint gutter) alongside syntax-colored mapped `.wat` instructions, active range highlighting, single WAT-instruction stepping, and a bottom Locals/Params inspector.
 
-## Completed: Phase 4.2 — Domain-Specific Mini-Apps & Distribution Readiness
+## Domain-Specific Mini-Apps, Audio, Plugin Settings & Distribution Readiness
 
 - [x] **Portable Tool Discovery**: Removed all hardcoded local user paths; `wasm2wat` resolves via `$WASM2WAT`, `./tools/wasm2wat`, `$ODIT_HOME/tools/wasm2wat`, `~/.local/bin/wasm2wat`, `/usr/bin`, `/usr/local/bin`, or `PATH`, and `README.md` documents installation & search paths for every prerequisite.
 - [x] **HTTP-Server Route Viewer (`plugins/http_routes/main.onyx` → `build/plugins/http_routes.wasm`)**: Scans workspace `.onyx` files for `onyx pkg add http-server` routes (`->get/post/put/patch/delete`, `->route(...)`, `@http.route`/`@route`), displays a filterable `Method | Path | Handler | Location` table with color-coded method pills, and jumps to definitions on click.

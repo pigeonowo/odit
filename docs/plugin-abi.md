@@ -64,6 +64,9 @@ When using the declarative decorators in [`sdk/plugin_sdk.onyx`](../sdk/plugin_s
 | `6` | `host_execute_command(id..., arg...) -> i32` | Live |
 | `7` | `host_spawn_plugin(plugin_id...) -> u32` | Live |
 | `8` | `host_set_clipboard(text_ptr, text_len)` | Live |
+| `9` | `host_register_setting(key..., label..., kind, default...) -> u32` | Live |
+| `10` | `host_get_setting(key..., out_ptr, out_cap) -> i32` | Live |
+| `11` | `host_set_setting(key..., val_ptr, val_len) -> i32` | Live |
 
 ### B. UI Drawing & Immediate Widgets (`20..49`)
 All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped to the pane.
@@ -77,6 +80,7 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
 | `33–34` | `ui_scroll_area_begin` / `ui_scroll_area_end` | Live |
 | `35–37` | `ui_table_begin` / `ui_table_row` / `ui_table_end` | Live |
 | `38–40` | `ui_texture_load`, `ui_texture_unload`, `ui_draw_texture` | Live |
+| `41–43` | `audio_load(path...) -> u32`, `audio_play(handle, volume)`, `audio_unload(handle)` | Live |
 
 ### C. Workspace, Editor, AST/LSP & Docs (`50..79`)
 | Opcode | Function | Status |
