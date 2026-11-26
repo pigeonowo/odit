@@ -42,10 +42,11 @@ use odit.editor
 use odit.plugin
 
 AppState :: struct {
-    workspace_root:  str;
-    odit_home:       str;
-    plugins_dir:     str;
-    window_mgr:      wm.WindowManager;
+    workspace_root:   str;
+    odit_home:        str;
+    plugins_dir:      str;
+    user_plugins_dir: str;
+    window_mgr:       wm.WindowManager;
     ed:              editor.EditorView;
     lsp_client:      lsp.LspClient;
     palette:         ui.CommandPalette;
@@ -71,38 +72,48 @@ init_install_paths :: () {
             g_app.plugins_dir = str.copy(core.tprintf("{}/build/plugins", g_app.odit_home));
         }
 
-        // In installed mode, store global settings & layout under ~/.config/odit/
+        // In installed mode, store global settings, layout & user plugins under ~/.config/odit/
         if user_home := os.env("HOME", context.temp_allocator); user_home && user_home->unwrap().count > 0 {
             cfg_base := core.tprintf("{}/.config", user_home->unwrap());
             cfg_dir  := core.tprintf("{}/odit", cfg_base);
+            usr_plug := core.tprintf("{}/plugins", cfg_dir);
             if !os.Directory.exists(cfg_base) do os.Directory.create(cfg_base);
             if !os.Directory.exists(cfg_dir)  do os.Directory.create(cfg_dir);
+            if !os.Directory.exists(usr_plug) do os.Directory.create(usr_plug);
             settings.settings_set_path(core.tprintf("{}/odit.json", cfg_dir));
             g_app.window_mgr.layout_path = str.copy(core.tprintf("{}/odit-layout.json", cfg_dir));
+            g_app.user_plugins_dir       = str.copy(usr_plug);
         }
     } else {
         g_app.odit_home   = ".";
         g_app.plugins_dir = "build/plugins";
+        if user_home := os.env("HOME", context.temp_allocator); user_home && user_home->unwrap().count > 0 {
+            usr_plug := core.tprintf("{}/.config/odit/plugins", user_home->unwrap());
+            if os.Directory.exists(usr_plug) do g_app.user_plugins_dir = str.copy(usr_plug);
+        }
     }
 }
 
 resolve_plugin_wasm :: (name_or_path: str, allocator := context.temp_allocator) -> str {
     if name_or_path.count == 0 do return "";
     if os.file_exists(name_or_path) do return str.copy(name_or_path, allocator);
-    // Fall back to basename inside `g_app.plugins_dir` (handles dev <-> installed layout)
+    // Fall back to basename across: .odit/plugins -> ~/.config/odit/plugins -> built-in plugins_dir
     base := name_or_path;
     for i in 0 .. name_or_path.count {
         if name_or_path[i] == '/' do base = name_or_path[(i + 1) .. name_or_path.count];
     }
-    cand := core.tprintf("{}/{}", g_app.plugins_dir, base);
-    if os.file_exists(cand) do return str.copy(cand, allocator);
+    search_dirs := str.[ ".odit/plugins", g_app.user_plugins_dir, g_app.plugins_dir ];
+    for d in search_dirs {
+        if d.count == 0 do continue;
+        cand := core.tprintf("{}/{}", d, base);
+        if os.file_exists(cand) do return str.copy(cand, allocator);
+    }
     return "";
 }
 
-discover_plugins :: () {
-    Array.clear(&g_app.available_wasms);
-    plugin_dir := g_app.plugins_dir;
-    if !os.Directory.exists(plugin_dir) do return;
+#local
+discover_plugins_in_dir :: (plugin_dir: str) {
+    if plugin_dir.count == 0 || !os.Directory.exists(plugin_dir) do return;
 
     for entry in os.Directory.list(plugin_dir) {
         name := entry->name();
@@ -114,6 +125,14 @@ discover_plugins :: () {
             ui.palette_register(&g_app.palette, cmd_id, label, "", 0);
         }
     }
+}
+
+discover_plugins :: () {
+    Array.clear(&g_app.available_wasms);
+    // Scan workspace dev plugins, user-installed plugins (~/.config/odit/plugins), and built-in plugins
+    discover_plugins_in_dir(".odit/plugins");
+    discover_plugins_in_dir(g_app.user_plugins_dir);
+    discover_plugins_in_dir(g_app.plugins_dir);
 }
 
 spawn_plugin_from_wasm :: (wasm_path: str) -> u32 {
@@ -365,8 +384,8 @@ execute_command :: (cmd: &ui.CommandEntry) {
         wm.wm_notify(&g_app.window_mgr, 1, "Debugger stopped");
     } elseif str.starts_with(cmd.id, "plugin.spawn.") {
         fname := cmd.id["plugin.spawn.".count .. cmd.id.count];
-        wasm_path := core.tprintf("{}/{}", g_app.plugins_dir, fname);
-        if spawn_plugin_from_wasm(wasm_path) > 0 {
+        wasm_path := resolve_plugin_wasm(fname, context.temp_allocator);
+        if wasm_path.count > 0 && spawn_plugin_from_wasm(wasm_path) > 0 {
             if !g_app.headless_test do wm.wm_save_layout(&g_app.window_mgr);
             wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Opened {}", fname));
         } else {

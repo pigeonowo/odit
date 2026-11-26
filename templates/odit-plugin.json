@@ -1,0 +1,33 @@
+{
+    "variables": {
+        "name": {
+            "type": "string",
+            "description": "Plugin package name (lowercase, e.g. my_plugin)"
+        },
+        "title": {
+            "type": "string",
+            "description": "Window title shown in ODIT (e.g. My Plugin)"
+        },
+        "author": {
+            "type": "string",
+            "description": "Author name"
+        },
+        "description": {
+            "type": "string",
+            "description": "Short plugin description"
+        }
+    },
+    "files": {
+        ".gitignore": "build/\nlib/\nbin/\n*.wasm\n*.wasm.js\n",
+        "onyx-pkg.kdl": "package {\n    name \"{{name}}\"\n    author \"{{author}}\"\n    url \"\"\n    description \"{{description}}\"\n    version \"0.1.0\"\n}\n\nconfig {\n    dependency_source_path \"./lib\"\n    dependency_binary_path \"./bin\"\n}\n\ndependencies {\n    \"odit_sdk\" \"0.1.0\" git=\"/home/jonas/projects/odit_onyx_sdk\"\n}\n\nlsp {\n    mode \"project\"\n    source_files \"src/main.onyx\"\n    include_dirs \"\"\n    working_dir \".\"\n}\n",
+        "src": {
+            "main.onyx": "#load \"./../lib/packages\"\n\nuse core { tprintf }\nuse odit.abi\nuse odit.sdk\n\n@sdk.Plugin.{\n    id             = \"user.{{name}}\",\n    title          = \"{{title}}\",\n    version        = \"0.1.0\",\n    default_slot   = 0,\n    default_width  = 360.0f,\n    default_height = 240.0f,\n    event_mask     = 67, // ActiveFileChanged (1) | BufferModified (2) | CommandInvoked (64)\n    allow_multiple = false,\n}\nPluginState :: struct {\n    clicks: u32;\n}\n\n@sdk.PluginInit\ninit :: (self: &PluginState, window_id: u32) -> i32 {\n    sdk.register_command(\"{{name}}.hello\", \"{{title}}: Say Hello\", \"\");\n    sdk.register_setting(\"{{name}}.greeting\", \"{{title}}: Greeting\", .String, \"Hello from {{title}}!\");\n    return 0;\n}\n\n@sdk.PluginEvent\non_event :: (self: &PluginState, window_id: u32, event: sdk.Event) {\n    switch event {\n        case .Command as cmd {\n            if cmd == \"{{name}}.hello\" {\n                self.clicks += 1;\n                msg := sdk.get_setting(\"{{name}}.greeting\", context.temp_allocator);\n                sdk.notify(.Info, msg if msg.count > 0 else \"Hello!\");\n            }\n        }\n        case _ {}\n    }\n}\n\n@sdk.PluginRender\nrender :: (self: &PluginState, window_id: u32, ctx: &abi.FrameContext) {\n    pad: f32 = 12.0f;\n    greeting := sdk.get_setting(\"{{name}}.greeting\", context.temp_allocator);\n    sdk.draw_text(pad, pad, greeting if greeting.count > 0 else \"Hello!\", 15.0f, sdk.theme_color(.TextPrimary), .Bold);\n    sdk.draw_text(pad, pad + 26.0f, tprintf(\"Clicks: {}\", self.clicks), 13.0f, sdk.theme_color(.TextSecondary));\n\n    sdk.on_click(1, pad, pad + 54.0f, 140.0f, 32.0f, \"Click Me\", .Primary) {\n        self.clicks += 1;\n    };\n}\n"
+        },
+        "build.onyx": "// =============================================================================\n// ODIT Plugin Build & Install Script (`onyx run build.onyx [-- install|dev]`)\n// =============================================================================\n//   onyx run build.onyx            -> compiles build/{{name}}.wasm\n//   onyx run build.onyx -- install -> compiles & installs to ~/.config/odit/plugins/{{name}}.wasm\n//   onyx run build.onyx -- dev     -> compiles & copies to .odit/plugins/{{name}}.wasm\n\nuse core { package, os, printf, println }\n\nPLUGIN_NAME :: \"{{name}}\"\n\nresolve_onyx :: () -> str {\n    if op := os.env(\"ONYX_PATH\", context.temp_allocator); op && op->unwrap().count > 0 {\n        cand := core.tprintf(\"{}/bin/onyx\", op->unwrap());\n        if os.file_exists(cand) do return cand;\n    }\n    if h := os.env(\"HOME\", context.temp_allocator); h && h->unwrap().count > 0 {\n        cand := core.tprintf(\"{}/.onyx/bin/onyx\", h->unwrap());\n        if os.file_exists(cand) do return cand;\n    }\n    return \"onyx\";\n}\n\nmain :: (args: [] cstr) {\n    do_install := false;\n    do_dev     := false;\n    for i in 1 .. args.count {\n        a := core.string.from_cstr(args[i]);\n        if str.equal(a, \"install\") do do_install = true;\n        if str.equal(a, \"dev\")     do do_dev     = true;\n    }\n\n    onyx_bin := resolve_onyx();\n    if !os.file_exists(\"lib/packages.onyx\") {\n        println(\"[build] Syncing dependencies (onyx pkg sync)...\");\n        _ := os.command()->path(onyx_bin)->args(.[\"pkg\", \"sync\"])->output();\n    }\n\n    os.Directory.create(\"build\");\n    out_wasm := core.tprintf(\"build/{}.wasm\", PLUGIN_NAME);\n\n    printf(\"[build] Compiling {} -> {}...\\n\", \"src/main.onyx\", out_wasm);\n    cmd := os.command()->path(onyx_bin)->args(.[\n        \"build\", \"-r\", \"js\", \"--wasm-mvp\", \"-o\", out_wasm, \"src/main.onyx\"\n    ]);\n    switch cmd->output() {\n        case .Ok {\n            js_path := core.tprintf(\"{}.js\", out_wasm);\n            if os.file_exists(js_path) do os.remove_file(js_path);\n            printf(\"[build] Built {}\\n\", out_wasm);\n        }\n        case .Err as err {\n            printf(\"[build] Compilation failed:\\n{}\\n\", err.output);\n            os.exit(1);\n        }\n    }\n\n    if do_install {\n        if h := os.env(\"HOME\", context.temp_allocator); h && h->unwrap().count > 0 {\n            cfg := core.tprintf(\"{}/.config\", h->unwrap());\n            od  := core.tprintf(\"{}/odit\", cfg);\n            pd  := core.tprintf(\"{}/plugins\", od);\n            if !os.Directory.exists(cfg) do os.Directory.create(cfg);\n            if !os.Directory.exists(od)  do os.Directory.create(od);\n            if !os.Directory.exists(pd)  do os.Directory.create(pd);\n            dst := core.tprintf(\"{}/{}.wasm\", pd, PLUGIN_NAME);\n            data := os.get_contents(out_wasm);\n            if data.count > 0 && os.File.write_contents(dst, data) {\n                printf(\"[install] Installed -> {}\\n\", dst);\n                println(\"[install] In ODIT, press Ctrl+P -> 'Plugins: Reload All .wasm Plugins'!\");\n            } else {\n                println(\"[install] Failed to copy plugin binary.\");\n                os.exit(1);\n            }\n        }\n    }\n\n    if do_dev {\n        os.Directory.create(\".odit\");\n        os.Directory.create(\".odit/plugins\");\n        dst := core.tprintf(\".odit/plugins/{}.wasm\", PLUGIN_NAME);\n        data := os.get_contents(out_wasm);\n        if data.count > 0 && os.File.write_contents(dst, data) {\n            printf(\"[dev] Installed workspace plugin -> {}\\n\", dst);\n        }\n    }\n}\n"
+        }
+    },
+    "commands": [
+        "git init",
+        "onyx pkg sync"
+    ]
+}

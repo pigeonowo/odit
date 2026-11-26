@@ -151,6 +151,14 @@ exec \"$ONYX_PATH/bin/onyx\" run \"$ODIT_HOME/odit.wasm\" -- \"$@\"
     $script | save -f $launcher
     ^chmod +x $launcher
 
+    # Install `onyx new odit-plugin` template if present
+    let tmpl_src = "templates/odit-plugin.json"
+    let tmpl_dir = ((onyx-path) | path join "tools" "pkg_templates")
+    if ($tmpl_src | path exists) and ($tmpl_dir | path exists) {
+        cp -f $tmpl_src ($tmpl_dir | path join "odit-plugin.json")
+        print $"Installed onyx template -> ($tmpl_dir | path join 'odit-plugin.json')"
+    }
+
     print $"Installed! Run `odit` from any project directory."
     print $"Make sure ($bin_dir) is on your PATH."
 }
