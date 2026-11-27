@@ -20,6 +20,7 @@ RunSlot :: struct {
     should:   str;
     is:       str;
     verified: bool;
+    time_str: str;
 }
 
 DayRecord :: struct {
@@ -45,6 +46,7 @@ SavedSlot :: struct {
     should:   str;
     is:       str;
     verified: bool;
+    time:     str;
 }
 
 SavedDay :: struct {
@@ -89,12 +91,14 @@ AocPlugin :: struct {
     scroll_y:    f32;
 
     // Active child process state
-    proc_handle: u32;
-    run_day:     u32;
-    run_is_test: bool;
-    run_stage:   RunStage;
-    out_buf:     [..] u8;
-    p1_tmp:      str;
+    proc_handle:   u32;
+    run_day:       u32;
+    run_is_test:   bool;
+    run_stage:     RunStage;
+    out_buf:       [..] u8;
+    p1_tmp:        str;
+    p1_time_tmp:   str;
+    stage_elapsed: f32;
 }
 
 // -----------------------------------------------------------------------------
@@ -343,10 +347,10 @@ load_state :: (self: &AocPlugin) -> bool {
                 rec.source_path     = sdk.copy_str(sd.source_path) if sd.source_path.count > 0 else detect_source_path(sd.day);
                 rec.input_path      = sdk.copy_str(sd.input_path)  if sd.input_path.count > 0  else sdk.copy_str(tprintf("{}/input_day{}.txt", self.input_dir, sd.day));
                 rec.test_input_path = sdk.copy_str(sd.test_input_path) if sd.test_input_path.count > 0 else sdk.copy_str(tprintf("{}/test_input_day{}.txt", self.input_dir, sd.day));
-                rec.test_p1         = .{ sdk.copy_str(sd.test_p1.should), sdk.copy_str(sd.test_p1.is), sd.test_p1.verified };
-                rec.test_p2         = .{ sdk.copy_str(sd.test_p2.should), sdk.copy_str(sd.test_p2.is), sd.test_p2.verified };
-                rec.real_p1         = .{ sdk.copy_str(sd.real_p1.should), sdk.copy_str(sd.real_p1.is), sd.real_p1.verified };
-                rec.real_p2         = .{ sdk.copy_str(sd.real_p2.should), sdk.copy_str(sd.real_p2.is), sd.real_p2.verified };
+                rec.test_p1         = .{ sdk.copy_str(sd.test_p1.should), sdk.copy_str(sd.test_p1.is), sd.test_p1.verified, sdk.copy_str(sd.test_p1.time) };
+                rec.test_p2         = .{ sdk.copy_str(sd.test_p2.should), sdk.copy_str(sd.test_p2.is), sd.test_p2.verified, sdk.copy_str(sd.test_p2.time) };
+                rec.real_p1         = .{ sdk.copy_str(sd.real_p1.should), sdk.copy_str(sd.real_p1.is), sd.real_p1.verified, sdk.copy_str(sd.real_p1.time) };
+                rec.real_p2         = .{ sdk.copy_str(sd.real_p2.should), sdk.copy_str(sd.real_p2.is), sd.real_p2.verified, sdk.copy_str(sd.real_p2.time) };
                 rec.last_error      = sdk.copy_str(sd.last_error);
                 set_edit_buf(rec.p1_buf, &rec.p1_len, rec.test_p1.should);
                 set_edit_buf(rec.p2_buf, &rec.p2_len, rec.test_p2.should);
@@ -377,7 +381,10 @@ append_slot_json :: (out: &[..] u8, name: str, sl: &RunSlot, comma: bool) {
     Array.concat(out, "\",\"is\":\"");
     append_esc(out, sl.is);
     Array.concat(out, "\",\"verified\":");
-    Array.concat(out, "true}" if sl.verified else "false}");
+    Array.concat(out, "true" if sl.verified else "false");
+    Array.concat(out, ",\"time\":\"");
+    append_esc(out, sl.time_str);
+    Array.concat(out, "\"}");
     if comma do Array.concat(out, ",");
     Array.concat(out, "\n");
 }
@@ -434,10 +441,22 @@ spawn_aoc_part :: (self: &AocPlugin, day: u32, part: u32, is_test: bool, stage: 
         return;
     }
 
-    self.proc_handle = ph;
-    self.run_day     = day;
-    self.run_is_test = is_test;
-    self.run_stage   = stage;
+    self.proc_handle   = ph;
+    self.run_day       = day;
+    self.run_is_test   = is_test;
+    self.run_stage     = stage;
+    self.stage_elapsed = 0.0f;
+}
+
+#local
+format_duration :: (secs: f32) -> str {
+    if secs < 0.0f do return "0ms";
+    if secs < 1.0f {
+        ms := cast(i32) (secs * 1000.0f + 0.5f);
+        if ms < 1 do ms = 1;
+        return tprintf("{}ms", ms);
+    }
+    return tprintf("{:.2}s", secs);
 }
 
 #local
@@ -452,6 +471,8 @@ start_run :: (self: &AocPlugin, day: u32, is_test: bool) {
     rec.last_error = "";
     sdk.free_str(self.p1_tmp);
     self.p1_tmp = "";
+    sdk.free_str(self.p1_time_tmp);
+    self.p1_time_tmp = "";
 
     // Refresh source path if file was newly created
     if sdk.workspace_read_file(rec.source_path, context.temp_allocator).count == 0 {
@@ -464,8 +485,9 @@ start_run :: (self: &AocPlugin, day: u32, is_test: bool) {
 }
 
 #local
-poll_runner :: (self: &AocPlugin) {
+poll_runner :: (self: &AocPlugin, dt: f32) {
     if self.proc_handle == 0 do return;
+    self.stage_elapsed += dt;
 
     chunk: [2048] u8;
     for _ in 0 .. 8 {
@@ -500,10 +522,14 @@ poll_runner :: (self: &AocPlugin) {
         return;
     }
 
+    elapsed_str := format_duration(self.stage_elapsed);
+
     if self.run_stage == .Both {
-        p1, p2 := parse_parts(raw_out);
+        p1, p2, t1, t2 := parse_parts(raw_out);
         if code == 0 && (p1.count > 0 || p2.count > 0) {
-            apply_results(self, rec, self.run_is_test, p1, p2);
+            eff_t1 := t1 if t1.count > 0 else (elapsed_str if p1.count > 0 else "");
+            eff_t2 := t2 if t2.count > 0 else (elapsed_str if p2.count > 0 else "");
+            apply_results(self, rec, self.run_is_test, p1, p2, eff_t1, eff_t2);
             self.run_stage = .Idle;
             save_state(self);
             return;
@@ -521,9 +547,11 @@ poll_runner :: (self: &AocPlugin) {
 
     if self.run_stage == .Part1 {
         if code == 0 {
-            p1, _ := parse_parts(raw_out);
+            p1, _, t1, _ := parse_parts(raw_out);
             sdk.free_str(self.p1_tmp);
             self.p1_tmp = sdk.copy_str(p1);
+            sdk.free_str(self.p1_time_tmp);
+            self.p1_time_tmp = sdk.copy_str(t1 if t1.count > 0 else elapsed_str);
             spawn_aoc_part(self, self.run_day, 2, self.run_is_test, .Part2);
         } else {
             record_run_error(rec, raw_out, code);
@@ -535,29 +563,38 @@ poll_runner :: (self: &AocPlugin) {
 
     if self.run_stage == .Part2 {
         p2 := "";
+        t2 := "";
         if code == 0 {
-            a, b := parse_parts(raw_out);
+            a, b, ta, tb := parse_parts(raw_out);
             p2 = b if b.count > 0 else a;
+            pt := tb if tb.count > 0 else ta;
+            t2 = pt if pt.count > 0 else (elapsed_str if p2.count > 0 else "");
         }
-        apply_results(self, rec, self.run_is_test, self.p1_tmp, p2);
+        apply_results(self, rec, self.run_is_test, self.p1_tmp, p2, self.p1_time_tmp, t2);
         sdk.free_str(self.p1_tmp);
         self.p1_tmp = "";
+        sdk.free_str(self.p1_time_tmp);
+        self.p1_time_tmp = "";
         self.run_stage = .Idle;
         save_state(self);
     }
 }
 
 #local
-apply_results :: (self: &AocPlugin, rec: &DayRecord, is_test: bool, p1: str, p2: str) {
+apply_results :: (self: &AocPlugin, rec: &DayRecord, is_test: bool, p1: str, p2: str, t1: str, t2: str) {
     sdk.free_str(rec.last_error);
     rec.last_error = "";
     if is_test {
-        sdk.free_str(rec.test_p1.is); rec.test_p1.is = sdk.copy_str(p1);
-        sdk.free_str(rec.test_p2.is); rec.test_p2.is = sdk.copy_str(p2);
+        sdk.free_str(rec.test_p1.is);       rec.test_p1.is       = sdk.copy_str(p1);
+        sdk.free_str(rec.test_p2.is);       rec.test_p2.is       = sdk.copy_str(p2);
+        sdk.free_str(rec.test_p1.time_str); rec.test_p1.time_str = sdk.copy_str(t1);
+        sdk.free_str(rec.test_p2.time_str); rec.test_p2.time_str = sdk.copy_str(t2);
         sdk.notify(.Info, tprintf("Day {} Test done (P1={}, P2={})", rec.day, p1, p2));
     } else {
-        sdk.free_str(rec.real_p1.is); rec.real_p1.is = sdk.copy_str(p1);
-        sdk.free_str(rec.real_p2.is); rec.real_p2.is = sdk.copy_str(p2);
+        sdk.free_str(rec.real_p1.is);       rec.real_p1.is       = sdk.copy_str(p1);
+        sdk.free_str(rec.real_p2.is);       rec.real_p2.is       = sdk.copy_str(p2);
+        sdk.free_str(rec.real_p1.time_str); rec.real_p1.time_str = sdk.copy_str(t1);
+        sdk.free_str(rec.real_p2.time_str); rec.real_p2.time_str = sdk.copy_str(t2);
         sdk.notify(.Info, tprintf("Day {} Real done (P1={}, P2={})", rec.day, p1, p2));
     }
 }
@@ -623,11 +660,36 @@ starts_with_ci :: (s: str, prefix: str) -> bool {
     return true;
 }
 
+/// Splits an optional trailing timing suffix like `"12345 (1.2ms)"` or `"12345 [450us]"`
+/// into `(clean_answer, time_str)` so answer comparison stays exact.
 #local
-parse_parts :: (raw_out: str) -> (str, str) {
+split_answer_and_time :: (raw: str) -> (str, str) {
+    s := trim_ws(raw);
+    if s.count >= 4 {
+        last := s[s.count - 1];
+        if last == ')' || last == ']' {
+            open_ch: u8 = '(' if last == ')' else '[';
+            op := s.count - 2;
+            while op > 0 && s[op] != open_ch do op -= 1;
+            if s[op] == open_ch && op > 0 {
+                inner := trim_ws(s[(op + 1) .. (s.count - 1)]);
+                if str.ends_with(inner, "ms") || str.ends_with(inner, "us") ||
+                   str.ends_with(inner, "ns") || str.ends_with(inner, "s") {
+                    return trim_ws(s[0 .. op]), inner;
+                }
+            }
+        }
+    }
+    return s, "";
+}
+
+#local
+parse_parts :: (raw_out: str) -> (str, str, str, str) {
     clean := strip_ansi(raw_out);
     p1 := "";
     p2 := "";
+    t1 := "";
+    t2 := "";
     fallback_lines := make([..] str, 8, context.temp_allocator);
 
     start := 0;
@@ -636,13 +698,13 @@ parse_parts :: (raw_out: str) -> (str, str) {
             ln := trim_ws(clean[start .. i]);
             if ln.count > 0 {
                 if starts_with_ci(ln, "part 1:") {
-                    p1 = trim_ws(ln[7 .. ln.count]);
+                    p1, t1 = split_answer_and_time(ln[7 .. ln.count]);
                 } elseif starts_with_ci(ln, "part 2:") {
-                    p2 = trim_ws(ln[7 .. ln.count]);
+                    p2, t2 = split_answer_and_time(ln[7 .. ln.count]);
                 } elseif starts_with_ci(ln, "p1:") {
-                    p1 = trim_ws(ln[3 .. ln.count]);
+                    p1, t1 = split_answer_and_time(ln[3 .. ln.count]);
                 } elseif starts_with_ci(ln, "p2:") {
-                    p2 = trim_ws(ln[3 .. ln.count]);
+                    p2, t2 = split_answer_and_time(ln[3 .. ln.count]);
                 } else {
                     fallback_lines << ln;
                 }
@@ -652,10 +714,10 @@ parse_parts :: (raw_out: str) -> (str, str) {
     }
 
     if p1.count == 0 && p2.count == 0 {
-        if fallback_lines.count >= 1 do p1 = fallback_lines[0];
-        if fallback_lines.count >= 2 do p2 = fallback_lines[1];
+        if fallback_lines.count >= 1 do p1, t1 = split_answer_and_time(fallback_lines[0]);
+        if fallback_lines.count >= 2 do p2, t2 = split_answer_and_time(fallback_lines[1]);
     }
-    return p1, p2;
+    return p1, p2, t1, t2;
 }
 
 #local
@@ -704,7 +766,7 @@ draw_readonly_box :: (ctx: &abi.FrameContext, x, y, w, h: f32, val: str, scroll_
 
 @sdk.PluginRender
 render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
-    poll_runner(self);
+    poll_runner(self, ctx.delta_time);
 
     pad: f32 = 10.0f;
     w := ctx.width - pad * 2.0f;
@@ -740,15 +802,17 @@ render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
         lbl_w:    f32 = 54.0f;
         play_w:   f32 = 30.0f;
         status_w: f32 = 34.0f;
+        time_w:   f32 = 52.0f;
         gap:      f32 = 6.0f;
-        box_w := (cw - 16.0f - lbl_w - play_w - status_w - gap * 4.0f) * 0.5f;
-        if box_w < 54.0f do box_w = 54.0f;
+        box_w := (cw - 16.0f - lbl_w - play_w - status_w - time_w - gap * 5.0f) * 0.5f;
+        if box_w < 48.0f do box_w = 48.0f;
 
         x_lbl  := pad + 8.0f;
-        x_shd  := x_lbl + lbl_w + gap;
-        x_is   := x_shd + box_w + gap;
-        x_play := x_is  + box_w + gap;
-        x_stat := x_play + play_w + gap;
+        x_shd  := x_lbl  + lbl_w    + gap;
+        x_is   := x_shd  + box_w    + gap;
+        x_play := x_is   + box_w    + gap;
+        x_stat := x_play + play_w   + gap;
+        x_time := x_stat + status_w + gap;
         row_h:  f32 = 24.0f;
 
         for i in 0 .. self.days.count {
@@ -787,10 +851,11 @@ render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
                 state_dirty = true;
             }
 
-            // Column headers ("should" / "is")
+            // Column headers ("should" / "is" / "time")
             hy := cy + 28.0f;
-            sdk.draw_text(x_shd + 4.0f, hy, "should", 11.0f, sdk.theme_color(.TextSecondary));
-            sdk.draw_text(x_is  + 4.0f, hy, "is",     11.0f, sdk.theme_color(.TextSecondary));
+            sdk.draw_text(x_shd  + 4.0f, hy, "should", 11.0f, sdk.theme_color(.TextSecondary));
+            sdk.draw_text(x_is   + 4.0f, hy, "is",     11.0f, sdk.theme_color(.TextSecondary));
+            sdk.draw_text(x_time + 2.0f, hy, "time",   11.0f, sdk.theme_color(.TextSecondary));
 
             running_this_test := self.proc_handle != 0 && self.run_day == d.day && self.run_is_test;
             running_this_real := self.proc_handle != 0 && self.run_day == d.day && !self.run_is_test;
@@ -828,7 +893,7 @@ render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
                 run_req_test = true;
             }
 
-            // Automatic Test status (`OK` green / `X` red)
+            // Automatic Test status (`OK` green / `X` red) + duration at end of row
             if d.test_p1.is.count > 0 {
                 ok1 := d.test_p1.should.count > 0 && str.equal(d.test_p1.should, d.test_p1.is);
                 sdk.draw_text(x_stat + 8.0f, ty1 + 5.0f, "OK" if ok1 else "X", 12.0f,
@@ -838,6 +903,17 @@ render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
                 ok2 := d.test_p2.should.count > 0 && str.equal(d.test_p2.should, d.test_p2.is);
                 sdk.draw_text(x_stat + 8.0f, ty2 + 5.0f, "OK" if ok2 else "X", 12.0f,
                               sdk.theme_color(.Success) if ok2 else sdk.theme_color(.Error), .Bold);
+            }
+            if running_this_test {
+                live_t := tprintf("{:.1}s", self.stage_elapsed);
+                sdk.draw_text(x_time + 2.0f, ty1 + 6.0f, live_t, 11.0f, sdk.theme_color(.Accent), .Mono);
+            } else {
+                if d.test_p1.time_str.count > 0 {
+                    sdk.draw_text(x_time + 2.0f, ty1 + 6.0f, d.test_p1.time_str, 11.0f, sdk.theme_color(.TextSecondary), .Mono);
+                }
+                if d.test_p2.time_str.count > 0 {
+                    sdk.draw_text(x_time + 2.0f, ty2 + 6.0f, d.test_p2.time_str, 11.0f, sdk.theme_color(.TextSecondary), .Mono);
+                }
             }
 
             // Subtle divider between test & real groups
@@ -864,9 +940,20 @@ render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
                 run_req_test = false;
             }
 
-            // Manual confirmation checkboxes (`[ ]` / `[v]` / `[x]`)
+            // Manual confirmation checkboxes (`[ ]` / `[v]` / `[x]`) + duration at end of row
             render_real_checkbox(base_id + 5, x_stat, ry1, status_w, row_h, &d.real_p1, &state_dirty);
             render_real_checkbox(base_id + 6, x_stat, ry2, status_w, row_h, &d.real_p2, &state_dirty);
+            if running_this_real {
+                live_t := tprintf("{:.1}s", self.stage_elapsed);
+                sdk.draw_text(x_time + 2.0f, ry1 + 6.0f, live_t, 11.0f, sdk.theme_color(.Accent), .Mono);
+            } else {
+                if d.real_p1.time_str.count > 0 {
+                    sdk.draw_text(x_time + 2.0f, ry1 + 6.0f, d.real_p1.time_str, 11.0f, sdk.theme_color(.TextSecondary), .Mono);
+                }
+                if d.real_p2.time_str.count > 0 {
+                    sdk.draw_text(x_time + 2.0f, ry2 + 6.0f, d.real_p2.time_str, 11.0f, sdk.theme_color(.TextSecondary), .Mono);
+                }
+            }
 
             // Optional error line at bottom of card
             if d.last_error.count > 0 {
