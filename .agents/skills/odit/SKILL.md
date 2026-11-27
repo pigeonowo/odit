@@ -77,6 +77,7 @@ description: >-
 - In Onyx plugins, never call `str.free` on empty/static strings (use `sdk.free_str` / `sdk.copy_str` to avoid Wasmer out-of-bounds traps).
 - In Onyx 2611, `main :: (args: [] cstr)` under `onyx run` indexes user args starting at **`0`** (after `--`).
 - Avoid `cast(T) X if cond else 0` inline ternaries with bitwise `|`; use explicit `if` statements.
+- Prefer Onyx's scoped `use x := ...` over `x := ...; defer delete(&x);` for automatic cleanup at scope exit.
 - Keep `odit_onyx_sdk` compatible with `onyx lsp` / `onyx check` (which run under default `-r onyx`).
 
 ---
