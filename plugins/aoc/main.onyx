@@ -428,7 +428,7 @@ spawn_aoc_part :: (self: &AocPlugin, day: u32, part: u32, is_test: bool, stage: 
     if src.count == 0 do src = detect_source_path(day);
 
     test_str := "true" if is_test else "false";
-    args := tprintf("run\n--no-colors\n--param\naoc.day={}\n--param\naoc.part={}\n--param\naoc.test={}\n{}",
+    args := tprintf("run\n--no-colors\n--param\naoc.day={}\n--param\naoc.part={}\n--param\naoc.test={}\n--param\naoc.bench=true\n{}",
                     day, part, test_str, src);
 
     Array.clear(&self.out_buf);
@@ -697,14 +697,22 @@ parse_parts :: (raw_out: str) -> (str, str, str, str) {
         if i == clean.count || clean[i] == '\n' {
             ln := trim_ws(clean[start .. i]);
             if ln.count > 0 {
-                if starts_with_ci(ln, "part 1:") {
-                    p1, t1 = split_answer_and_time(ln[7 .. ln.count]);
+                if starts_with_ci(ln, "part 1 elapsed:") {
+                    t1 = trim_ws(ln[15 .. ln.count]);
+                } elseif starts_with_ci(ln, "part 2 elapsed:") {
+                    t2 = trim_ws(ln[15 .. ln.count]);
+                } elseif starts_with_ci(ln, "part 1:") {
+                    p1, pt := split_answer_and_time(ln[7 .. ln.count]);
+                    if pt.count > 0 do t1 = pt;
                 } elseif starts_with_ci(ln, "part 2:") {
-                    p2, t2 = split_answer_and_time(ln[7 .. ln.count]);
+                    p2, pt := split_answer_and_time(ln[7 .. ln.count]);
+                    if pt.count > 0 do t2 = pt;
                 } elseif starts_with_ci(ln, "p1:") {
-                    p1, t1 = split_answer_and_time(ln[3 .. ln.count]);
+                    p1, pt := split_answer_and_time(ln[3 .. ln.count]);
+                    if pt.count > 0 do t1 = pt;
                 } elseif starts_with_ci(ln, "p2:") {
-                    p2, t2 = split_answer_and_time(ln[3 .. ln.count]);
+                    p2, pt := split_answer_and_time(ln[3 .. ln.count]);
+                    if pt.count > 0 do t2 = pt;
                 } else {
                     fallback_lines << ln;
                 }
@@ -802,7 +810,7 @@ render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
         lbl_w:    f32 = 54.0f;
         play_w:   f32 = 30.0f;
         status_w: f32 = 34.0f;
-        time_w:   f32 = 52.0f;
+        time_w:   f32 = 58.0f;
         gap:      f32 = 6.0f;
         box_w := (cw - 16.0f - lbl_w - play_w - status_w - time_w - gap * 5.0f) * 0.5f;
         if box_w < 48.0f do box_w = 48.0f;
