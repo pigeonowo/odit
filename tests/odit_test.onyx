@@ -441,6 +441,49 @@ main :: () {
 }
 
 @test.tag.{"debugger"}
+@test.it.{"Live debugger instruments multi-line |> / -> chains and switch expressions cleanly"}
+(t: &test.T) {
+    tmp_src := "/tmp/odit_live_dbg_pipe_test.onyx";
+    code := """use core { printf }
+
+double :: (x: i32) -> i32 { return x * 2 }
+add_one :: (x: i32) -> i32 { return x + 1 }
+
+main :: () {
+    val :=
+        10
+        |> double()
+        |> add_one()
+    tag := switch val {
+        case 21 => "ok"
+        case _  => "bad"
+    }
+    printf("{}={}\\n", tag, val)
+}
+""";
+    t->expect_true(os.File.write_contents(tmp_src, code));
+    defer os.remove_file(tmp_src);
+
+    services.dbg_init();
+    services.dbg_toggle_breakpoint(tmp_src, 15);
+    t->expect_eq(services.dbg_start(tmp_src, tmp_src, 15, 1), 0);
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Paused);
+    t->expect_eq(services.g_dbg.current_line, cast(u32) 15);
+
+    found_val := "";
+    for &v in services.g_dbg.locals {
+        if str.equal(v.name, "val") do found_val = v.value;
+    }
+    t->expect_eq(found_val, "21");
+
+    t->expect_eq(services.dbg_command(.Continue, 1), 0);
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Exited);
+    t->expect_eq(services.g_dbg.exit_code, 0);
+    st_js := services.dbg_get_state_json(context.temp_allocator);
+    t->expect_contains(st_js, "ok=21");
+}
+
+@test.tag.{"debugger"}
 @test.it.{"Debugger parses full onyx run commands with --param flags and entry file"}
 (t: &test.T) {
     entry, args, explicit := services.dbg_parse_run_command(

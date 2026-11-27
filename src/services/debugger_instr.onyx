@@ -398,6 +398,26 @@ ends_with_continuation :: (code: str) -> bool {
     return false;
 }
 
+#local
+starts_with_continuation :: (code: str) -> bool {
+    if code.count == 0 do return false;
+    c0 := code[0];
+    if c0 == '.' || c0 == '|' || c0 == '?' || c0 == ':' || c0 == ',' ||
+       c0 == ')' || c0 == ']' || c0 == '+' || c0 == '/' || c0 == '%' ||
+       c0 == '^' || c0 == '&' || c0 == '=' || c0 == '<' || c0 == '>' {
+        return true;
+    }
+    if str.starts_with(code, "->") || str.starts_with(code, "- ") ||
+       str.starts_with(code, "* ") || str.starts_with(code, "!=") {
+        return true;
+    }
+    if starts_with_kw(code, "where") || starts_with_kw(code, "in") ||
+       starts_with_kw(code, "as") || starts_with_kw(code, "do") {
+        return true;
+    }
+    return false;
+}
+
 /// Checks if a single-line loop (`for ... do <body>` or `while ... do <body>`) can be
 /// safely expanded into a braced block with a per-iteration pause hook.
 #local
@@ -584,6 +604,7 @@ instrument_onyx_source :: (src: str, rel_path: str, rt_load_rel: str, is_entry: 
         // Determine if this line is a safe executable statement start
         can_hook := is_stmt_ctx && code.count > 0 &&
                     code[0] != '}' && code[0] != '#' && code[0] != '@' &&
+                    !starts_with_continuation(code) &&
                     !starts_with_kw(code, "else") &&
                     !starts_with_kw(code, "elseif") &&
                     !starts_with_kw(code, "case") &&
