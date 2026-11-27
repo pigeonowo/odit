@@ -690,6 +690,7 @@ parse_parts :: (raw_out: str) -> (str, str, str, str) {
     p2 := "";
     t1 := "";
     t2 := "";
+    pt := "";
     fallback_lines := make([..] str, 8, context.temp_allocator);
 
     start := 0;
@@ -702,16 +703,16 @@ parse_parts :: (raw_out: str) -> (str, str, str, str) {
                 } elseif starts_with_ci(ln, "part 2 elapsed:") {
                     t2 = trim_ws(ln[15 .. ln.count]);
                 } elseif starts_with_ci(ln, "part 1:") {
-                    p1, pt := split_answer_and_time(ln[7 .. ln.count]);
+                    p1, pt = split_answer_and_time(ln[7 .. ln.count]);
                     if pt.count > 0 do t1 = pt;
                 } elseif starts_with_ci(ln, "part 2:") {
-                    p2, pt := split_answer_and_time(ln[7 .. ln.count]);
+                    p2, pt = split_answer_and_time(ln[7 .. ln.count]);
                     if pt.count > 0 do t2 = pt;
                 } elseif starts_with_ci(ln, "p1:") {
-                    p1, pt := split_answer_and_time(ln[3 .. ln.count]);
+                    p1, pt = split_answer_and_time(ln[3 .. ln.count]);
                     if pt.count > 0 do t1 = pt;
                 } elseif starts_with_ci(ln, "p2:") {
-                    p2, pt := split_answer_and_time(ln[3 .. ln.count]);
+                    p2, pt = split_answer_and_time(ln[3 .. ln.count]);
                     if pt.count > 0 do t2 = pt;
                 } else {
                     fallback_lines << ln;
