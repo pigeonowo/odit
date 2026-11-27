@@ -54,7 +54,7 @@ InspectorTab :: enum (i32) {
     default_slot   = 0,
     default_width  = 640.0f,
     default_height = 460.0f,
-    event_mask     = 0xFFFFFFFF,
+    event_mask     = 0x3FF,
     allow_multiple = false,
 }
 DebuggerPlugin :: struct {
@@ -151,17 +151,19 @@ current_run_cmd :: (self: &DebuggerPlugin) -> str {
 }
 
 #local
-load_view_file :: (self: &DebuggerPlugin, path: str, focus_line: u32) {
+load_view_file :: (self: &DebuggerPlugin, path: str, focus_line: u32, force_reload: bool = false, scroll_to_line: bool = true) {
     if path.count == 0 do return;
     set_default_cmd(self, path);
-    if !str.equal(path, self.view_path) || self.src_lines.count == 0 {
+    if force_reload || !str.equal(path, self.view_path) || self.src_lines.count == 0 {
         sdk.free_str(self.view_path);
         self.view_path = sdk.copy_str(path);
         src := sdk.workspace_read_file(path, context.temp_allocator);
         split_into_lines(&self.src_lines, src);
     }
     self.view_line = focus_line;
-    self.auto_scroll_req = true;
+    if scroll_to_line && focus_line > 0 {
+        self.auto_scroll_req = true;
+    }
 }
 
 #local
@@ -169,6 +171,8 @@ apply_state_json :: (self: &DebuggerPlugin, js: str) {
     if js.count == 0 do return;
 
     prev_status := self.status;
+    prev_line   := self.current_line;
+    prev_path   := str.temp_copy(self.source_path);
     self.status           = cast(abi.DebugStatus) sdk.json_get_i32(js, "status");
     self.current_line     = cast(u32) sdk.json_get_i32(js, "current_line");
     self.exit_code        = sdk.json_get_i32(js, "exit_code");
@@ -242,7 +246,9 @@ apply_state_json :: (self: &DebuggerPlugin, js: str) {
     }
 
     if self.source_path.count > 0 {
-        load_view_file(self, self.source_path, self.current_line);
+        moved := self.current_line != prev_line || !str.equal(self.source_path, prev_path) || self.status != prev_status;
+        restarted := prev_status != .Running && prev_status != .Paused && (self.status == .Running || self.status == .Paused);
+        load_view_file(self, self.source_path, self.current_line, restarted, moved);
     }
     refresh_breakpoints(self);
 }
@@ -333,13 +339,11 @@ on_event :: (self: &DebuggerPlugin, window_id: u32, event: sdk.Event) {
                 self.needs_sync = true;
             }
         }
-        case .Raw as raw {
-            if raw.type == .DebugStateChanged {
-                if raw.payload.count > 0 {
-                    apply_state_json(self, str.{ raw.payload.data, raw.payload.count });
-                } else {
-                    self.needs_sync = true;
-                }
+        case .DebugStateChanged as js {
+            if js.count > 0 {
+                apply_state_json(self, js);
+            } else {
+                self.needs_sync = true;
             }
         }
         case _ {}
@@ -411,8 +415,8 @@ render :: (self: &DebuggerPlugin, window_id: u32, ctx: &abi.FrameContext) {
         bx += 52.0f + gap;
     } else {
         sdk.on_click(1, bx, y, 82.0f, btn_h, "Debug (F5)", .Primary) {
-            rc := sdk.debug_start(current_run_cmd(self));
-            if rc != 0 do self.needs_sync = true;
+            sdk.debug_start(current_run_cmd(self));
+            self.needs_sync = true;
         };
         bx += 82.0f + gap;
     }
