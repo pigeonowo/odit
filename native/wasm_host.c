@@ -209,6 +209,11 @@ static const HostOpSpec g_host_ops[] = {
     { "host_register_setting",       9 },
     { "host_get_setting",            10 },
     { "host_set_setting",            11 },
+    { "host_get_clipboard",          12 },
+    { "host_open_url",               13 },
+    { "storage_read",                14 },
+    { "storage_write",               15 },
+    { "storage_delete",              16 },
 
     // B. UI Drawing Primitives & Immediate Widgets (20..49)
     { "ui_push_clip",                20 },
@@ -236,6 +241,11 @@ static const HostOpSpec g_host_ops[] = {
     { "audio_play",                  42 },
     { "audio_unload",                43 },
     { "audio_load_memory",           44 },
+    { "ui_get_scale",                45 },
+    { "ui_checkbox",                 46 },
+    { "ui_slider_f32",               47 },
+    { "ui_draw_text_wrapped",        48 },
+    { "ui_tooltip",                  49 },
 
     // C. Workspace, Editor, AST/LSP & Docs (50..79)
     { "workspace_get_root",          50 },
@@ -255,8 +265,15 @@ static const HostOpSpec g_host_ops[] = {
     { "ast_get_diagnostics",         64 },
     { "docs_search",                 65 },
     { "workspace_write_file",        66 },
+    { "editor_insert_text",          67 },
+    { "editor_get_selection",        68 },
+    { "editor_replace_range",        69 },
+    { "editor_save",                 70 },
+    { "workspace_file_exists",       71 },
+    { "workspace_delete_file",       72 },
+    { "workspace_mkdir",             73 },
 
-    // D. Process & Compiler / WAT (80..89)
+    // D. Process, Async HTTP & Compiler / WAT (80..89)
     { "proc_spawn",                  80 },
     { "proc_poll_status",            81 },
     { "proc_read_output",            82 },
@@ -264,13 +281,16 @@ static const HostOpSpec g_host_ops[] = {
     { "compiler_build",              84 },
     { "compiler_get_function_wat",   85 },
     { "proc_write_input",            86 },
+    { "http_fetch",                  87 },
 
-    // E. Live Debugger (90..99)
+    // E. Live Debugger & Extended UI Media/Table (90..99)
     { "debug_toggle_breakpoint",     90 },
     { "debug_get_breakpoints",       91 },
     { "debug_start",                 92 },
     { "debug_command",               93 },
     { "debug_get_state",             94 },
+    { "ui_texture_load_memory",      95 },
+    { "ui_table_get_row_y",          96 },
 
     { NULL, 0 }
 };

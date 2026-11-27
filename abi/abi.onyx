@@ -30,7 +30,7 @@ use runtime
 // -----------------------------------------------------------------------------
 
 ABI_VERSION_MAJOR :: 1
-ABI_VERSION_MINOR :: 0
+ABI_VERSION_MINOR :: 1
 ABI_VERSION_PATCH :: 0
 ABI_VERSION       :: (ABI_VERSION_MAJOR << 16) | (ABI_VERSION_MINOR << 8) | ABI_VERSION_PATCH
 
@@ -438,6 +438,11 @@ DebugState :: struct {
         host_execute_command  :: (id_ptr: u32, id_len: u32, arg_ptr: u32, arg_len: u32) -> i32 ---
         host_spawn_plugin     :: (plugin_id_ptr: u32, plugin_id_len: u32) -> u32 ---
         host_set_clipboard    :: (text_ptr: u32, text_len: u32) -> void ---
+        host_get_clipboard    :: (out_ptr: u32, out_cap: u32) -> i32 ---
+        host_open_url         :: (url_ptr: u32, url_len: u32) -> i32 ---
+        storage_read          :: (key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        storage_write         :: (key_ptr: u32, key_len: u32, data_ptr: u32, data_len: u32) -> i32 ---
+        storage_delete        :: (key_ptr: u32, key_len: u32) -> i32 ---
         host_register_setting :: (key_ptr: u32, key_len: u32, label_ptr: u32, label_len: u32, kind: u32, def_ptr: u32, def_len: u32) -> u32 ---
         host_get_setting      :: (key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
         host_set_setting      :: (key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32 ---
@@ -448,17 +453,22 @@ DebugState :: struct {
         ui_pop_clip          :: () -> void ---
         ui_measure_text      :: (text_ptr: u32, text_len: u32, font_size: f32, flags: u32) -> f32 ---
         ui_get_theme_color   :: (role: u32) -> u32 ---
+        ui_get_scale         :: () -> f32 ---
 
         ui_draw_rect         :: (x: f32, y: f32, w: f32, h: f32, radius: f32, fill_rgba: u32, border_rgba: u32, border_width: f32) -> void ---
         ui_draw_line         :: (x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, rgba: u32) -> void ---
         ui_draw_arrow        :: (x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, head_size: f32, rgba: u32) -> void ---
         ui_draw_circle       :: (cx: f32, cy: f32, radius: f32, fill_rgba: u32, border_rgba: u32, border_width: f32) -> void ---
         ui_draw_text         :: (x: f32, y: f32, text_ptr: u32, text_len: u32, font_size: f32, rgba: u32, flags: u32) -> void ---
+        ui_draw_text_wrapped :: (x: f32, y: f32, max_w: f32, text_ptr: u32, text_len: u32, font_size: f32, rgba: u32, flags: u32) -> f32 ---
 
         ui_pill              :: (x: f32, y: f32, text_ptr: u32, text_len: u32, bg_rgba: u32, fg_rgba: u32) -> f32 ---
         ui_button            :: (id: u32, x: f32, y: f32, w: f32, h: f32, label_ptr: u32, label_len: u32, style_flags: u32) -> u32 ---
         ui_input             :: (id: u32, x: f32, y: f32, w: f32, h: f32, buf_ptr: u32, buf_len: u32, buf_cap: u32, placeholder_ptr: u32, placeholder_len: u32, out_len_ptr: u32) -> u32 ---
         ui_dropdown          :: (id: u32, x: f32, y: f32, w: f32, h: f32, items_ptr: u32, items_len: u32, selected_idx: i32) -> i32 ---
+        ui_checkbox          :: (id: u32, x: f32, y: f32, label_ptr: u32, label_len: u32, checked_ptr: u32) -> u32 ---
+        ui_slider_f32        :: (id: u32, x: f32, y: f32, w: f32, label_ptr: u32, label_len: u32, val_ptr: u32, min_v: f32, max_v: f32) -> u32 ---
+        ui_tooltip           :: (text_ptr: u32, text_len: u32) -> void ---
 
         ui_scroll_area_begin :: (id: u32, x: f32, y: f32, w: f32, h: f32, content_h: f32, scroll_y_ptr: u32) -> void ---
         ui_scroll_area_end   :: () -> void ---
@@ -466,10 +476,12 @@ DebugState :: struct {
         ui_table_begin       :: (id: u32, x: f32, y: f32, w: f32, h: f32, col_count: u32, headers_ptr: u32, headers_len: u32, col_widths_ptr: u32) -> void ---
         ui_table_row         :: (row_id: u32, cells_ptr: u32, cells_len: u32, flags: u32) -> u32 ---
         ui_table_end         :: () -> void ---
+        ui_table_get_row_y   :: () -> f32 ---
 
-        ui_texture_load      :: (path_ptr: u32, path_len: u32) -> u32 ---
-        ui_texture_unload    :: (handle: u32) -> void ---
-        ui_draw_texture      :: (handle: u32, x: f32, y: f32, w: f32, h: f32, tint_rgba: u32) -> void ---
+        ui_texture_load        :: (path_ptr: u32, path_len: u32) -> u32 ---
+        ui_texture_load_memory :: (data_ptr: u32, data_len: u32, ext_ptr: u32, ext_len: u32) -> u32 ---
+        ui_texture_unload      :: (handle: u32) -> void ---
+        ui_draw_texture        :: (handle: u32, x: f32, y: f32, w: f32, h: f32, tint_rgba: u32) -> void ---
 
         audio_load           :: (path_ptr: u32, path_len: u32) -> u32 ---
         audio_load_memory    :: (data_ptr: u32, data_len: u32, ext_ptr: u32, ext_len: u32) -> u32 ---
@@ -478,11 +490,14 @@ DebugState :: struct {
 
         // ---- C. Workspace, Editor Buffer, AST / LSP & Docs ----
 
-        workspace_get_root   :: (out_ptr: u32, out_cap: u32) -> i32 ---
-        workspace_list_dir   :: (rel_path_ptr: u32, rel_path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
-        workspace_read_file  :: (rel_path_ptr: u32, rel_path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
-        workspace_write_file :: (rel_path_ptr: u32, rel_path_len: u32, data_ptr: u32, data_len: u32) -> i32 ---
-        workspace_find_files :: (ext_ptr: u32, ext_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        workspace_get_root    :: (out_ptr: u32, out_cap: u32) -> i32 ---
+        workspace_list_dir    :: (rel_path_ptr: u32, rel_path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        workspace_read_file   :: (rel_path_ptr: u32, rel_path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        workspace_write_file  :: (rel_path_ptr: u32, rel_path_len: u32, data_ptr: u32, data_len: u32) -> i32 ---
+        workspace_find_files  :: (ext_ptr: u32, ext_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
+        workspace_file_exists :: (rel_path_ptr: u32, rel_path_len: u32) -> u32 ---
+        workspace_delete_file :: (rel_path_ptr: u32, rel_path_len: u32) -> i32 ---
+        workspace_mkdir       :: (rel_path_ptr: u32, rel_path_len: u32) -> i32 ---
 
         editor_get_active_path      :: (out_ptr: u32, out_cap: u32) -> i32 ---
         editor_get_buffer_len       :: () -> i32 ---
@@ -492,19 +507,24 @@ DebugState :: struct {
         editor_set_cursor           :: (line: i32, col: i32) -> void ---
         editor_set_gutter_marker    :: (path_ptr: u32, path_len: u32, line: i32, kind: u32, rgba: u32) -> void ---
         editor_clear_gutter_markers :: (kind: u32) -> void ---
+        editor_insert_text          :: (text_ptr: u32, text_len: u32) -> i32 ---
+        editor_get_selection        :: (out_ptr: u32, out_cap: u32) -> i32 ---
+        editor_replace_range        :: (start_line: i32, start_col: i32, end_line: i32, end_col: i32, text_ptr: u32, text_len: u32) -> i32 ---
+        editor_save                 :: () -> i32 ---
 
         ast_get_symbols      :: (path_ptr: u32, path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
         ast_get_references   :: (path_ptr: u32, path_len: u32, line: u32, col: u32, out_ptr: u32, out_cap: u32) -> i32 ---
         ast_get_diagnostics  :: (path_ptr: u32, path_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
         docs_search          :: (query_ptr: u32, query_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---
 
-        // ---- D. Process Execution & Compiler / WAT Disassembly ----
+        // ---- D. Process Execution, Async HTTP & Compiler / WAT Disassembly ----
 
         proc_spawn           :: (cmd_ptr: u32, cmd_len: u32, args_ptr: u32, args_len: u32, cwd_ptr: u32, cwd_len: u32) -> u32 ---
         proc_poll_status     :: (handle: u32, out_exit_code_ptr: u32) -> u32 ---
         proc_read_output     :: (handle: u32, stream_mask: u32, out_ptr: u32, out_cap: u32) -> i32 ---
         proc_write_input     :: (handle: u32, data_ptr: u32, data_len: u32) -> i32 ---
         proc_kill            :: (handle: u32) -> i32 ---
+        http_fetch           :: (url_ptr: u32, url_len: u32) -> u32 ---
 
         compiler_build            :: (entry_ptr: u32, entry_len: u32, target: u32, flags: u32) -> u32 ---
         compiler_get_function_wat :: (file_ptr: u32, file_len: u32, func_ptr: u32, func_len: u32, out_ptr: u32, out_cap: u32) -> i32 ---

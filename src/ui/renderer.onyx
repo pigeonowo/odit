@@ -32,6 +32,7 @@ TableState :: struct {
     id:         u32;
     x, y, w, h: f32;
     cur_y:      f32;
+    last_row_y: f32; // Last rendered row's window-local Y
     col_count:  u32;
     col_widths: [16] f32;
     row_index:  u32;
@@ -72,13 +73,16 @@ UiContext :: struct {
     key_tab:       bool;
     key_paste:     bool;
 
-    // Persistent focused text input across frames
+    // Persistent focused text input & active drag slider across frames
     focused_input_win: u32;
     focused_input_id:  u32;
+    active_slider_win: u32;
+    active_slider_id:  u32;
     last_click_time:   f64;
     last_click_x:      f32;
     last_click_y:      f32;
     blink_timer:       f32;
+    tooltip_text:      str;
 
     // Nested scissor clip stack
     clip_stack:    [16] ClipRect;
@@ -100,6 +104,7 @@ g_ui: UiContext;
 ui_begin_frame :: (dt: f32, capture_keys_for_plugins: bool) {
     g_ui.dt = dt;
     g_ui.blink_timer += dt;
+    g_ui.tooltip_text = "";
 
     mpos := raylib.GetMousePosition();
     g_ui.mouse_x = mpos.x;
@@ -108,6 +113,10 @@ ui_begin_frame :: (dt: f32, capture_keys_for_plugins: bool) {
     g_ui.mouse_down    = raylib.IsMouseButtonDown(.LEFT);
     g_ui.mouse_pressed = raylib.IsMouseButtonPressed(.LEFT);
     g_ui.mouse_dbl     = false;
+    if !g_ui.mouse_down {
+        g_ui.active_slider_win = 0;
+        g_ui.active_slider_id  = 0;
+    }
 
     if g_ui.mouse_pressed {
         now := raylib.GetTime();
@@ -624,7 +633,8 @@ ui_table_begin :: (id: u32, x, y, w, h: f32, col_count: u32, headers: str, col_w
     }
 
     push_clip_screen(sx, sy + header_h, w, h - header_h);
-    g_ui.table.cur_y = sy + header_h;
+    g_ui.table.cur_y      = sy + header_h;
+    g_ui.table.last_row_y = (sy + header_h) - g_ui.origin_y + g_ui.scroll_offset;
 }
 
 ui_table_row :: (row_id: u32, cells: str, flags: u32) -> u32 {
@@ -635,6 +645,7 @@ ui_table_row :: (row_id: u32, cells: str, flags: u32) -> u32 {
     cell_fs: f32 = 13.0f * s;
     rx := g_ui.table.x;
     ry := g_ui.table.cur_y;
+    g_ui.table.last_row_y = ry - g_ui.origin_y + g_ui.scroll_offset;
     rw := g_ui.table.w;
     rflags := cast(abi.TableRowFlags) flags;
 
@@ -684,6 +695,233 @@ ui_table_end :: () {
     if !g_ui.table.active do return;
     g_ui.table.active = false;
     ui_pop_clip();
+}
+
+ui_table_get_row_y :: () -> f32 {
+    return g_ui.table.last_row_y;
+}
+
+ui_checkbox :: (id: u32, x, y: f32, label: str, checked: &bool) -> u32 {
+    s := settings.g_settings.ui_scale;
+    box_sz := 16.0f * s;
+    fs     := 13.0f * s;
+    sx     := to_screen_x(x);
+    sy     := to_screen_y(y);
+    tw     := theme.measure_text(label, fs) if (!g_ui.headless && label.count > 0) else cast(f32) label.count * fs * 0.6f;
+    hit_w  := box_sz + (8.0f * s + tw if label.count > 0 else 0.0f);
+    hit_h  := box_sz + 4.0f * s;
+
+    hovered := g_ui.hovered &&
+               point_in_clip(g_ui.mouse_x, g_ui.mouse_y) &&
+               point_in_rect(g_ui.mouse_x, g_ui.mouse_y, sx, sy, hit_w, hit_h);
+    clicked := hovered && g_ui.mouse_pressed;
+    changed := false;
+    if clicked {
+        *checked = !(*checked);
+        changed = true;
+    }
+
+    if !g_ui.headless {
+        by := sy + (hit_h - box_sz) * 0.5f;
+        bg := theme.get_color(.Accent) if *checked else theme.get_color(.BgSurface);
+        bd := theme.get_color(.BorderFocused) if (hovered || *checked) else theme.get_color(.Border);
+        theme.draw_rect(sx, by, box_sz, box_sz, bg, 3.0f, bd, 1.0f);
+        if *checked {
+            // Draw crisp checkmark inside box
+            col := theme.rgba_to_rl(0x11111BFF);
+            p1 := raylib.Vector2.{ sx + box_sz * 0.22f, by + box_sz * 0.52f };
+            p2 := raylib.Vector2.{ sx + box_sz * 0.44f, by + box_sz * 0.74f };
+            p3 := raylib.Vector2.{ sx + box_sz * 0.78f, by + box_sz * 0.28f };
+            raylib.DrawLineEx(p1, p2, 2.0f * s, col);
+            raylib.DrawLineEx(p2, p3, 2.0f * s, col);
+        }
+        if label.count > 0 {
+            theme.draw_text(sx + box_sz + 8.0f * s, sy + (hit_h - fs) * 0.5f, label, fs, theme.get_color(.TextPrimary));
+        }
+    }
+
+    res: u32 = 0;
+    if hovered do res |= cast(u32) abi.WidgetState.Hovered;
+    if clicked do res |= cast(u32) abi.WidgetState.Clicked;
+    if changed do res |= cast(u32) abi.WidgetState.Changed;
+    return res;
+}
+
+ui_slider_f32 :: (id: u32, x, y, w: f32, label: str, val: &f32, min_v, max_v: f32) -> u32 {
+    s := settings.g_settings.ui_scale;
+    fs := 12.0f * s;
+    track_h := 6.0f * s;
+    knob_r  := 7.0f * s;
+    sx := to_screen_x(x);
+    sy := to_screen_y(y);
+
+    lbl_h := (fs + 4.0f * s) if label.count > 0 else 0.0f;
+    track_y := sy + lbl_h + knob_r;
+    hit_h   := lbl_h + knob_r * 2.0f + 4.0f * s;
+
+    hovered := g_ui.hovered &&
+               point_in_clip(g_ui.mouse_x, g_ui.mouse_y) &&
+               point_in_rect(g_ui.mouse_x, g_ui.mouse_y, sx - 4.0f, sy, w + 8.0f, hit_h);
+
+    if hovered && g_ui.mouse_pressed {
+        g_ui.active_slider_win = g_ui.window_id;
+        g_ui.active_slider_id  = id;
+    }
+
+    active := g_ui.mouse_down &&
+              g_ui.active_slider_win == g_ui.window_id &&
+              g_ui.active_slider_id  == id;
+
+    changed := false;
+    span := max_v - min_v;
+    if span <= 0.00001f do span = 1.0f;
+
+    if active && w > 1.0f {
+        t := (g_ui.mouse_x - sx) / w;
+        if t < 0.0f do t = 0.0f;
+        if t > 1.0f do t = 1.0f;
+        nv := min_v + t * span;
+        if math.abs(nv - *val) > 0.0001f {
+            *val = nv;
+            changed = true;
+        }
+    }
+
+    t_norm := (*val - min_v) / span;
+    if t_norm < 0.0f do t_norm = 0.0f;
+    if t_norm > 1.0f do t_norm = 1.0f;
+
+    if !g_ui.headless {
+        if label.count > 0 {
+            theme.draw_text(sx, sy, label, fs, theme.get_color(.TextSecondary));
+            vtxt := core.tprintf("{:.2}", *val);
+            vw := theme.measure_text(vtxt, fs);
+            theme.draw_text(sx + w - vw, sy, vtxt, fs, theme.get_color(.TextPrimary));
+        }
+        theme.draw_rect(sx, track_y - track_h * 0.5f, w, track_h, theme.get_color(.BgSurface), track_h * 0.5f, theme.get_color(.Border), 1.0f);
+        fill_w := w * t_norm;
+        if fill_w > 1.0f {
+            theme.draw_rect(sx, track_y - track_h * 0.5f, fill_w, track_h, theme.get_color(.Accent), track_h * 0.5f);
+        }
+        kx := sx + fill_w;
+        knob_col := theme.get_color(.BorderFocused) if (active || hovered) else theme.get_color(.TextPrimary);
+        raylib.DrawCircleV(.{ kx, track_y }, knob_r, theme.rgba_to_rl(knob_col));
+    }
+
+    res: u32 = 0;
+    if hovered do res |= cast(u32) abi.WidgetState.Hovered;
+    if active  do res |= cast(u32) abi.WidgetState.Active;
+    if changed do res |= cast(u32) abi.WidgetState.Changed;
+    return res;
+}
+
+ui_draw_text_wrapped :: (x, y, max_w: f32, text: str, font_size: f32, rgba: u32, flags: u32) -> f32 {
+    if text.count == 0 do return 0.0f;
+    s := settings.g_settings.ui_scale;
+    fs := font_size * s;
+    lh := (font_size + 4.0f) * s;
+    eff_w := max_w if max_w > 20.0f else 200.0f;
+    sx := to_screen_x(x);
+    sy := to_screen_y(y);
+    tflags := cast(abi.TextFlags) flags;
+
+    cur_y := sy;
+    i := 0;
+    while i < text.count {
+        // Find end of logical line
+        line_end := i;
+        while line_end < text.count && text[line_end] != '\n' do line_end += 1;
+        seg := text[i .. line_end];
+
+        if seg.count == 0 {
+            cur_y += lh;
+        } else {
+            pos := 0;
+            while pos < seg.count {
+                // Skip leading spaces on wrapped continuation lines
+                if pos > 0 {
+                    while pos < seg.count && seg[pos] == ' ' do pos += 1;
+                    if pos >= seg.count do break;
+                }
+                end := pos;
+                last_space := -1;
+                while end < seg.count {
+                    if seg[end] == ' ' do last_space = end;
+                    cand := seg[pos .. (end + 1)];
+                    cw := theme.measure_text(cand, fs) if !g_ui.headless else cast(f32) cand.count * fs * 0.6f;
+                    if cw > eff_w && end > pos {
+                        if last_space > pos do end = last_space;
+                        break;
+                    }
+                    end += 1;
+                }
+                chunk := seg[pos .. end];
+                if !g_ui.headless && chunk.count > 0 {
+                    theme.draw_text(sx, cur_y, chunk, fs, rgba);
+                    if tflags & .Bold {
+                        theme.draw_text(sx + 0.6f, cur_y, chunk, fs, rgba);
+                    }
+                }
+                cur_y += lh;
+                pos = end;
+            }
+        }
+        i = line_end + 1;
+    }
+
+    return cur_y - sy;
+}
+
+ui_tooltip :: (text: str) {
+    if text.count == 0 do return;
+    g_ui.tooltip_text = str.copy(text, context.temp_allocator);
+}
+
+ui_draw_tooltip :: () {
+    if g_ui.headless || g_ui.tooltip_text.count == 0 do return;
+    s := settings.g_settings.ui_scale;
+    fs := 12.0f * s;
+    pad_x := 8.0f * s;
+    pad_y := 5.0f * s;
+    tw := theme.measure_text(g_ui.tooltip_text, fs);
+    bw := tw + pad_x * 2.0f;
+    bh := fs + pad_y * 2.0f;
+
+    sw := cast(f32) raylib.GetScreenWidth();
+    sh := cast(f32) raylib.GetScreenHeight();
+    bx := g_ui.mouse_x + 14.0f;
+    by := g_ui.mouse_y + 18.0f;
+    if bx + bw > sw - 8.0f do bx = sw - bw - 8.0f;
+    if by + bh > sh - 8.0f do by = g_ui.mouse_y - bh - 8.0f;
+    if bx < 4.0f do bx = 4.0f;
+    if by < 4.0f do by = 4.0f;
+
+    theme.draw_rect(bx, by, bw, bh, theme.get_color(.BgHeader), 5.0f, theme.get_color(.BorderFocused), 1.0f);
+    theme.draw_text(bx + pad_x, by + pad_y, g_ui.tooltip_text, fs, theme.get_color(.TextPrimary));
+}
+
+ui_texture_load_memory :: (data: [] u8, ext: str) -> u32 {
+    if g_ui.headless || data.count == 0 do return 0;
+    dot_ext := ".png";
+    if ext.count > 0 {
+        dot_ext = ext if ext[0] == '.' else core.tprintf(".{}", ext);
+    }
+
+    for i in 0 .. 64 {
+        if !g_ui.textures[i].in_use {
+            tmp_path := core.tprintf("/tmp/odit_tex_{}{}", i + 1, dot_ext);
+            if !core.os.File.write_contents(tmp_path, str.{ data.data, data.count }) do return 0;
+            defer core.os.remove_file(tmp_path);
+
+            slot := &g_ui.textures[i];
+            raylib.LoadTexture(theme.to_temp_cstr(tmp_path), &slot.texture);
+            if slot.texture.id == 0 do return 0;
+            slot.in_use = true;
+            slot.is_anim = false;
+            return cast(u32) (i + 1);
+        }
+    }
+    return 0;
 }
 
 ui_texture_load :: (path: str) -> u32 {

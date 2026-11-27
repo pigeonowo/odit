@@ -1,4 +1,4 @@
-# Host-to-WASM Plugin ABI Reference (v1.0.0)
+# Host-to-WASM Plugin ABI Reference (v1.1.0)
 
 The canonical ABI definition lives in [`abi/abi.onyx`](../abi/abi.onyx). Both the native host (`-r onyx`) and every WASM plugin (`-r js --wasm-mvp` or `-r custom`) `#load` this exact file.
 
@@ -67,8 +67,11 @@ When using the declarative decorators in [`sdk/plugin_sdk.onyx`](../sdk/plugin_s
 | `9` | `host_register_setting(key..., label..., kind, default...) -> u32` | Live |
 | `10` | `host_get_setting(key..., out_ptr, out_cap) -> i32` | Live |
 | `11` | `host_set_setting(key..., val_ptr, val_len) -> i32` | Live |
+| `12` | `host_get_clipboard(out_ptr, out_cap) -> i32` | Live |
+| `13` | `host_open_url(url_ptr, url_len) -> i32` | Live |
+| `14–16` | `storage_read`, `storage_write`, `storage_delete` (plugin-scoped `~/.config/odit/plugin_data/<id>/`) | Live |
 
-### B. UI Drawing & Immediate Widgets (`20..49`)
+### B. UI Drawing & Immediate Widgets (`20..49`, `95..96`)
 All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped to the pane.
 
 | Opcode | Function | Status |
@@ -81,6 +84,8 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
 | `35–37` | `ui_table_begin` / `ui_table_row` / `ui_table_end` | Live |
 | `38–40` | `ui_texture_load`, `ui_texture_unload`, `ui_draw_texture` | Live |
 | `41–44` | `audio_load(path...)`, `audio_play(handle, volume)`, `audio_unload(handle)`, `audio_load_memory(data..., ext...)` | Live |
+| `45–49` | `ui_get_scale`, `ui_checkbox`, `ui_slider_f32`, `ui_draw_text_wrapped`, `ui_tooltip` | Live |
+| `95–96` | `ui_texture_load_memory(data..., ext...)`, `ui_table_get_row_y()` | Live |
 
 ### C. Workspace, Editor, AST/LSP & Docs (`50..79`)
 | Opcode | Function | Status |
@@ -91,14 +96,17 @@ All coordinates are window-local `(0, 0) .. (ctx.width, ctx.height)` and clipped
 | `62–64` | `ast_get_symbols`, `ast_get_references`, `ast_get_diagnostics` | Live |
 | `65` | `docs_search(query...)` | Live |
 | `66` | `workspace_write_file(rel_path..., data...)` | Live |
+| `67–70` | `editor_insert_text`, `editor_get_selection`, `editor_replace_range`, `editor_save` | Live |
+| `71–73` | `workspace_file_exists`, `workspace_delete_file`, `workspace_mkdir` | Live |
 
-### D. Process, Compiler & WAT (`80..89`)
+### D. Process, Async HTTP, Compiler & WAT (`80..89`)
 | Opcode | Function | Status |
 | :---: | :--- | :---: |
 | `80–83` | `proc_spawn`, `proc_poll_status`, `proc_read_output`, `proc_kill` | Live |
 | `84` | `compiler_build(entry..., target, flags)` | Live |
 | `85` | `compiler_get_function_wat(file..., func..., out...)` | Live |
 | `86` | `proc_write_input(handle, data_ptr, data_len)` | Live |
+| `87` | `http_fetch(url_ptr, url_len) -> proc_handle` (async HTTP GET via `proc_poll`/`proc_read`) | Live |
 
 ### E. Live Debugger (`90..99`)
 | Opcode | Function | Status |

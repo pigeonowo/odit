@@ -70,6 +70,51 @@ sanitize_rel_path :: (rel: str) -> ? str {
     return core.tprintf("{}/{}", g_host_ctx.workspace_root, rel);
 }
 
+#local
+sanitize_storage_segment :: (s: str) -> str {
+    if s.count == 0 do return "";
+    out := make([..] u8, s.count, context.temp_allocator);
+    for i in 0 .. s.count {
+        c := s[i];
+        ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if ok do out << c;
+        else  do out << '_';
+    }
+    res := str.{ out.data, out.count };
+    if str.equal(res, ".") || str.equal(res, "..") || str.contains(res, "..") do return "";
+    return res;
+}
+
+#local
+resolve_storage_path :: (handle: u32, key: str, create_dirs: bool) -> ? str {
+    safe_key := sanitize_storage_segment(key);
+    if safe_key.count == 0 do return .None;
+    pid := "default";
+    if pane := wm.wm_find_pane_by_handle(g_host_ctx.window_mgr, handle); pane != null && pane.plugin_id.count > 0 {
+        sp := sanitize_storage_segment(pane.plugin_id);
+        if sp.count > 0 do pid = sp;
+    }
+    base_dir := ".odit/plugin_data";
+    if h := os.env("HOME", context.temp_allocator); h && h->unwrap().count > 0 {
+        cfg := core.tprintf("{}/.config", h->unwrap());
+        od  := core.tprintf("{}/odit", cfg);
+        pd  := core.tprintf("{}/plugin_data", od);
+        if create_dirs {
+            if !os.Directory.exists(cfg) do os.Directory.create(cfg);
+            if !os.Directory.exists(od)  do os.Directory.create(od);
+            if !os.Directory.exists(pd)  do os.Directory.create(pd);
+        }
+        base_dir = pd;
+    } elseif create_dirs {
+        if !os.Directory.exists(".odit") do os.Directory.create(".odit");
+        if !os.Directory.exists(base_dir) do os.Directory.create(base_dir);
+    }
+    pdir := core.tprintf("{}/{}", base_dir, pid);
+    if create_dirs && !os.Directory.exists(pdir) do os.Directory.create(pdir);
+    return core.tprintf("{}/{}", pdir, safe_key);
+}
+
 #export "__odit_host_dispatch" __odit_host_dispatch
 __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
     g_host_scratch[12] = 0;
@@ -156,6 +201,81 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
             val := guest_read_str(handle, arg_u32(2), arg_u32(3));
             ok := settings.settings_set_plugin(key, val);
             ret_i32(0 if ok else cast(i32) abi.AbiError.NotFound);
+        }
+
+        case 12 { // host_get_clipboard(out_ptr, out_cap) -> i32
+            if ui.g_ui.headless {
+                ret_i32(0);
+            } else {
+                cp := raylib.GetClipboardText();
+                txt := "";
+                if cp.data != 0 {
+                    n := core.cptr.extract_str(cp, .[]);
+                    if n > 0 {
+                        tmp := make([] u8, cast(i32) n, context.temp_allocator);
+                        core.cptr.extract_str(cp, tmp);
+                        txt = str.{ tmp.data, tmp.count };
+                    }
+                }
+                ret_i32(guest_write_out(handle, txt, arg_u32(0), arg_u32(1)));
+            }
+        }
+
+        case 13 { // host_open_url(url_ptr, url_len) -> i32
+            url := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            if !str.starts_with(url, "http://") && !str.starts_with(url, "https://") {
+                ret_i32(cast(i32) abi.AbiError.PermissionDenied);
+            } else {
+                cmd := "xdg-open";
+                cwd := g_host_ctx.workspace_root;
+                ph := native_proc_spawn(cmd.data, cmd.count, url.data, url.count, cwd.data, cwd.count);
+                ret_i32(0 if ph != 0 else cast(i32) abi.AbiError.ProcessFailed);
+            }
+        }
+
+        case 14 { // storage_read(key_ptr, key_len, out_ptr, out_cap) -> i32
+            key := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            if sp := resolve_storage_path(handle, key, false); sp {
+                fp := sp->unwrap();
+                if os.file_exists(fp) {
+                    data := os.get_contents(fp);
+                    defer delete(&data);
+                    ret_i32(guest_write_out(handle, data, arg_u32(2), arg_u32(3)));
+                } else {
+                    ret_i32(cast(i32) abi.AbiError.NotFound);
+                }
+            } else {
+                ret_i32(cast(i32) abi.AbiError.InvalidArg);
+            }
+        }
+
+        case 15 { // storage_write(key_ptr, key_len, data_ptr, data_len) -> i32
+            key  := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            data := guest_read_str(handle, arg_u32(2), arg_u32(3));
+            if sp := resolve_storage_path(handle, key, true); sp {
+                if os.File.write_contents(sp->unwrap(), data) {
+                    ret_i32(cast(i32) data.count);
+                } else {
+                    ret_i32(cast(i32) abi.AbiError.Unknown);
+                }
+            } else {
+                ret_i32(cast(i32) abi.AbiError.InvalidArg);
+            }
+        }
+
+        case 16 { // storage_delete(key_ptr, key_len) -> i32
+            key := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            if sp := resolve_storage_path(handle, key, false); sp {
+                fp := sp->unwrap();
+                if os.file_exists(fp) {
+                    os.remove_file(fp);
+                    ret_i32(0);
+                } else {
+                    ret_i32(cast(i32) abi.AbiError.NotFound);
+                }
+            } else {
+                ret_i32(cast(i32) abi.AbiError.InvalidArg);
+            }
         }
 
         // ---- B. UI Drawing Primitives & Immediate Widgets (20..49) ----
@@ -335,6 +455,46 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
                     ret_u32(0);
                 }
             }
+        }
+
+        case 45 { // ui_get_scale() -> f32
+            ret_f32(settings.g_settings.ui_scale);
+        }
+
+        case 46 { // ui_checkbox(id, x, y, label_ptr, label_len, checked_ptr) -> u32
+            lbl  := guest_read_str(handle, arg_u32(3), arg_u32(4));
+            cptr := arg_u32(5);
+            cbyte: u8 = 0;
+            if cptr != 0 do wasm_plugin_mem_read(handle, cptr, &cbyte, 1);
+            chk := cbyte != 0;
+            res := ui.ui_checkbox(arg_u32(0), arg_f32(1), arg_f32(2), lbl, &chk);
+            if cptr != 0 && (res & cast(u32) abi.WidgetState.Changed) != 0 {
+                nb: u8 = cast(u8) (1 if chk else 0);
+                wasm_plugin_mem_write(handle, cptr, &nb, 1);
+            }
+            ret_u32(res);
+        }
+
+        case 47 { // ui_slider_f32(id, x, y, w, label_ptr, label_len, val_ptr, min_v, max_v) -> u32
+            lbl  := guest_read_str(handle, arg_u32(4), arg_u32(5));
+            vptr := arg_u32(6);
+            val: f32 = 0.0f;
+            if vptr != 0 do wasm_plugin_mem_read(handle, vptr, &val, 4);
+            res := ui.ui_slider_f32(arg_u32(0), arg_f32(1), arg_f32(2), arg_f32(3), lbl, &val, arg_f32(7), arg_f32(8));
+            if vptr != 0 && (res & cast(u32) abi.WidgetState.Changed) != 0 {
+                wasm_plugin_mem_write(handle, vptr, &val, 4);
+            }
+            ret_u32(res);
+        }
+
+        case 48 { // ui_draw_text_wrapped(x, y, max_w, text_ptr, text_len, font_size, rgba, flags) -> f32
+            txt := guest_read_str(handle, arg_u32(3), arg_u32(4));
+            ret_f32(ui.ui_draw_text_wrapped(arg_f32(0), arg_f32(1), arg_f32(2), txt, arg_f32(5), arg_u32(6), arg_u32(7)));
+        }
+
+        case 49 { // ui_tooltip(text_ptr, text_len)
+            txt := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            ui.ui_tooltip(txt);
         }
 
         // ---- C. Workspace & Editor Context (50..65) ----
@@ -524,6 +684,102 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
             }
         }
 
+        case 67 { // editor_insert_text(text_ptr, text_len) -> i32
+            txt := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            editor.buffer_insert_text(&g_host_ctx.ed.buf, txt);
+            editor.editor_ensure_cursor_visible(g_host_ctx.ed, g_host_ctx.window_mgr.editor_content.h);
+            ret_i32(cast(i32) txt.count);
+        }
+
+        case 68 { // editor_get_selection(out_ptr, out_cap) -> i32
+            sel := editor.buffer_get_selected_text(&g_host_ctx.ed.buf, context.temp_allocator);
+            ret_i32(guest_write_out(handle, sel, arg_u32(0), arg_u32(1)));
+        }
+
+        case 69 { // editor_replace_range(start_line, start_col, end_line, end_col, text_ptr, text_len) -> i32
+            sl := arg_i32(0) - 1;
+            sc := arg_i32(1) - 1;
+            el := arg_i32(2) - 1;
+            ec := arg_i32(3) - 1;
+            txt := guest_read_str(handle, arg_u32(4), arg_u32(5));
+            b := &g_host_ctx.ed.buf;
+            if sl < 0 do sl = 0;
+            if sc < 0 do sc = 0;
+            if el < 0 do el = 0;
+            if ec < 0 do ec = 0;
+            if sl >= b.lines.count do sl = b.lines.count - 1;
+            if el >= b.lines.count do el = b.lines.count - 1;
+            if sc > b.lines[sl].count do sc = b.lines[sl].count;
+            if ec > b.lines[el].count do ec = b.lines[el].count;
+            b.sel_anchor_line = sl;
+            b.sel_anchor_col  = sc;
+            b.cursor_line     = el;
+            b.cursor_col      = ec;
+            b.has_sel         = (sl != el || sc != ec);
+            if txt.count > 0 {
+                editor.buffer_insert_text(b, txt);
+            } else {
+                editor.buffer_delete_selection(b);
+            }
+            editor.editor_ensure_cursor_visible(g_host_ctx.ed, g_host_ctx.window_mgr.editor_content.h);
+            ret_i32(cast(i32) txt.count);
+        }
+
+        case 70 { // editor_save() -> i32
+            ok := editor.buffer_save_file(&g_host_ctx.ed.buf);
+            if ok && g_host_ctx.lsp_client != null {
+                txt := editor.buffer_to_string(&g_host_ctx.ed.buf, context.temp_allocator);
+                lsp.lsp_did_save(g_host_ctx.lsp_client, g_host_ctx.ed.buf.path, txt);
+            }
+            ret_i32(0 if ok else cast(i32) abi.AbiError.Unknown);
+        }
+
+        case 71 { // workspace_file_exists(rel_ptr, rel_len) -> u32
+            rel := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            if full := sanitize_rel_path(rel); full {
+                fp := full->unwrap();
+                ret_u32(1 if (os.file_exists(fp) || os.Directory.exists(fp)) else 0);
+            } else {
+                ret_u32(0);
+            }
+        }
+
+        case 72 { // workspace_delete_file(rel_ptr, rel_len) -> i32
+            rel := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            if rel.count == 0 || str.equal(rel, ".") {
+                ret_i32(cast(i32) abi.AbiError.PermissionDenied);
+            } else {
+                if full := sanitize_rel_path(rel); full {
+                    fp := full->unwrap();
+                    if os.file_exists(fp) {
+                        os.remove_file(fp);
+                        ret_i32(0);
+                    } else {
+                        ret_i32(cast(i32) abi.AbiError.NotFound);
+                    }
+                } else {
+                    ret_i32(cast(i32) abi.AbiError.PermissionDenied);
+                }
+            }
+        }
+
+        case 73 { // workspace_mkdir(rel_ptr, rel_len) -> i32
+            rel := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            if full := sanitize_rel_path(rel); full {
+                fp := full->unwrap();
+                for i in 1 .. fp.count {
+                    if fp[i] == '/' {
+                        dir := fp[0 .. i];
+                        if !os.Directory.exists(dir) do os.Directory.create(dir);
+                    }
+                }
+                if !os.Directory.exists(fp) do os.Directory.create(fp);
+                ret_i32(0);
+            } else {
+                ret_i32(cast(i32) abi.AbiError.PermissionDenied);
+            }
+        }
+
         // ---- D. Process Execution & Compiler / Build & Run (80..85) ----
 
         case 80 { // proc_spawn(cmd_ptr, cmd_len, args_ptr, args_len, cwd_ptr, cwd_len) -> u32
@@ -641,6 +897,18 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
             }
         }
 
+        case 87 { // http_fetch(url_ptr, url_len) -> u32 (returns proc_handle streaming response body)
+            url := guest_read_str(handle, arg_u32(0), arg_u32(1));
+            if !str.starts_with(url, "http://") && !str.starts_with(url, "https://") {
+                ret_u32(0);
+            } else {
+                cmd  := "curl";
+                args := core.tprintf("-sSL\n--max-time\n15\n{}", url);
+                cwd  := g_host_ctx.workspace_root;
+                ret_u32(native_proc_spawn(cmd.data, cmd.count, args.data, args.count, cwd.data, cwd.count));
+            }
+        }
+
         // ---- E. Live Debugger (90..94) ----
         case 90 { // debug_toggle_breakpoint(path_ptr, path_len, line) -> u32
             path := guest_read_str(handle, arg_u32(0), arg_u32(1));
@@ -673,6 +941,26 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
         case 94 { // debug_get_state(out_ptr, out_cap) -> i32
             js := services.dbg_get_state_json(context.temp_allocator);
             ret_i32(guest_write_out(handle, js, arg_u32(0), arg_u32(1)));
+        }
+
+        case 95 { // ui_texture_load_memory(data_ptr, data_len, ext_ptr, ext_len) -> u32
+            dptr := arg_u32(0);
+            dlen := arg_u32(1);
+            ext  := guest_read_str(handle, arg_u32(2), arg_u32(3));
+            if dptr == 0 || dlen == 0 || dlen > 16 * 1024 * 1024 {
+                ret_u32(0);
+            } else {
+                buf := make([] u8, cast(i32) dlen, context.temp_allocator);
+                if wasm_plugin_mem_read(handle, dptr, buf.data, dlen) == cast(i32) dlen {
+                    ret_u32(ui.ui_texture_load_memory(buf, ext));
+                } else {
+                    ret_u32(0);
+                }
+            }
+        }
+
+        case 96 { // ui_table_get_row_y() -> f32
+            ret_f32(ui.ui_table_get_row_y());
         }
 
         case _ {

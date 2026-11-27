@@ -473,6 +473,43 @@ VStack.divider :: (s: &VStack) {
     s.y += s.gap + 2.0f;
 }
 
+/// Lightweight horizontal layout cursor (companion to `VStack`).
+HStack :: struct {
+    x:   f32;
+    y:   f32;
+    h:   f32;
+    gap: f32;
+}
+
+hstack :: (x, y, h: f32, gap: f32 = 6.0f) -> HStack {
+    return .{ x = x, y = y, h = h, gap = gap };
+}
+
+HStack.next :: (s: &HStack, w: f32) -> f32 {
+    cur := s.x;
+    s.x += w + s.gap;
+    return cur;
+}
+
+HStack.spacer :: (s: &HStack, px: f32) {
+    s.x += px;
+}
+
+HStack.button :: (s: &HStack, id: u32, w: f32, label: str, style: abi.ButtonFlags = .{}) -> abi.WidgetState {
+    rx := s->next(w);
+    return button(id, rx, s.y, w, s.h, label, style);
+}
+
+// ---- Ergonomic `WidgetState` Flag Predicates ----
+
+is_hovered        :: (st: abi.WidgetState) -> bool { return (cast(u32) st & cast(u32) abi.WidgetState.Hovered)       != 0; }
+is_active         :: (st: abi.WidgetState) -> bool { return (cast(u32) st & cast(u32) abi.WidgetState.Active)        != 0; }
+is_clicked        :: (st: abi.WidgetState) -> bool { return (cast(u32) st & cast(u32) abi.WidgetState.Clicked)       != 0; }
+is_double_clicked :: (st: abi.WidgetState) -> bool { return (cast(u32) st & cast(u32) abi.WidgetState.DoubleClicked) != 0; }
+is_changed        :: (st: abi.WidgetState) -> bool { return (cast(u32) st & cast(u32) abi.WidgetState.Changed)       != 0; }
+is_submitted      :: (st: abi.WidgetState) -> bool { return (cast(u32) st & cast(u32) abi.WidgetState.Submitted)     != 0; }
+is_focused        :: (st: abi.WidgetState) -> bool { return (cast(u32) st & cast(u32) abi.WidgetState.Focused)       != 0; }
+
 /// Ergonomic row hit-test helper (accounts for `FRAME_FLAG_HOVERED` and scroll offset).
 row_hit :: (ctx: &abi.FrameContext, x, y, w, h: f32, scroll_y: f32 = 0.0f) -> (hovered: bool, clicked: bool) {
     if (ctx.flags & abi.FRAME_FLAG_HOVERED) == 0 do return false, false;
@@ -515,6 +552,47 @@ spawn_plugin :: (plugin_id: str) -> u32 {
 
 set_clipboard :: (text: str) {
     abi.host_set_clipboard(cast(u32) text.data, cast(u32) text.count);
+}
+
+get_clipboard :: (allocator := context.temp_allocator) -> str {
+    needed := abi.host_get_clipboard(0, 0);
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.host_get_clipboard(cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
+    return buf[0 .. got];
+}
+
+open_url :: (url: str) -> bool {
+    return abi.host_open_url(cast(u32) url.data, cast(u32) url.count) >= 0;
+}
+
+// ---- Plugin-Scoped Global Storage (`~/.config/odit/plugin_data/<plugin_id>/`) ----
+
+storage_read :: (key: str, allocator := context.temp_allocator) -> str {
+    needed := abi.storage_read(cast(u32) key.data, cast(u32) key.count, 0, 0);
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.storage_read(cast(u32) key.data, cast(u32) key.count, cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
+    return buf[0 .. got];
+}
+
+storage_write :: (key: str, data: str) -> bool {
+    return abi.storage_write(
+        cast(u32) key.data, cast(u32) key.count,
+        cast(u32) data.data, cast(u32) data.count
+    ) >= 0;
+}
+
+storage_delete :: (key: str) -> bool {
+    return abi.storage_delete(cast(u32) key.data, cast(u32) key.count) >= 0;
 }
 
 // ---- Plugin Settings Registration (shown in `Ctrl+,` Settings & saved in `odit.json`) ----
@@ -623,6 +701,8 @@ theme_color :: (role: abi.ThemeColor) -> u32 {
     return abi.ui_get_theme_color(cast(u32) role);
 }
 
+ui_scale :: () -> f32 { return abi.ui_get_scale(); }
+
 push_clip :: (x, y, w, h: f32) => abi.ui_push_clip(x, y, w, h);
 pop_clip  :: ()                => abi.ui_pop_clip();
 
@@ -650,6 +730,49 @@ draw_text :: (x, y: f32, text: str, font_size: f32 = 14.0, color: u32 = 0xCDD6F4
     if text.count == 0 do return;
     abi.ui_draw_text(x, y, cast(u32) text.data, cast(u32) text.count, font_size, color, cast(u32) flags);
 }
+
+/// Draws word-wrapped multi-line text inside `max_w` and returns the total rendered height.
+draw_text_wrapped :: (x, y, max_w: f32, text: str, font_size: f32 = 14.0, color: u32 = 0xCDD6F4FF, flags: abi.TextFlags = .{}) -> f32 {
+    if text.count == 0 do return 0.0f;
+    return abi.ui_draw_text_wrapped(x, y, max_w, cast(u32) text.data, cast(u32) text.count, font_size, color, cast(u32) flags);
+}
+
+checkbox :: (id: u32, x, y: f32, label: str, checked: &bool) -> abi.WidgetState {
+    b: u8 = cast(u8) (1 if *checked else 0);
+    st := cast(abi.WidgetState) abi.ui_checkbox(id, x, y, cast(u32) label.data, cast(u32) label.count, cast(u32) &b);
+    *checked = b != 0;
+    return st;
+}
+
+slider_f32 :: (id: u32, x, y, w: f32, label: str, val: &f32, min_v: f32 = 0.0f, max_v: f32 = 1.0f) -> abi.WidgetState {
+    return cast(abi.WidgetState) abi.ui_slider_f32(
+        id, x, y, w,
+        cast(u32) label.data, cast(u32) label.count,
+        cast(u32) val, min_v, max_v
+    );
+}
+
+tooltip :: (text: str) {
+    if text.count == 0 do return;
+    abi.ui_tooltip(cast(u32) text.data, cast(u32) text.count);
+}
+
+table_row_y :: () -> f32 { return abi.ui_table_get_row_y(); }
+
+texture_load :: (rel_path: str) -> u32 {
+    return abi.ui_texture_load(cast(u32) rel_path.data, cast(u32) rel_path.count);
+}
+
+/// Loads a PNG/JPG/BMP/GIF texture directly from embedded bytes (`#file_contents "icon.png"`).
+texture_load_memory :: (data: [] u8, ext: str = ".png") -> u32 {
+    return abi.ui_texture_load_memory(
+        cast(u32) data.data, cast(u32) data.count,
+        cast(u32) ext.data, cast(u32) ext.count
+    );
+}
+
+texture_unload :: (handle: u32) => abi.ui_texture_unload(handle);
+draw_texture   :: (handle: u32, x, y, w, h: f32, tint_rgba: u32 = 0xFFFFFFFF) => abi.ui_draw_texture(handle, x, y, w, h, tint_rgba);
 
 pill :: (x, y: f32, text: str, bg: u32, fg: u32) -> f32 {
     return abi.ui_pill(x, y, cast(u32) text.data, cast(u32) text.count, bg, fg);
@@ -738,6 +861,47 @@ editor_cursor :: () -> abi.EditorCursor {
 
 editor_open :: (path: str, line: i32 = 1, col: i32 = 1) -> i32 {
     return abi.editor_open_file(cast(u32) path.data, cast(u32) path.count, line, col);
+}
+
+editor_insert_text :: (text: str) -> bool {
+    return abi.editor_insert_text(cast(u32) text.data, cast(u32) text.count) >= 0;
+}
+
+editor_get_selection :: (allocator := context.temp_allocator) -> str {
+    needed := abi.editor_get_selection(0, 0);
+    if needed <= 0 do return "";
+    buf := make([] u8, needed, allocator);
+    got := abi.editor_get_selection(cast(u32) buf.data, cast(u32) buf.count);
+    if got <= 0 {
+        raw_free(allocator, buf.data);
+        return "";
+    }
+    return buf[0 .. got];
+}
+
+editor_replace_range :: (start_line, start_col, end_line, end_col: i32, text: str) -> bool {
+    return abi.editor_replace_range(start_line, start_col, end_line, end_col, cast(u32) text.data, cast(u32) text.count) >= 0;
+}
+
+editor_save :: () -> bool {
+    return abi.editor_save() >= 0;
+}
+
+workspace_file_exists :: (rel_path: str) -> bool {
+    return abi.workspace_file_exists(cast(u32) rel_path.data, cast(u32) rel_path.count) != 0;
+}
+
+workspace_delete_file :: (rel_path: str) -> bool {
+    return abi.workspace_delete_file(cast(u32) rel_path.data, cast(u32) rel_path.count) >= 0;
+}
+
+workspace_mkdir :: (rel_path: str) -> bool {
+    return abi.workspace_mkdir(cast(u32) rel_path.data, cast(u32) rel_path.count) >= 0;
+}
+
+/// Starts an async HTTP GET request; poll & read the response body using `proc_poll` / `proc_read`.
+http_fetch :: (url: str) -> u32 {
+    return abi.http_fetch(cast(u32) url.data, cast(u32) url.count);
 }
 
 workspace_read_file :: (rel_path: str, allocator := context.temp_allocator) -> str {

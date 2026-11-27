@@ -1327,6 +1327,7 @@ main :: (args: [] cstr) {
             }
         }
 
+        ui.ui_draw_tooltip();
         raylib.EndDrawing();
     }
 
