@@ -99,6 +99,7 @@ AocPlugin :: struct {
     p1_tmp:        str;
     p1_time_tmp:   str;
     stage_elapsed: f32;
+    xmas_time:     f32;
 }
 
 // -----------------------------------------------------------------------------
@@ -776,6 +777,7 @@ draw_readonly_box :: (ctx: &abi.FrameContext, x, y, w, h: f32, val: str, scroll_
 @sdk.PluginRender
 render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
     poll_runner(self, ctx.delta_time);
+    self.xmas_time += ctx.delta_time;
 
     pad: f32 = 10.0f;
     w := ctx.width - pad * 2.0f;
@@ -975,6 +977,118 @@ render :: (self: &AocPlugin, window_id: u32, ctx: &abi.FrameContext) {
 
     if state_dirty do save_state(self);
     if run_req_day > 0 do start_run(self, run_req_day, run_req_test);
+
+    // Seasonal Christmas overlay (remove this single call + `draw_christmas_overlay` to disable)
+    draw_christmas_overlay(self, ctx);
+}
+
+#local
+draw_christmas_overlay :: (self: &AocPlugin, ctx: &abi.FrameContext) {
+    w := ctx.width;
+    h := ctx.height;
+    t := self.xmas_time;
+
+    // 1. Subtle falling snow across the pane
+    snow_count :: 22;
+    for i in 0 .. snow_count {
+        fi := cast(f32) i;
+        // Deterministic pseudo-random X, speed, radius, and sway per flake
+        seed_x := cast(f32) ((i * 73 + 19) % 100) / 100.0f;
+        speed  := 18.0f + cast(f32) ((i * 29) % 24);
+        rad    := 1.3f + cast(f32) (i % 3) * 0.55f;
+
+        raw_y := (fi * 37.0f + t * speed);
+        fy    := raw_y - cast(f32) (cast(i32) (raw_y / (h + 20.0f))) * (h + 20.0f) - 10.0f;
+        // Gentle horizontal drift (triangular wave so no trig import needed)
+        ph    := t * 0.6f + fi * 0.9f;
+        frac  := ph - cast(f32) (cast(i32) ph);
+        sway  := (frac * 2.0f - 1.0f) if frac < 0.5f else ((1.0f - frac) * 2.0f - 1.0f);
+        fx    := seed_x * w + sway * 10.0f;
+
+        sdk.draw_circle(fx, fy, rad, 0xFFFFFF44);
+    }
+
+    // 2. Twinkling fairy lights garland along the top edge
+    bulb_colors := u32.[ 0xF38BA8EE, 0xF9E2AFEE, 0xA6E3A1EE, 0x89DCEBEE ];
+    bulb_glow   := u32.[ 0xF38BA844, 0xF9E2AF44, 0xA6E3A144, 0x89DCEB44 ];
+    spacing: f32 = 28.0f;
+    bx: f32 = 14.0f;
+    idx := 0;
+    phase := cast(i32) (t * 2.2f);
+    while bx < w - 10.0f {
+        nx := bx + spacing;
+        if nx < w - 10.0f {
+            sdk.draw_line(bx, 3.0f, nx, 3.0f, 1.0f, 0x45475AAA);
+        }
+        ci := idx % 4;
+        lit := ((idx + phase) % 2) == 0;
+        if lit {
+            sdk.draw_circle(bx, 5.5f, 5.2f, bulb_glow[ci]);
+        }
+        sdk.draw_circle(bx, 5.5f, 2.4f, bulb_colors[ci] if lit else 0x585B70AA);
+        bx = nx;
+        idx += 1;
+    }
+
+    // 3. Twinkling golden stars next to the "Advent of Code" title
+    draw_star :: (cx, cy, r: f32, bright: bool) {
+        col := 0xF9E2AFFF if bright else 0xF9E2AF88;
+        if bright {
+            sdk.draw_circle(cx, cy, r * 1.15f, 0xF9E2AF33);
+        }
+        sdk.draw_line(cx - r, cy, cx + r, cy, 1.4f, col);
+        sdk.draw_line(cx, cy - r, cx, cy + r, 1.4f, col);
+        d := r * 0.65f;
+        sdk.draw_line(cx - d, cy - d, cx + d, cy + d, 1.0f, col);
+        sdk.draw_line(cx - d, cy + d, cx + d, cy - d, 1.0f, col);
+    };
+    draw_star(156.0f, 20.0f, 4.5f, (phase % 2) == 0);
+    draw_star(172.0f, 15.0f, 3.0f, (phase % 2) == 1);
+    draw_star(184.0f, 24.0f, 3.5f, ((phase + 1) % 3) == 0);
+
+    // 4. Cozy Christmas tree + wrapped presents tucked in the bottom-right corner
+    if w >= 200.0f && h >= 140.0f {
+        base_y := h - 10.0f;
+        tree_x := w - 42.0f;
+
+        // Soft snowy ground hill
+        sdk.draw_rect(w - 108.0f, base_y - 4.0f, 98.0f, 8.0f, 0xCDD6F444, 4.0f);
+
+        // Tree trunk
+        sdk.draw_rect(tree_x - 4.0f, base_y - 12.0f, 8.0f, 10.0f, 0x8B5A2BFF, 1.5f);
+
+        // Layered pine tiers (bottom -> top)
+        sdk.draw_rect(tree_x - 20.0f, base_y - 22.0f, 40.0f, 11.0f, 0x2D6A4FEE, 3.0f);
+        sdk.draw_rect(tree_x - 16.0f, base_y - 31.0f, 32.0f, 11.0f, 0x40916CEE, 3.0f);
+        sdk.draw_rect(tree_x - 11.0f, base_y - 40.0f, 22.0f, 11.0f, 0x52B788EE, 3.0f);
+        sdk.draw_rect(tree_x - 6.0f,  base_y - 48.0f, 12.0f, 10.0f, 0x74C69DEE, 3.0f);
+
+        // Tree topper star
+        draw_star(tree_x, base_y - 52.0f, 5.5f, (phase % 2) == 0);
+
+        // Tiny ornaments on the tree
+        sdk.draw_circle(tree_x - 10.0f, base_y - 17.0f, 2.2f, 0xF38BA8FF);
+        sdk.draw_circle(tree_x + 9.0f,  base_y - 16.0f, 2.2f, 0xF9E2AFFF);
+        sdk.draw_circle(tree_x + 4.0f,  base_y - 26.0f, 2.1f, 0x89DCEBFF);
+        sdk.draw_circle(tree_x - 6.0f,  base_y - 28.0f, 2.1f, 0xF9E2AFFF);
+        sdk.draw_circle(tree_x - 2.0f,  base_y - 36.0f, 2.0f, 0xF38BA8FF);
+
+        // Present 1 (red box + gold ribbon)
+        p1x := tree_x - 42.0f;
+        p1y := base_y - 15.0f;
+        sdk.draw_rect(p1x, p1y, 16.0f, 13.0f, 0xE64553EE, 2.0f, 0x11111B88, 1.0f);
+        sdk.draw_rect(p1x + 6.5f, p1y, 3.0f, 13.0f, 0xF9E2AFFF);
+        sdk.draw_rect(p1x, p1y + 5.0f, 16.0f, 3.0f, 0xF9E2AFFF);
+        sdk.draw_circle(p1x + 6.0f,  p1y - 1.5f, 2.2f, 0xF9E2AFFF);
+        sdk.draw_circle(p1x + 10.0f, p1y - 1.5f, 2.2f, 0xF9E2AFFF);
+
+        // Present 2 (blue box + white ribbon)
+        p2x := tree_x - 58.0f;
+        p2y := base_y - 12.0f;
+        sdk.draw_rect(p2x, p2y, 13.0f, 10.0f, 0x89B4FAEE, 2.0f, 0x11111B88, 1.0f);
+        sdk.draw_rect(p2x + 5.0f, p2y, 2.8f, 10.0f, 0xFFFFFFFF);
+        sdk.draw_rect(p2x, p2y + 3.8f, 13.0f, 2.8f, 0xFFFFFFFF);
+    }
 }
 
 #local
