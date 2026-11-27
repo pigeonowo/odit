@@ -604,7 +604,9 @@ ui_table_begin :: (id: u32, x, y, w, h: f32, col_count: u32, headers: str, col_w
     }
 
     // Header bar
-    header_h: f32 = 24.0;
+    s := settings.g_settings.ui_scale;
+    header_h: f32 = 24.0f * s;
+    hdr_fs: f32 = 12.0f * s;
     theme.draw_rect(sx, sy, w, header_h, theme.get_color(.BgHeader), 0.0, theme.get_color(.Border), 1.0);
     cx := sx;
     col_i: u32 = 0;
@@ -613,7 +615,7 @@ ui_table_begin :: (id: u32, x, y, w, h: f32, col_count: u32, headers: str, col_w
         if i == headers.count || headers[i] == '\t' {
             if col_i < cols {
                 label := headers[start .. i];
-                theme.draw_text(cx + 8.0, sy + 5.0, label, 12.0, theme.get_color(.TextSecondary));
+                theme.draw_text(cx + 8.0f * s, sy + (header_h - hdr_fs) * 0.5f, label, hdr_fs, theme.get_color(.TextSecondary));
                 cx += g_ui.table.col_widths[col_i];
                 col_i += 1;
             }
@@ -628,7 +630,9 @@ ui_table_begin :: (id: u32, x, y, w, h: f32, col_count: u32, headers: str, col_w
 ui_table_row :: (row_id: u32, cells: str, flags: u32) -> u32 {
     if !g_ui.table.active do return 0;
 
-    row_h: f32 = 24.0;
+    s := settings.g_settings.ui_scale;
+    row_h: f32 = 24.0f * s;
+    cell_fs: f32 = 13.0f * s;
     rx := g_ui.table.x;
     ry := g_ui.table.cur_y;
     rw := g_ui.table.w;
@@ -658,7 +662,7 @@ ui_table_row :: (row_id: u32, cells: str, flags: u32) -> u32 {
         if i == cells.count || cells[i] == '\t' {
             if col_i < g_ui.table.col_count {
                 cell := cells[start .. i];
-                theme.draw_text(cx + 8.0, ry + 5.0, cell, 13.0, fg);
+                theme.draw_text(cx + 8.0f * s, ry + (row_h - cell_fs) * 0.5f, cell, cell_fs, fg);
                 cx += g_ui.table.col_widths[col_i];
                 col_i += 1;
             }
