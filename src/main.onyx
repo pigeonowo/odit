@@ -13,6 +13,7 @@
 #load "./services/workspace.onyx"
 #load "./services/compiler_wat.onyx"
 #load "./services/debugger.onyx"
+#load "./services/debugger_instr.onyx"
 #load "./services/debugger_eval.onyx"
 #load "./services/docs_index.onyx"
 #load "./wm/layout.onyx"
@@ -240,8 +241,9 @@ register_builtin_commands :: () {
     ui.palette_register(&g_app.palette, "plugin.reload_all",    "Plugins: Reload All .wasm Plugins",      "",         0);
     ui.palette_register(&g_app.palette, "debug.start",          "Debug: Start / Continue Session",        "F5",       0);
     ui.palette_register(&g_app.palette, "debug.toggle_bp",      "Debug: Toggle Breakpoint on Line",       "F9",       0);
-    ui.palette_register(&g_app.palette, "debug.step_over",      "Debug: Step Over (Onyx Line)",           "F10",      0);
-    ui.palette_register(&g_app.palette, "debug.step_wat",       "Debug: Step WAT Instruction",            "F11",      0);
+    ui.palette_register(&g_app.palette, "debug.step_over",      "Debug: Step Over",                       "F10",      0);
+    ui.palette_register(&g_app.palette, "debug.step_into",      "Debug: Step Into",                       "F11",      0);
+    ui.palette_register(&g_app.palette, "debug.step_out",       "Debug: Step Out",                        "Shift+F11", 0);
     ui.palette_register(&g_app.palette, "debug.stop",           "Debug: Stop Session",                    "Shift+F5", 0);
 }
 
@@ -372,10 +374,15 @@ execute_command :: (cmd: &ui.CommandEntry) {
     } elseif str.equal(cmd.id, "debug.start") {
         if services.g_dbg.status == .Paused {
             services.dbg_command(.Continue, g_app.ed.buf.version);
+        } elseif services.g_dbg.status == .Running {
+            services.dbg_command(.Pause, g_app.ed.buf.version);
         } else {
+            if g_app.ed.buf.dirty && g_app.ed.buf.path.count > 0 {
+                editor.buffer_save_file(&g_app.ed.buf);
+            }
             rc := services.dbg_start("", g_app.ed.buf.path, cast(u32) (g_app.ed.buf.cursor_line + 1), g_app.ed.buf.version);
             if rc != 0 do wm.wm_notify(&g_app.window_mgr, 3, services.g_dbg.last_error);
-            else       do wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Debugger paused in {}()", services.g_dbg.current_func));
+            else       do wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Debugging {}...", services.g_dbg.entry_path));
         }
     } elseif str.equal(cmd.id, "debug.toggle_bp") {
         ln := cast(u32) (g_app.ed.buf.cursor_line + 1);
@@ -383,8 +390,10 @@ execute_command :: (cmd: &ui.CommandEntry) {
         wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("{} breakpoint at {}:{}", "Set" if added != 0 else "Removed", g_app.ed.buf.path, ln));
     } elseif str.equal(cmd.id, "debug.step_over") {
         services.dbg_command(.StepOver, g_app.ed.buf.version);
-    } elseif str.equal(cmd.id, "debug.step_wat") {
-        services.dbg_command(.StepInstruction, g_app.ed.buf.version);
+    } elseif str.equal(cmd.id, "debug.step_into") {
+        services.dbg_command(.StepInto, g_app.ed.buf.version);
+    } elseif str.equal(cmd.id, "debug.step_out") {
+        services.dbg_command(.StepOut, g_app.ed.buf.version);
     } elseif str.equal(cmd.id, "debug.stop") {
         services.dbg_command(.Stop, g_app.ed.buf.version);
         wm.wm_notify(&g_app.window_mgr, 1, "Debugger stopped");
@@ -478,6 +487,7 @@ run_headless_selftest :: () {
            cast(i32) settings.g_settings.editor_font_size,
            settings.g_settings.ui_scale,
            settings.g_settings.theme);
+    settings.g_settings.ui_scale = 1.0f; // deterministic geometry for headless click assertions
     wm.wm_init(&g_app.window_mgr);
     g_app.window_mgr.autosave = false;
     ui.palette_init(&g_app.palette);
@@ -635,17 +645,32 @@ run_headless_selftest :: () {
         }
     }
 
-    // 3) File Explorer: click folder row 0 (`abi`) to expand, then click row 1 (`abi/abi.onyx`) to open
+    // 3) File Explorer: filter to `abi`, click folder row 0 (`abi`) to expand, then click row 1 (`abi/abi.onyx`) to open
     if fp := wm.wm_find_pane(&g_app.window_mgr, wid_fe); fp != null {
         if lp := find_loaded_plugin(fp.plugin_handle); lp != null {
-            // Click row 0 (list_y = 42.0, row_h = 26.0 -> y = 52.0 hits first folder `abi`)
-            ui.g_ui.mouse_x = 60; ui.g_ui.mouse_y = 52; ui.g_ui.mouse_pressed = true; ui.g_ui.typed_count = 0;
+            // Focus Filter input (x=40, y=18) and type "abi" so dot-folders (.agents/.odit) don't shift row 0
+            ui.g_ui.mouse_x = 40; ui.g_ui.mouse_y = 18; ui.g_ui.mouse_pressed = true; ui.g_ui.typed_count = 0;
             ui.ui_begin_pane(wid_fe, 0, 0, 360, 440, true, true);
             fctx := abi.FrameContext.{
                 window_id = wid_fe, width = 360, height = 440,
-                mouse_x = 60, mouse_y = 52, mouse_pressed = cast(u32) abi.MouseButton.Left,
+                mouse_x = 40, mouse_y = 18, mouse_pressed = cast(u32) abi.MouseButton.Left,
                 flags = abi.FRAME_FLAG_FOCUSED | abi.FRAME_FLAG_HOVERED, delta_time = 0.016f,
             };
+            plugin.plugin_render_with_ctx(lp, wid_fe, &fctx);
+            ui.ui_end_pane();
+
+            ui.g_ui.mouse_pressed = false;
+            ui.g_ui.typed_chars[0] = 'a'; ui.g_ui.typed_chars[1] = 'b'; ui.g_ui.typed_chars[2] = 'i';
+            ui.g_ui.typed_count = 3;
+            ui.ui_begin_pane(wid_fe, 0, 0, 360, 440, true, true);
+            fctx.mouse_pressed = 0;
+            plugin.plugin_render_with_ctx(lp, wid_fe, &fctx);
+            ui.ui_end_pane();
+
+            // Click row 0 (list_y = 42.0, row_h = 26.0 -> y = 52.0 hits folder `abi`)
+            ui.g_ui.mouse_x = 60; ui.g_ui.mouse_y = 52; ui.g_ui.mouse_pressed = true; ui.g_ui.typed_count = 0;
+            ui.ui_begin_pane(wid_fe, 0, 0, 360, 440, true, true);
+            fctx.mouse_x = 60; fctx.mouse_y = 52; fctx.mouse_pressed = cast(u32) abi.MouseButton.Left;
             plugin.plugin_render_with_ctx(lp, wid_fe, &fctx);
             ui.ui_end_pane();
             if err := plugin.host_last_error(); err.count > 0 {
@@ -753,15 +778,31 @@ run_headless_selftest :: () {
     }
     println("[odit] PASS: Advent of Code WASM plugin spawned, persisted state & rendered with 0 traps!");
 
-    // 6) Live Debugger plugin: spawn, toggle BP, start session, step WAT, and render with 0 traps
+    // 6) Live Debugger plugin: spawn, run real instrumented program, hit BP with live locals/stack, and render with 0 traps
     wid_dbg := spawn_plugin_from_wasm("build/plugins/debugger.wasm");
     if wid_dbg == 0 {
         println("[odit] FAIL: could not spawn build/plugins/debugger.wasm");
         os.exit(1);
     }
-    services.dbg_toggle_breakpoint("src/settings.onyx", 28);
-    if services.dbg_start("src/settings.onyx", "src/settings.onyx", 28, 1) != 0 {
+    dbg_tmp := "/tmp/odit_selftest_dbg.onyx";
+    os.File.write_contents(dbg_tmp, """main :: () {
+    total := 0;
+    for i in 0 .. 4 {
+        if i == 1 do continue;
+        total += i;
+    }
+}
+""");
+    defer os.remove_file(dbg_tmp);
+    services.dbg_toggle_breakpoint(dbg_tmp, 5);
+    if services.dbg_start(dbg_tmp, dbg_tmp, 5, 1) != 0 {
         printf("[odit] FAIL: debugger failed to start: {}\n", services.g_dbg.last_error);
+        os.exit(1);
+    }
+    if services.dbg_wait_for_stop() != .Paused || services.g_dbg.current_line != 5 || services.g_dbg.locals.count < 2 {
+        printf("[odit] FAIL: debugger did not pause at live BP (status={}, line={}, locals={})\n",
+            cast(u32) services.g_dbg.status, services.g_dbg.current_line, services.g_dbg.locals.count);
+        services.dbg_command(.Stop, 1);
         os.exit(1);
     }
     dbg_js := services.dbg_get_state_json(context.temp_allocator);
@@ -783,7 +824,7 @@ run_headless_selftest :: () {
         }
     }
     services.dbg_command(.Stop, 1);
-    println("[odit] PASS: Live Debugger WASM plugin started, mapped WAT & rendered with 0 traps!");
+    println("[odit] PASS: Live Debugger WASM plugin executed real loop, paused with live locals & rendered with 0 traps!");
 
     // 7) HTTP Routes & ORM Schema domain plugins: spawn & render with 0 traps
     wid_http := spawn_plugin_from_wasm("build/plugins/http_routes.wasm");
@@ -1076,15 +1117,22 @@ main :: (args: [] cstr) {
                 wm.wm_notify(&g_app.window_mgr, 1, "Debugger stopped");
             } elseif services.g_dbg.status == .Paused {
                 services.dbg_command(.Continue, g_app.ed.buf.version);
+            } elseif services.g_dbg.status == .Running {
+                services.dbg_command(.Pause, g_app.ed.buf.version);
             } else {
+                if g_app.ed.buf.dirty && g_app.ed.buf.path.count > 0 {
+                    editor.buffer_save_file(&g_app.ed.buf);
+                }
                 rc := services.dbg_start("", g_app.ed.buf.path, cast(u32) (g_app.ed.buf.cursor_line + 1), g_app.ed.buf.version);
                 if rc != 0 do wm.wm_notify(&g_app.window_mgr, 3, services.g_dbg.last_error);
-                else       do wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Debugger paused in {}()", services.g_dbg.current_func));
+                else       do wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Debugging {}...", services.g_dbg.entry_path));
             }
         } elseif raylib.IsKeyPressed(.F10) && services.g_dbg.status == .Paused {
             services.dbg_command(.StepOver, g_app.ed.buf.version);
         } elseif raylib.IsKeyPressed(.F11) && services.g_dbg.status == .Paused {
-            services.dbg_command(.StepInstruction, g_app.ed.buf.version);
+            shift := raylib.IsKeyDown(.LEFT_SHIFT) || raylib.IsKeyDown(.RIGHT_SHIFT);
+            if shift do services.dbg_command(.StepOut, g_app.ed.buf.version);
+            else     do services.dbg_command(.StepInto, g_app.ed.buf.version);
         } elseif ctrl && (raylib.IsKeyPressed(.EQUAL) || raylib.IsKeyPressed(.KP_ADD)) {
             adjust_font_size(2.0f);
         } elseif ctrl && (raylib.IsKeyPressed(.MINUS) || raylib.IsKeyPressed(.KP_SUBTRACT)) {
@@ -1277,6 +1325,9 @@ main :: (args: [] cstr) {
             wm.wm_notify(&g_app.window_mgr, 1, core.tprintf("Opened {}", g_app.ed.buf.path));
         }
 
+        // Poll live debugger child process & TCP IPC non-blockingly every frame
+        services.dbg_poll();
+
         // Sync Live Debugger gutter markers & broadcast DebugStateChanged to plugins
         if services.g_dbg.markers_dirty {
             services.g_dbg.markers_dirty = false;
@@ -1331,7 +1382,8 @@ main :: (args: [] cstr) {
         raylib.EndDrawing();
     }
 
-    // Cleanly shut down all WASM plugins
+    // Cleanly shut down any active debug session & WASM plugins
+    services.dbg_command(.Stop, 0);
     while g_app.window_mgr.panes.count > 0 {
         close_plugin_window(g_app.window_mgr.panes[0].window_id);
     }

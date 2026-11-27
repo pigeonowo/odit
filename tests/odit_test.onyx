@@ -15,6 +15,7 @@ package main
 #load "./../src/services/workspace.onyx"
 #load "./../src/services/compiler_wat.onyx"
 #load "./../src/services/debugger.onyx"
+#load "./../src/services/debugger_instr.onyx"
 #load "./../src/services/debugger_eval.onyx"
 #load "./../src/services/docs_index.onyx"
 #load "./../src/wm/layout.onyx"
@@ -341,26 +342,102 @@ use odit.services
 }
 
 @test.tag.{"debugger"}
-@test.it.{"Debugger starts on settings.onyx, maps Onyx lines to WAT, and steps instructions"}
+@test.it.{"Live debugger executes real loops, continue, break, call stack, and live locals"}
 (t: &test.T) {
+    tmp_src := "/tmp/odit_live_dbg_test.onyx";
+    code := """use core { printf }
+
+compute :: (n: i32) -> i32 {
+    sum := 0;
+    for i in 0 .. n {
+        if i == 2 do continue;
+        if i == 5 do break;
+        sum += i * 10;
+    }
+    return sum;
+}
+
+main :: () {
+    ans := compute(8);
+    printf("final={}\\n", ans);
+}
+""";
+    t->expect_true(os.File.write_contents(tmp_src, code));
+    defer os.remove_file(tmp_src);
+
     services.dbg_init();
-    // Place breakpoint inside settings_defaults
-    services.dbg_toggle_breakpoint("src/settings.onyx", 28);
-    rc := services.dbg_start("src/settings.onyx", "src/settings.onyx", 28, 1);
+    // Line 8 is `sum += i * 10;` inside the loop (after `continue` and `break`!)
+    services.dbg_toggle_breakpoint(tmp_src, 8);
+    rc := services.dbg_start(tmp_src, tmp_src, 1, 1);
     t->expect_eq(rc, 0);
-    t->expect_eq(cast(u32) services.g_dbg.status, cast(u32) abi.DebugStatus.Paused);
-    t->expect_true(services.g_dbg.line_map.count > 0);
+
+    // 1st hit: i = 0, sum = 0 (with real 2-frame call stack: compute -> main)
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Paused);
+    t->expect_eq(services.g_dbg.current_func, "compute");
+    t->expect_eq(services.g_dbg.current_line, cast(u32) 8);
+    t->expect_eq(services.g_dbg.frames.count, 2);
+    t->expect_eq(services.g_dbg.frames[0].func, "compute");
+    t->expect_eq(services.g_dbg.frames[1].func, "main");
+
+    find_var :: (name: str) -> str {
+        for &v in services.g_dbg.locals {
+            if str.equal(v.name, name) do return v.value;
+        }
+        return "";
+    };
+    t->expect_eq(find_var("i"), "0");
+    t->expect_eq(find_var("sum"), "0");
+
+    // Continue -> 2nd hit: i = 1, sum = 0
+    t->expect_eq(services.dbg_command(.Continue, 1), 0);
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Paused);
+    t->expect_eq(find_var("i"), "1");
+    t->expect_eq(find_var("sum"), "0");
+
+    // Continue -> i = 2 hits `continue` and MUST BE SKIPPED! 3rd hit MUST be i = 3, sum = 10!
+    t->expect_eq(services.dbg_command(.Continue, 1), 0);
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Paused);
+    t->expect_eq(find_var("i"), "3");
+    t->expect_eq(find_var("sum"), "10");
+
+    // Continue -> 4th hit: i = 4, sum = 40
+    t->expect_eq(services.dbg_command(.Continue, 1), 0);
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Paused);
+    t->expect_eq(find_var("i"), "4");
+    t->expect_eq(find_var("sum"), "40");
+
+    // Step Over on line 8 -> executes `sum += 40` (sum=80), loops to i = 5 -> line 6 (`if i == 2`)
+    t->expect_eq(services.dbg_command(.StepOver, 1), 0);
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Paused);
+    t->expect_eq(services.g_dbg.current_line, cast(u32) 6);
+    t->expect_eq(find_var("i"), "5");
+    t->expect_eq(find_var("sum"), "80");
+
+    // Step Over -> line 7 (`if i == 5 do break;`)
+    t->expect_eq(services.dbg_command(.StepOver, 1), 0);
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Paused);
+    t->expect_eq(services.g_dbg.current_line, cast(u32) 7);
+
+    // Step Over -> `break` MUST exit the loop directly to line 10 (`return sum;`)!
+    t->expect_eq(services.dbg_command(.StepOver, 1), 0);
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Paused);
+    t->expect_eq(services.g_dbg.current_line, cast(u32) 10);
+    t->expect_eq(find_var("sum"), "80");
+
+    // Step Out -> returns back to main() line 15 (`printf`) with ans = 80!
+    t->expect_eq(services.dbg_command(.StepOut, 1), 0);
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Paused);
+    t->expect_eq(services.g_dbg.current_func, "main");
+    t->expect_eq(services.g_dbg.current_line, cast(u32) 15);
+    t->expect_eq(find_var("ans"), "80");
+
+    // Continue -> program finishes cleanly and captures stdout `final=80`!
+    t->expect_eq(services.dbg_command(.Continue, 1), 0);
+    t->expect_eq(cast(u32) services.dbg_wait_for_stop(), cast(u32) abi.DebugStatus.Exited);
+    t->expect_eq(services.g_dbg.exit_code, 0);
 
     st_js := services.dbg_get_state_json(context.temp_allocator);
-    t->expect_contains(st_js, "(func $");
-    t->expect_contains(st_js, "\"line_map\":[");
-
-    w0 := services.g_dbg.current_wat_line;
-    t->expect_eq(services.dbg_command(.StepInstruction, 1), 0);
-    t->expect_true(services.g_dbg.current_wat_line >= w0);
-
-    t->expect_eq(services.dbg_command(.Stop, 1), 0);
-    t->expect_eq(cast(u32) services.g_dbg.status, cast(u32) abi.DebugStatus.Idle);
+    t->expect_contains(st_js, "final=80");
 }
 
 @test.tag.{"debugger"}

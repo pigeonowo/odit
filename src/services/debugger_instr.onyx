@@ -1,0 +1,768 @@
+package odit.services
+
+// =============================================================================
+// Onyx Editor ("odit") — Real Live Onyx Debugger Instrumenter & Runtime
+// =============================================================================
+// Instruments workspace `.onyx` files into a hidden shadow directory
+// (`.odit/dbg_shadow/`) without ever touching the user's real source files,
+// injects a lightweight TCP-loopback debug runtime (`__odit_dbg_rt.onyx`), and
+// executes the real compiled Onyx program natively via `onyx run`.
+//
+// Because the real compiled Onyx program executes natively:
+//   - Loops (`for`, `while`), `break`, `continue`, `if`/`elseif`/`else`,
+//     `switch`, recursion, `defer`, `use`, indirect calls (`aoc.run()`),
+//     `--param` flags, and file I/O all execute 100% faithfully.
+//   - At every pause point (breakpoint, Step Over, Step Into, Step Out, Pause),
+//     the live Onyx runtime formats real in-scope local variables & parameters
+//     via `runtime.info` + `any` and streams the live call stack over TCP.
+
+use core { package, os, Array, tprintf }
+
+// -----------------------------------------------------------------------------
+// 1. Live Debug Runtime Source Generator (`.odit/dbg_shadow/__odit_dbg_rt.onyx`)
+// -----------------------------------------------------------------------------
+
+#local DBG_RT_TEMPLATE :: #file_contents "./dbg_rt_template.onyx"
+
+generate_dbg_runtime_source :: (port: i32, allocator := context.temp_allocator) -> str {
+    out := make(dyn_str, DBG_RT_TEMPLATE.count + 128, allocator);
+    Array.concat(&out, "package __odit_dbg\n\n");
+    Array.concat(&out, tprintf("ODIT_DBG_PORT :: cast(u16) {}\n\n", port));
+    Array.concat(&out, DBG_RT_TEMPLATE);
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// 2. Scope-Aware Onyx Source Instrumenter
+// -----------------------------------------------------------------------------
+
+#local
+BlockKind :: enum {
+    ProcBody;
+    StmtBlock;
+    SwitchBody;
+    ExprBlock;
+}
+
+#local
+ScopeFrame :: struct {
+    kind: BlockKind;
+    vars: [..] str;
+}
+
+#local
+is_valid_ident :: (s: str) -> bool {
+    if s.count == 0 do return false;
+    if str.equal(s, "_") do return false;
+    c0 := s[0];
+    if !((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_') do return false;
+    for i in 1 .. s.count {
+        if !is_ident_ch(s[i]) do return false;
+    }
+    // Reject Onyx keywords
+    kws := str.[
+        "if", "elseif", "else", "for", "while", "switch", "case", "return",
+        "break", "continue", "defer", "use", "package", "struct", "enum",
+        "union", "interface", "macro", "cast", "sizeof", "alignof", "typeof",
+        "in", "do", "as", "true", "false", "null", "fallthrough"
+    ];
+    for kw in kws {
+        if str.equal(s, kw) do return false;
+    }
+    return true;
+}
+
+#local
+starts_with_kw :: (ln: str, kw: str) -> bool {
+    if !str.starts_with(ln, kw) do return false;
+    if ln.count == kw.count do return true;
+    nxt := ln[kw.count];
+    return !is_ident_ch(nxt);
+}
+
+#local
+add_var_unique :: (dst: &[..] str, name: str) {
+    if !is_valid_ident(name) do return;
+    for existing in *dst {
+        if str.equal(existing, name) do return;
+    }
+    *dst << name;
+}
+
+/// Parses parameter names (and optional named return names) from a proc header like:
+///   `foo :: (a: i32, b, c: f32, $T: type_expr, d := 5) -> (res: i32) {`
+#local
+extract_proc_param_names :: (sig: str, out_vars: &[..] str) {
+    // Find first `(` and its matching `)`
+    op := -1;
+    for i in 0 .. sig.count {
+        if sig[i] == '(' { op = i; break; }
+    }
+    if op < 0 do return;
+
+    depth := 0;
+    cl := -1;
+    for i in op .. sig.count {
+        if sig[i] == '(' do depth += 1;
+        elseif sig[i] == ')' {
+            depth -= 1;
+            if depth == 0 { cl = i; break; }
+        }
+    }
+    if cl <= op + 1 do return;
+
+    parse_param_list(sig[(op + 1) .. cl], out_vars);
+
+    // Check optional named returns after `-> (`
+    rest := sig[(cl + 1) .. sig.count];
+    if rest.count >= 2 do for i in 0 .. (rest.count - 1) {
+        if rest[i] == '-' && rest[i + 1] == '>' {
+            after := trim_s(rest[(i + 2) .. rest.count]);
+            if after.count > 2 && after[0] == '(' {
+                d2 := 0;
+                c2 := -1;
+                for j in 0 .. after.count {
+                    if after[j] == '(' do d2 += 1;
+                    elseif after[j] == ')' {
+                        d2 -= 1;
+                        if d2 == 0 { c2 = j; break; }
+                    }
+                }
+                if c2 > 1 {
+                    ret_inner := after[1 .. c2];
+                    // Only named returns contain `:`
+                    if str.contains(ret_inner, ":") {
+                        parse_param_list(ret_inner, out_vars);
+                    }
+                }
+            }
+            break;
+        }
+    }
+}
+
+#local
+parse_param_list :: (inner: str, out_vars: &[..] str) {
+    // Split on top-level commas, tracking group names like `a, b: i32`
+    pending := make([..] str, 8, context.temp_allocator);
+    start := 0;
+    pd := 0;
+    bd := 0;
+    cd := 0;
+
+    for i in 0 .. (inner.count + 1) {
+        c := inner[i] if i < inner.count else ',';
+        if i < inner.count {
+            if c == '(' do pd += 1;
+            elseif c == ')' do pd -= 1;
+            elseif c == '[' do bd += 1;
+            elseif c == ']' do bd -= 1;
+            elseif c == '{' do cd += 1;
+            elseif c == '}' do cd -= 1;
+        }
+        if (i == inner.count || c == ',') && pd == 0 && bd == 0 && cd == 0 {
+            part := trim_s(inner[start .. i]);
+            start = i + 1;
+            if part.count == 0 do continue;
+            // Strip leading `use ` on parameter (e.g. `use s: &Stream`)
+            if starts_with_kw(part, "use") {
+                part = trim_s(part[3 .. part.count]);
+            }
+            // Find `:` in parameter
+            col := -1;
+            for k in 0 .. part.count {
+                if part[k] == ':' { col = k; break; }
+            }
+            if col > 0 {
+                nm := trim_s(part[0 .. col]);
+                tp := trim_s(part[(col + 1) .. part.count]);
+                // Skip polymorphic `$T`, `type_expr`, `Code`, varargs `..`
+                skip := str.starts_with(nm, "$") ||
+                        str.contains(tp, "$") ||
+                        str.contains(tp, "type_expr") ||
+                        str.contains(tp, "Code") ||
+                        str.starts_with(tp, "..");
+                if !skip {
+                    for p in pending do add_var_unique(out_vars, p);
+                    add_var_unique(out_vars, nm);
+                }
+                Array.clear(&pending);
+            } else {
+                // Grouped parameter name before a later `: Type` (e.g. `x, y: f32`)
+                if is_valid_ident(part) {
+                    pending << part;
+                } else {
+                    Array.clear(&pending);
+                }
+            }
+        }
+    }
+}
+
+/// Extracts newly declared variable name(s) from a statement line:
+///   `x := ...`, `use x := ...`, `a, b := ...`, `x: i32 = ...`, `x: i32;`
+#local
+extract_decl_vars :: (ln: str, out_vars: &[..] str) {
+    s := ln;
+    if starts_with_kw(s, "use") {
+        rest := trim_s(s[3 .. s.count]);
+        // Only treat `use x := ...` or `use x: T = ...` as a local var (NOT `use core`!)
+        if !str.contains(rest, ":") do return;
+        s = rest;
+    }
+    if starts_with_kw(s, "if") || starts_with_kw(s, "elseif") || starts_with_kw(s, "while") ||
+       starts_with_kw(s, "for") || starts_with_kw(s, "switch") || starts_with_kw(s, "case") ||
+       starts_with_kw(s, "return") || starts_with_kw(s, "defer") {
+        return;
+    }
+
+    // Find first `:` outside strings/parens
+    col := -1;
+    in_s := false;
+    pd := 0;
+    for i in 0 .. s.count {
+        c := s[i];
+        if c == '"' && (i == 0 || s[i - 1] != '\\') { in_s = !in_s; continue; }
+        if in_s do continue;
+        if c == '/' && i + 1 < s.count && s[i + 1] == '/' do break;
+        if c == '(' || c == '[' || c == '{' do pd += 1;
+        elseif c == ')' || c == ']' || c == '}' do pd -= 1;
+        elseif c == ':' && pd == 0 {
+            col = i;
+            break;
+        }
+    }
+    if col <= 0 do return;
+    // Skip `::` compile-time constants / procs / structs
+    if col + 1 < s.count && s[col + 1] == ':' do return;
+
+    lhs := trim_s(s[0 .. col]);
+    // Ensure LHS is only comma-separated identifiers (no `.`, `[`, `=`, etc.)
+    start := 0;
+    for i in 0 .. (lhs.count + 1) {
+        if i == lhs.count || lhs[i] == ',' {
+            nm := trim_s(lhs[start .. i]);
+            start = i + 1;
+            if nm.count == 0 do continue;
+            if str.equal(nm, "_") do continue;
+            if !is_valid_ident(nm) do return; // Not a plain var decl
+        }
+    }
+    start = 0;
+    for i in 0 .. (lhs.count + 1) {
+        if i == lhs.count || lhs[i] == ',' {
+            nm := trim_s(lhs[start .. i]);
+            start = i + 1;
+            add_var_unique(out_vars, nm);
+        }
+    }
+}
+
+/// Extracts loop / branch / case-binding variables that belong to the block opened by `ln`.
+#local
+extract_block_header_vars :: (ln: str, out_vars: &[..] str) {
+    if starts_with_kw(ln, "for") {
+        rest := trim_s(ln[3 .. ln.count]);
+        // Look for ` in ` before `{` or `do`
+        in_pos := -1;
+        if rest.count >= 4 do for i in 0 .. (rest.count - 3) {
+            if rest[i] == '{' do break;
+            if (rest[i] == ' ' || rest[i] == '\t') && rest[i + 1] == 'i' && rest[i + 2] == 'n' &&
+               (rest[i + 3] == ' ' || rest[i + 3] == '\t') {
+                in_pos = i;
+                break;
+            }
+        }
+        if in_pos > 0 {
+            lhs := trim_s(rest[0 .. in_pos]);
+            start := 0;
+            for i in 0 .. (lhs.count + 1) {
+                if i == lhs.count || lhs[i] == ',' {
+                    nm := trim_s(lhs[start .. i]);
+                    start = i + 1;
+                    if str.starts_with(nm, "&") do nm = trim_s(nm[1 .. nm.count]);
+                    if str.starts_with(nm, "^") do nm = trim_s(nm[1 .. nm.count]);
+                    add_var_unique(out_vars, nm);
+                }
+            }
+        } else {
+            // `for 0 .. n {` implicitly binds `it`
+            add_var_unique(out_vars, "it");
+        }
+        return;
+    }
+
+    if starts_with_kw(ln, "if") || starts_with_kw(ln, "elseif") || starts_with_kw(ln, "while") {
+        kw_len := 6 if starts_with_kw(ln, "elseif") else (5 if starts_with_kw(ln, "while") else 2);
+        rest := trim_s(ln[kw_len .. ln.count]);
+        // Check for initializer `if x := expr; cond {`
+        semi := -1;
+        for i in 0 .. rest.count {
+            if rest[i] == '{' do break;
+            if rest[i] == ';' { semi = i; break; }
+        }
+        if semi > 0 {
+            extract_decl_vars(trim_s(rest[0 .. semi]), out_vars);
+        }
+        // Check for optional unwrap `if opt as val {` or `if opt as &val {`
+        if rest.count >= 4 do for i in 0 .. (rest.count - 3) {
+            if rest[i] == '{' do break;
+            if (rest[i] == ' ' || rest[i] == '\t') && rest[i + 1] == 'a' && rest[i + 2] == 's' &&
+               (rest[i + 3] == ' ' || rest[i + 3] == '\t') {
+                after := trim_s(rest[(i + 4) .. rest.count]);
+                if str.starts_with(after, "&") do after = trim_s(after[1 .. after.count]);
+                end := 0;
+                while end < after.count && is_ident_ch(after[end]) do end += 1;
+                if end > 0 do add_var_unique(out_vars, after[0 .. end]);
+                break;
+            }
+        }
+        return;
+    }
+
+    if starts_with_kw(ln, "case") {
+        // Check for `case .Variant as v {` or `case .Variant as &v {`
+        if ln.count >= 4 do for i in 0 .. (ln.count - 3) {
+            if ln[i] == '{' do break;
+            if (ln[i] == ' ' || ln[i] == '\t') && ln[i + 1] == 'a' && ln[i + 2] == 's' &&
+               (ln[i + 3] == ' ' || ln[i + 3] == '\t') {
+                after := trim_s(ln[(i + 4) .. ln.count]);
+                if str.starts_with(after, "&") do after = trim_s(after[1 .. after.count]);
+                end := 0;
+                while end < after.count && is_ident_ch(after[end]) do end += 1;
+                if end > 0 do add_var_unique(out_vars, after[0 .. end]);
+                break;
+            }
+        }
+    }
+}
+
+#local
+emit_hook :: (out: &dyn_str, rel_path: str, line_1: u32, scopes: [] ScopeFrame) {
+    Array.concat(out, tprintf("if __odit_dbg.will_pause(\"{}\", {}) {{ __odit_dbg.begin_vars(); ", json_esc_wat(rel_path), line_1));
+    // Collect visible variables from outer -> inner scopes (deduplicated)
+    emitted := make([..] str, 24, context.temp_allocator);
+    for &sc in scopes {
+        for v in sc.vars {
+            seen := false;
+            for ev in emitted {
+                if str.equal(ev, v) { seen = true; break; }
+            }
+            if !seen {
+                emitted << v;
+                Array.concat(out, tprintf("__odit_dbg.var(\"{}\", {}); ", v, v));
+            }
+        }
+    }
+    Array.concat(out, tprintf("__odit_dbg.pause(\"{}\", {}); }} ", json_esc_wat(rel_path), line_1));
+}
+
+#local
+strip_line_comment :: (ln: str) -> str {
+    in_s := false;
+    in_c := false;
+    for i in 0 .. ln.count {
+        c := ln[i];
+        if in_s {
+            if c == '\\' && i + 1 < ln.count { continue; }
+            if c == '"' && (i == 0 || ln[i - 1] != '\\') do in_s = false;
+        } elseif in_c {
+            if c == '\'' && (i == 0 || ln[i - 1] != '\\') do in_c = false;
+        } else {
+            if c == '"' do in_s = true;
+            elseif c == '\'' do in_c = true;
+            elseif c == '/' && i + 1 < ln.count && ln[i + 1] == '/' {
+                return trim_s(ln[0 .. i]);
+            }
+        }
+    }
+    return trim_s(ln);
+}
+
+#local
+ends_with_continuation :: (code: str) -> bool {
+    if code.count == 0 do return false;
+    last := code[code.count - 1];
+    if last == '(' || last == '[' || last == ',' || last == '=' ||
+       last == '+' || last == '-' || last == '*' || last == '/' ||
+       last == '&' || last == '|' || last == '?' || last == ':' ||
+       last == '.' || last == '<' || last == '>' || last == '^' {
+        return true;
+    }
+    if str.ends_with(code, "=>") || str.ends_with(code, "->") ||
+       str.ends_with(code, "&&") || str.ends_with(code, "||") ||
+       str.ends_with(code, "<<") || str.ends_with(code, "do") ||
+       str.ends_with(code, "in") {
+        return true;
+    }
+    return false;
+}
+
+/// Checks if a single-line loop (`for ... do <body>` or `while ... do <body>`) can be
+/// safely expanded into a braced block with a per-iteration pause hook.
+#local
+find_do_split :: (code: str) -> i32 {
+    if !starts_with_kw(code, "for") && !starts_with_kw(code, "while") do return -1;
+    in_s := false;
+    pd := 0;
+    bd := 0;
+    if code.count >= 4 do for i in 0 .. (code.count - 3) {
+        c := code[i];
+        if c == '"' && (i == 0 || code[i - 1] != '\\') { in_s = !in_s; continue; }
+        if in_s do continue;
+        if c == '{' do return -1; // already braced
+        if c == '(' do pd += 1;
+        elseif c == ')' do pd -= 1;
+        elseif c == '[' do bd += 1;
+        elseif c == ']' do bd -= 1;
+        if pd == 0 && bd == 0 && (c == ' ' || c == '\t') &&
+           code[i + 1] == 'd' && code[i + 2] == 'o' &&
+           (code[i + 3] == ' ' || code[i + 3] == '\t') {
+            return i + 1;
+        }
+    }
+    return -1;
+}
+
+/// Instruments an Onyx source file for live debugging while preserving line semantics.
+instrument_onyx_source :: (src: str, rel_path: str, rt_load_rel: str, is_entry: bool, allocator := context.temp_allocator) -> str {
+    lines := split_lines(src, context.temp_allocator);
+    procs := parse_procs_in_source(lines, rel_path, context.temp_allocator);
+
+    out := make(dyn_str, src.count * 2 + 1024, allocator);
+
+    // Find insertion point for `#load` / `use __odit_dbg` (must be AFTER `package ...` if present)
+    pkg_line_idx := -1;
+    for i in 0 .. lines.count {
+        t := trim_s(lines[i]);
+        if t.count == 0 || str.starts_with(t, "//") do continue;
+        if starts_with_kw(t, "package") {
+            pkg_line_idx = i;
+        }
+        break;
+    }
+
+    inject_header :: (dst: &dyn_str, rt_rel: str, entry: bool) {
+        if entry && rt_rel.count > 0 {
+            Array.concat(dst, tprintf("#load \"{}\"\n", rt_rel));
+        }
+        Array.concat(dst, "use __odit_dbg\n");
+    };
+
+    if pkg_line_idx < 0 {
+        inject_header(&out, rt_load_rel, is_entry);
+    }
+
+    in_raw_str   := false;
+    in_blk_comm  := false;
+
+    in_proc      := false;
+    active_proc: &ParsedProc = null;
+    proc_entered := false;
+    proc_header_buf := make(dyn_str, 256, context.temp_allocator);
+
+    scopes := make([..] ScopeFrame, 16, context.temp_allocator);
+    paren_depth   := 0;
+    bracket_depth := 0;
+    prev_cont     := false;
+
+    for i in 0 .. lines.count {
+        raw_ln  := lines[i];
+        line_1  := cast(u32) (i + 1);
+        t       := trim_s(raw_ln);
+        code    := strip_line_comment(raw_ln);
+
+        // Emit package line first, then inject `#load` + `use __odit_dbg` right after it
+        if i == pkg_line_idx {
+            Array.concat(&out, raw_ln);
+            Array.concat(&out, "\n");
+            inject_header(&out, rt_load_rel, is_entry);
+            continue;
+        }
+
+        // Check if this line begins a top-level instrumentable procedure
+        if !in_proc && !in_raw_str && !in_blk_comm {
+            for &p in procs {
+                if p.start_line == line_1 {
+                    // Skip macros or polymorphic procedures with `$` or `Code`
+                    if !str.contains(p.sig_line, "macro") {
+                        in_proc      = true;
+                        active_proc  = p;
+                        proc_entered = false;
+                        Array.clear(&proc_header_buf);
+                        Array.clear(&scopes);
+                        paren_depth   = 0;
+                        bracket_depth = 0;
+                        prev_cont     = false;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if !in_proc {
+            Array.concat(&out, raw_ln);
+            Array.concat(&out, "\n");
+            // Still track multi-line strings/block comments outside procs
+            k := 0;
+            while k < raw_ln.count {
+                if in_raw_str {
+                    if k + 2 < raw_ln.count && raw_ln[k] == '"' && raw_ln[k + 1] == '"' && raw_ln[k + 2] == '"' {
+                        in_raw_str = false; k += 3; continue;
+                    }
+                    k += 1; continue;
+                }
+                if in_blk_comm {
+                    if k + 1 < raw_ln.count && raw_ln[k] == '*' && raw_ln[k + 1] == '/' {
+                        in_blk_comm = false; k += 2; continue;
+                    }
+                    k += 1; continue;
+                }
+                if k + 1 < raw_ln.count && raw_ln[k] == '/' && raw_ln[k + 1] == '/' do break;
+                if k + 1 < raw_ln.count && raw_ln[k] == '/' && raw_ln[k + 1] == '*' { in_blk_comm = true; k += 2; continue; }
+                if k + 2 < raw_ln.count && raw_ln[k] == '"' && raw_ln[k + 1] == '"' && raw_ln[k + 2] == '"' { in_raw_str = true; k += 3; continue; }
+                k += 1;
+            }
+            continue;
+        }
+
+        // Inside a procedure: wait until the opening `{` of the procedure body
+        if !proc_entered {
+            Array.concat(&proc_header_buf, code);
+            Array.concat(&proc_header_buf, " ");
+            // Find opening `{` on this line outside strings/comments
+            open_pos := -1;
+            in_s := false;
+            for k in 0 .. raw_ln.count {
+                c := raw_ln[k];
+                if c == '"' && (k == 0 || raw_ln[k - 1] != '\\') { in_s = !in_s; continue; }
+                if in_s do continue;
+                if c == '/' && k + 1 < raw_ln.count && raw_ln[k + 1] == '/' do break;
+                if c == '{' { open_pos = k; break; }
+            }
+            if open_pos >= 0 {
+                // Emit up through `{`, then inject enter/leave
+                Array.concat(&out, raw_ln[0 .. (open_pos + 1)]);
+                Array.concat(&out, tprintf(" __odit_dbg.enter(\"{}\", \"{}\", {}); defer __odit_dbg.leave();",
+                    json_esc_wat(rel_path), json_esc_wat(active_proc.name), active_proc.start_line));
+                rest_after := raw_ln[(open_pos + 1) .. raw_ln.count];
+                Array.concat(&out, rest_after);
+                Array.concat(&out, "\n");
+
+                proc_entered = true;
+                root_scope: ScopeFrame;
+                root_scope.kind = .ProcBody;
+                root_scope.vars = make([..] str, 16, context.temp_allocator);
+                extract_proc_param_names(str.{ proc_header_buf.data, proc_header_buf.count }, &root_scope.vars);
+                scopes << root_scope;
+
+                // Handle single-line proc `foo :: () { return 1; }` closing on the same line
+                if str.contains(strip_line_comment(rest_after), "}") {
+                    // Count braces in rest_after
+                    for k in 0 .. rest_after.count {
+                        if rest_after[k] == '}' && scopes.count > 0 do scopes.count -= 1;
+                    }
+                    if scopes.count == 0 {
+                        in_proc = false;
+                        active_proc = null;
+                    }
+                }
+            } else {
+                Array.concat(&out, raw_ln);
+                Array.concat(&out, "\n");
+            }
+            continue;
+        }
+
+        // Inside the procedure body!
+        top_kind := scopes[scopes.count - 1].kind if scopes.count > 0 else BlockKind.ExprBlock;
+        is_stmt_ctx := !in_raw_str && !in_blk_comm &&
+                       paren_depth == 0 && bracket_depth == 0 &&
+                       !prev_cont &&
+                       (top_kind == .ProcBody || top_kind == .StmtBlock);
+
+        // Determine if this line is a safe executable statement start
+        can_hook := is_stmt_ctx && code.count > 0 &&
+                    code[0] != '}' && code[0] != '#' && code[0] != '@' &&
+                    !starts_with_kw(code, "else") &&
+                    !starts_with_kw(code, "elseif") &&
+                    !starts_with_kw(code, "case") &&
+                    !starts_with_kw(code, "package") &&
+                    !starts_with_kw(code, "struct") &&
+                    !starts_with_kw(code, "enum") &&
+                    !starts_with_kw(code, "union") &&
+                    !starts_with_kw(code, "macro");
+
+        // Skip `use pkg` imports (without `:=`) and local `Foo :: ...` declarations
+        if can_hook && starts_with_kw(code, "use") && !str.contains(code, ":") {
+            can_hook = false;
+        }
+        if can_hook {
+            // Skip `Name :: ...` local compile-time decls (outside strings)
+            in_s := false;
+            if code.count >= 2 do for k in 0 .. (code.count - 1) {
+                if code[k] == '"' && (k == 0 || code[k - 1] != '\\') { in_s = !in_s; continue; }
+                if in_s do continue;
+                if code[k] == '(' || code[k] == '=' || code[k] == '{' do break;
+                if code[k] == ':' && code[k + 1] == ':' {
+                    can_hook = false;
+                    break;
+                }
+            }
+        }
+
+        // Handle single-line `for ... do <body>` / `while ... do <body>` loop expansion!
+        do_idx := find_do_split(code) if can_hook else -1;
+        if do_idx > 0 {
+            // Preserve leading indentation
+            indent_end := 0;
+            while indent_end < raw_ln.count && (raw_ln[indent_end] == ' ' || raw_ln[indent_end] == '\t') do indent_end += 1;
+            Array.concat(&out, raw_ln[0 .. indent_end]);
+            emit_hook(&out, rel_path, line_1, scopes);
+
+            loop_hdr  := code[0 .. do_idx];
+            loop_body := trim_s(code[(do_idx + 2) .. code.count]);
+
+            // Temporarily push loop variables for the inner body hook
+            loop_sc: ScopeFrame;
+            loop_sc.kind = .StmtBlock;
+            loop_sc.vars = make([..] str, 4, context.temp_allocator);
+            extract_block_header_vars(code, &loop_sc.vars);
+            scopes << loop_sc;
+
+            Array.concat(&out, loop_hdr);
+            Array.concat(&out, "{ ");
+            emit_hook(&out, rel_path, line_1, scopes);
+            Array.concat(&out, loop_body);
+            Array.concat(&out, " }\n");
+
+            scopes.count -= 1;
+            prev_cont = false;
+            continue;
+        }
+
+        if can_hook {
+            // Preserve leading indentation
+            indent_end := 0;
+            while indent_end < raw_ln.count && (raw_ln[indent_end] == ' ' || raw_ln[indent_end] == '\t') do indent_end += 1;
+            Array.concat(&out, raw_ln[0 .. indent_end]);
+            emit_hook(&out, rel_path, line_1, scopes);
+            Array.concat(&out, raw_ln[indent_end .. raw_ln.count]);
+            Array.concat(&out, "\n");
+        } else {
+            Array.concat(&out, raw_ln);
+            Array.concat(&out, "\n");
+        }
+
+        // Update variable scopes & lexical delimiters from this line
+        if is_stmt_ctx && code.count > 0 && scopes.count > 0 {
+            extract_decl_vars(code, &scopes[scopes.count - 1].vars);
+        }
+
+        // Prepare header variables (e.g. `for i in ...`, `if x := ...;`, `case .Ok as v`) for any `{` opened on this line
+        pending_hdr_vars := make([..] str, 4, context.temp_allocator);
+        is_stmt_block_hdr := false;
+        is_switch_hdr     := false;
+        if !in_raw_str && !in_blk_comm && paren_depth == 0 && bracket_depth == 0 {
+            check_ln := code;
+            // Handle `} else {` / `} elseif ... {`
+            if str.starts_with(check_ln, "}") {
+                check_ln = trim_s(check_ln[1 .. check_ln.count]);
+            }
+            if starts_with_kw(check_ln, "for") || starts_with_kw(check_ln, "while") ||
+               starts_with_kw(check_ln, "if")  || starts_with_kw(check_ln, "elseif") ||
+               starts_with_kw(check_ln, "else") || starts_with_kw(check_ln, "case") ||
+               starts_with_kw(check_ln, "defer") || str.starts_with(check_ln, "#if") ||
+               str.starts_with(check_ln, "#elseif") || str.starts_with(check_ln, "#else") {
+                is_stmt_block_hdr = true;
+                extract_block_header_vars(check_ln, &pending_hdr_vars);
+            } elseif starts_with_kw(check_ln, "switch") {
+                is_switch_hdr = true;
+            }
+        }
+
+        // Scan characters on this line to update strings, comments, parens, brackets, and `{`/`}` scopes
+        k := 0;
+        in_str  := false;
+        in_chr  := false;
+        while k < raw_ln.count {
+            if in_raw_str {
+                if k + 2 < raw_ln.count && raw_ln[k] == '"' && raw_ln[k + 1] == '"' && raw_ln[k + 2] == '"' {
+                    in_raw_str = false; k += 3; continue;
+                }
+                k += 1; continue;
+            }
+            if in_blk_comm {
+                if k + 1 < raw_ln.count && raw_ln[k] == '*' && raw_ln[k + 1] == '/' {
+                    in_blk_comm = false; k += 2; continue;
+                }
+                k += 1; continue;
+            }
+            c := raw_ln[k];
+            if in_str {
+                if c == '\\' && k + 1 < raw_ln.count { k += 2; continue; }
+                if c == '"' do in_str = false;
+                k += 1; continue;
+            }
+            if in_chr {
+                if c == '\\' && k + 1 < raw_ln.count { k += 2; continue; }
+                if c == '\'' do in_chr = false;
+                k += 1; continue;
+            }
+            if c == '/' && k + 1 < raw_ln.count && raw_ln[k + 1] == '/' do break;
+            if c == '/' && k + 1 < raw_ln.count && raw_ln[k + 1] == '*' { in_blk_comm = true; k += 2; continue; }
+            if c == '"' && k + 2 < raw_ln.count && raw_ln[k + 1] == '"' && raw_ln[k + 2] == '"' {
+                in_raw_str = true; k += 3; continue;
+            }
+            if c == '"'  { in_str = true; k += 1; continue; }
+            if c == '\'' { in_chr = true; k += 1; continue; }
+
+            if c == '(' do paren_depth += 1;
+            elseif c == ')' && paren_depth > 0 do paren_depth -= 1;
+            elseif c == '[' do bracket_depth += 1;
+            elseif c == ']' && bracket_depth > 0 do bracket_depth -= 1;
+            elseif c == '{' {
+                // Determine block kind
+                prev_ch: u8 = 0;
+                p := k - 1;
+                while p >= 0 && (raw_ln[p] == ' ' || raw_ln[p] == '\t') do p -= 1;
+                if p >= 0 do prev_ch = raw_ln[p];
+
+                bk := BlockKind.ExprBlock;
+                if paren_depth == 0 && bracket_depth == 0 && prev_ch != '.' && prev_ch != '=' && prev_ch != ',' && prev_ch != ':' && prev_ch != '(' && prev_ch != '[' {
+                    if is_switch_hdr {
+                        bk = .SwitchBody;
+                        is_switch_hdr = false;
+                    } elseif is_stmt_block_hdr || prev_ch == 0 {
+                        bk = .StmtBlock;
+                        is_stmt_block_hdr = false;
+                    }
+                }
+                nf: ScopeFrame;
+                nf.kind = bk;
+                nf.vars = make([..] str, 8, context.temp_allocator);
+                if bk == .StmtBlock {
+                    for v in pending_hdr_vars do nf.vars << v;
+                    Array.clear(&pending_hdr_vars);
+                }
+                scopes << nf;
+            } elseif c == '}' {
+                if scopes.count > 0 {
+                    scopes.count -= 1;
+                }
+                if scopes.count == 0 {
+                    in_proc     = false;
+                    active_proc = null;
+                    break;
+                }
+            }
+            k += 1;
+        }
+
+        if code.count > 0 && !in_raw_str && !in_blk_comm {
+            prev_cont = ends_with_continuation(code);
+        }
+    }
+
+    return out;
+}

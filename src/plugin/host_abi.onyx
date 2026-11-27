@@ -923,6 +923,9 @@ __odit_host_dispatch :: (handle: u32, opcode: u32) -> void {
         }
 
         case 92 { // debug_start(entry_ptr, entry_len) -> i32
+            if g_host_ctx.ed.buf.dirty && g_host_ctx.ed.buf.path.count > 0 {
+                editor.buffer_save_file(&g_host_ctx.ed.buf);
+            }
             entry := guest_read_str(handle, arg_u32(0), arg_u32(1));
             rc := services.dbg_start(
                 entry,

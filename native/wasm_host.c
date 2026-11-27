@@ -13,14 +13,18 @@
 #define ONYX_LIBRARY_NAME odit_wasm_host
 #include <onyx_library.h>
 
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -1152,6 +1156,139 @@ ONYX_DEF(native_proc_kill, (INT), (INT)) {
     return NULL;
 }
 
+// -----------------------------------------------------------------------------
+// Live Debugger Non-Blocking Loopback TCP IPC Server (`127.0.0.1:<ephemeral>`)
+// -----------------------------------------------------------------------------
+
+static int g_dbg_listen_fd = -1;
+static int g_dbg_client_fd = -1;
+
+static void dbg_close_fds(void) {
+    if (g_dbg_client_fd >= 0) { close(g_dbg_client_fd); g_dbg_client_fd = -1; }
+    if (g_dbg_listen_fd >= 0) { close(g_dbg_listen_fd); g_dbg_listen_fd = -1; }
+}
+
+// native_dbg_server_start() -> i32 (assigned TCP port, or -1 on error)
+ONYX_DEF(native_dbg_server_start, (), (INT)) {
+    dbg_close_fds();
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        results->data[0] = WASM_I32_VAL(-1);
+        return NULL;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0; // kernel picks free ephemeral port
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(fd, 4) != 0) {
+        close(fd);
+        results->data[0] = WASM_I32_VAL(-1);
+        return NULL;
+    }
+
+    socklen_t alen = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *)&addr, &alen) != 0) {
+        close(fd);
+        results->data[0] = WASM_I32_VAL(-1);
+        return NULL;
+    }
+
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+    g_dbg_listen_fd = fd;
+    results->data[0] = WASM_I32_VAL((int32_t)ntohs(addr.sin_port));
+    return NULL;
+}
+
+// native_dbg_server_accept() -> i32 (1=connected, 0=pending, -1=error)
+ONYX_DEF(native_dbg_server_accept, (), (INT)) {
+    if (g_dbg_client_fd >= 0) {
+        results->data[0] = WASM_I32_VAL(1);
+        return NULL;
+    }
+    if (g_dbg_listen_fd < 0) {
+        results->data[0] = WASM_I32_VAL(-1);
+        return NULL;
+    }
+    int cfd = accept(g_dbg_listen_fd, NULL, NULL);
+    if (cfd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            results->data[0] = WASM_I32_VAL(0);
+        } else {
+            results->data[0] = WASM_I32_VAL(-1);
+        }
+        return NULL;
+    }
+    int one = 1;
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    int fl = fcntl(cfd, F_GETFL, 0);
+    if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+    g_dbg_client_fd = cfd;
+    results->data[0] = WASM_I32_VAL(1);
+    return NULL;
+}
+
+// native_dbg_server_read(out_ptr, out_cap) -> i32 (>0 bytes, 0=EAGAIN, -1=EOF/closed)
+ONYX_DEF(native_dbg_server_read, (PTR, INT), (INT)) {
+    void *dst = ONYX_PTR(params->data[0].of.i32);
+    int cap = params->data[1].of.i32;
+    if (g_dbg_client_fd < 0 || !dst || cap <= 0) {
+        results->data[0] = WASM_I32_VAL(-1);
+        return NULL;
+    }
+    ssize_t r = recv(g_dbg_client_fd, dst, (size_t)cap, 0);
+    if (r > 0) {
+        results->data[0] = WASM_I32_VAL((int32_t)r);
+    } else if (r == 0) {
+        close(g_dbg_client_fd);
+        g_dbg_client_fd = -1;
+        results->data[0] = WASM_I32_VAL(-1);
+    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        results->data[0] = WASM_I32_VAL(0);
+    } else {
+        close(g_dbg_client_fd);
+        g_dbg_client_fd = -1;
+        results->data[0] = WASM_I32_VAL(-1);
+    }
+    return NULL;
+}
+
+// native_dbg_server_write(src_ptr, src_len) -> i32
+ONYX_DEF(native_dbg_server_write, (PTR, INT), (INT)) {
+    const uint8_t *src = (const uint8_t *)ONYX_PTR(params->data[0].of.i32);
+    int len = params->data[1].of.i32;
+    if (g_dbg_client_fd < 0 || !src || len <= 0) {
+        results->data[0] = WASM_I32_VAL(-1);
+        return NULL;
+    }
+    int total = 0;
+    while (total < len) {
+        ssize_t w = send(g_dbg_client_fd, src + total, (size_t)(len - total), MSG_NOSIGNAL);
+        if (w > 0) {
+            total += (int)w;
+        } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(1000);
+        } else {
+            results->data[0] = WASM_I32_VAL(-1);
+            return NULL;
+        }
+    }
+    results->data[0] = WASM_I32_VAL(total);
+    return NULL;
+}
+
+// native_dbg_server_close() -> void
+ONYX_DEF(native_dbg_server_close, (), ()) {
+    dbg_close_fds();
+    return NULL;
+}
+
 ONYX_LIBRARY {
     ONYX_FUNC(wasm_host_init)
     ONYX_FUNC(wasm_host_last_error)
@@ -1173,5 +1310,10 @@ ONYX_LIBRARY {
     ONYX_FUNC(native_proc_read)
     ONYX_FUNC(native_proc_poll)
     ONYX_FUNC(native_proc_kill)
+    ONYX_FUNC(native_dbg_server_start)
+    ONYX_FUNC(native_dbg_server_accept)
+    ONYX_FUNC(native_dbg_server_read)
+    ONYX_FUNC(native_dbg_server_write)
+    ONYX_FUNC(native_dbg_server_close)
     NULL
 };

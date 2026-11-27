@@ -1,37 +1,76 @@
 package odit.services
 
 // =============================================================================
-// Onyx Editor ("odit") — Live Onyx <-> WASM Debugger Service
+// Onyx Editor ("odit") — Real Live Onyx Debugger Service
 // =============================================================================
-// Manages line breakpoints, compiles & disassembles the target Onyx program
-// with `--generate-name-section` + `wasm2wat`, maps executable Onyx source
-// lines to their corresponding WAT instruction ranges (`SourceWatMap`),
-// parses procedure parameters/locals, and provides StepOver, StepInstruction
-// (WAT-level), StepInto, StepOut, Continue, and Stop controls.
+// Runs the user's actual Onyx program inside a non-destructive shadow workspace
+// (`.odit/dbg_shadow/`) with scope-aware source instrumentation and a live
+// loopback TCP protocol (`127.0.0.1:<ephemeral>`).
+//
+// Features:
+//   - 100% real Onyx execution: loops (`for`, `while`), `break`, `continue`,
+//     `if`/`elseif`/`else`, `switch`, recursion, `defer`, `use`, `--param`
+//     flags, indirect calls (`aoc.run()`), file I/O, and live stdout/stderr.
+//   - Real breakpoints across multiple files (dynamically synced mid-session).
+//   - Real Step Over (`F10`), Step Into (`F11`), Step Out (`Shift+F11`),
+//     Continue (`F5`), Pause, and Stop (`Shift+F5`).
+//   - Live local variable & parameter inspection with change highlighting,
+//     real call stack frames, program console output, and optional WAT view.
 
 use core { package, os, Array, tprintf }
 use odit.abi
+
+#library "odit_wasm_host"
+
+#local
+#foreign "odit_wasm_host" {
+    native_proc_spawn       :: (cmd_ptr: rawptr, cmd_len: i32, args_ptr: rawptr, args_len: i32, cwd_ptr: rawptr, cwd_len: i32) -> u32 ---
+    native_proc_read        :: (handle: u32, stream_mask: i32, out_ptr: rawptr, out_cap: i32) -> i32 ---
+    native_proc_poll        :: (handle: u32, out_exit_code: &i32) -> u32 ---
+    native_proc_kill        :: (handle: u32) -> i32 ---
+
+    native_dbg_server_start  :: () -> i32 ---
+    native_dbg_server_accept :: () -> i32 ---
+    native_dbg_server_read   :: (out_ptr: rawptr, out_cap: i32) -> i32 ---
+    native_dbg_server_write  :: (src_ptr: rawptr, src_len: i32) -> i32 ---
+    native_dbg_server_close  :: () -> void ---
+}
+
+#local dbg_proc_spawn :: native_proc_spawn
+#local dbg_proc_read  :: native_proc_read
+#local dbg_proc_poll  :: native_proc_poll
+#local dbg_proc_kill  :: native_proc_kill
+#local dbg_srv_start  :: native_dbg_server_start
+#local dbg_srv_accept :: native_dbg_server_accept
+#local dbg_srv_read   :: native_dbg_server_read
+#local dbg_srv_write  :: native_dbg_server_write
+#local dbg_srv_close  :: native_dbg_server_close
 
 Breakpoint :: struct {
     path: str;
     line: u32; // 1-based line number
 }
 
-CallFrame :: struct {
-    source_path:      str;
-    func_name:        str;
-    line:             u32;
-    wat_line:         i32;
-    saved_args:       [..] EvalVal;
+LiveFrame :: struct {
+    func: str;
+    path: str;
+    line: u32;
+}
+
+LiveVar :: struct {
+    name:    str;
+    type:    str;
+    value:   str;
+    changed: bool;
 }
 
 ParsedProc :: struct {
     name:       str;
-    wat_hint:   str;  // Exact WAT symbol name or `unnamed_at` file+line suffix
-    start_line: u32;  // 1-based
-    end_line:   u32;  // 1-based inclusive
+    wat_hint:   str;
+    start_line: u32;
+    end_line:   u32;
     sig_line:   str;
-    is_tagged:  bool; // True for `@tag` anonymous or tagged procedures (e.g. `@aoc.part1`)
+    is_tagged:  bool;
 }
 
 DebuggerState :: struct {
@@ -39,21 +78,40 @@ DebuggerState :: struct {
     entry_path:       str;
     explicit_entry:   bool;
     extra_args:       [..] str;
+    prog_args:        [..] str;
+
     source_path:      str;
     current_line:     u32;
     current_func:     str;
+    pause_reason:     str;
+    exit_code:        i32;
     current_wat_line: i32;
     wat_text:         str;
     wat_line_count:   i32;
+    last_wat_func:    str;
+    last_wat_path:    str;
     last_error:       str;
 
-    breakpoints:        [..] Breakpoint;
-    line_map:           [..] abi.SourceWatMap;
-    locals:             [..] abi.DebugVariable;
-    exec_lines:         [..] u32;
-    call_stack:         [..] CallFrame;
-    active_call_args:   [..] EvalVal;
-    visited_tagged_cnt: i32;
+    breakpoints:      [..] Breakpoint;
+    line_map:         [..] abi.SourceWatMap;
+    locals:           [..] LiveVar;
+    frames:           [..] LiveFrame;
+    output_lines:     [..] str;
+    output_partial:   [..] u8;
+
+    // Live child process + TCP IPC state
+    proc_handle:      u32;
+    tcp_port:         i32;
+    tcp_connected:    bool;
+    rx_buf:           [..] u8;
+    collecting_pause: bool;
+    pend_file:        str;
+    pend_func:        str;
+    pend_line:        u32;
+    pend_reason:      str;
+    pend_frames:      [..] LiveFrame;
+    pend_vars:        [..] LiveVar;
+    buf_version:      u32;
 
     dirty:            bool;
     markers_dirty:    bool;
@@ -66,22 +124,46 @@ dbg_init :: () {
     g_dbg.entry_path       = "";
     g_dbg.explicit_entry   = false;
     g_dbg.extra_args       = make([..] str);
+    g_dbg.prog_args        = make([..] str);
     g_dbg.source_path      = "";
     g_dbg.current_line     = 0;
     g_dbg.current_func     = "";
+    g_dbg.pause_reason     = "";
+    g_dbg.exit_code        = 0;
     g_dbg.current_wat_line = -1;
     g_dbg.wat_text         = "";
     g_dbg.wat_line_count   = 0;
+    g_dbg.last_wat_func    = "";
+    g_dbg.last_wat_path    = "";
     g_dbg.last_error       = "";
+
     g_dbg.breakpoints      = make([..] Breakpoint);
     g_dbg.line_map         = make([..] abi.SourceWatMap);
-    g_dbg.locals           = make([..] abi.DebugVariable);
-    g_dbg.exec_lines       = make([..] u32);
-    g_dbg.call_stack       = make([..] CallFrame);
-    g_dbg.active_call_args = make([..] EvalVal);
+    g_dbg.locals           = make([..] LiveVar);
+    g_dbg.frames           = make([..] LiveFrame);
+    g_dbg.output_lines     = make([..] str);
+    g_dbg.output_partial   = make([..] u8);
+
+    g_dbg.proc_handle      = 0;
+    g_dbg.tcp_port         = -1;
+    g_dbg.tcp_connected    = false;
+    g_dbg.rx_buf           = make([..] u8, 2048);
+    g_dbg.collecting_pause = false;
+    g_dbg.pend_file        = "";
+    g_dbg.pend_func        = "";
+    g_dbg.pend_line        = 0;
+    g_dbg.pend_reason      = "";
+    g_dbg.pend_frames      = make([..] LiveFrame);
+    g_dbg.pend_vars        = make([..] LiveVar);
+    g_dbg.buf_version      = 0;
+
     g_dbg.dirty            = false;
     g_dbg.markers_dirty    = false;
 }
+
+// -----------------------------------------------------------------------------
+// Breakpoint Management
+// -----------------------------------------------------------------------------
 
 dbg_has_breakpoint :: (path: str, line: u32) -> bool {
     for &bp in g_dbg.breakpoints {
@@ -99,13 +181,25 @@ dbg_toggle_breakpoint :: (path: str, line: u32) -> u32 {
             Array.remove_at(&g_dbg.breakpoints, i);
             g_dbg.dirty         = true;
             g_dbg.markers_dirty = true;
+            if g_dbg.tcp_connected do sync_breakpoints_to_child();
             return 0;
         }
     }
     g_dbg.breakpoints << .{ str.copy(path), line };
     g_dbg.dirty         = true;
     g_dbg.markers_dirty = true;
+    if g_dbg.tcp_connected do sync_breakpoints_to_child();
     return 1;
+}
+
+dbg_clear_breakpoints :: () {
+    for &bp in g_dbg.breakpoints {
+        if bp.path.count > 0 do str.free(bp.path);
+    }
+    Array.clear(&g_dbg.breakpoints);
+    g_dbg.dirty         = true;
+    g_dbg.markers_dirty = true;
+    if g_dbg.tcp_connected do sync_breakpoints_to_child();
 }
 
 dbg_get_breakpoints_json :: (path: str, allocator := context.temp_allocator) -> str {
@@ -123,7 +217,7 @@ dbg_get_breakpoints_json :: (path: str, allocator := context.temp_allocator) -> 
 }
 
 // -----------------------------------------------------------------------------
-// Source Procedure Parsing & Onyx <-> WAT Mapping
+// Shared Source Parsing Helpers (Used by Instrumenter, Eval & Unit Tests)
 // -----------------------------------------------------------------------------
 
 #package
@@ -157,8 +251,6 @@ split_lines :: (src: str, allocator := context.temp_allocator) -> [..] str {
 
 #local
 make_unnamed_wat_hint :: (source_path: str, line_1: u32, allocator := context.temp_allocator) -> str {
-    // Onyx names anonymous procedures: `$unnamed_at_<sanitized_abs_path>_<1based_line>`
-    // Matching `<sanitized_rel_path>_<line_1>` uniquely matches the suffix!
     out := make(dyn_str, source_path.count + 16, allocator);
     for i in 0 .. source_path.count {
         c := source_path[i];
@@ -180,10 +272,14 @@ find_brace_block_end :: (lines: [] str, start_i: i32) -> (end_i: i32, found: boo
     j := start_i;
     while j < lines.count {
         l := lines[j];
+        in_s := false;
         for k in 0 .. l.count {
-            if l[k] == '/' && k + 1 < l.count && l[k + 1] == '/' do break;
-            if l[k] == '{' { depth += 1; found_brace = true; }
-            elseif l[k] == '}' { depth -= 1; }
+            c := l[k];
+            if c == '"' && (k == 0 || l[k - 1] != '\\') { in_s = !in_s; continue; }
+            if in_s do continue;
+            if c == '/' && k + 1 < l.count && l[k + 1] == '/' do break;
+            if c == '{' { depth += 1; found_brace = true; }
+            elseif c == '}' { depth -= 1; }
         }
         res_end = j;
         if found_brace && depth <= 0 do break;
@@ -205,7 +301,6 @@ parse_procs_in_source :: (lines: [] str, source_path: str = "", allocator := con
             i += 1;
             continue;
         }
-        // Track `@tag` directives (e.g. `@aoc.part1`, `@test.it.{...}`) attached to the next proc
         if ln[0] == '@' {
             pending_tag = ln;
             pending_tag_line = i;
@@ -217,7 +312,7 @@ parse_procs_in_source :: (lines: [] str, source_path: str = "", allocator := con
 
         // 1. Named procedure: `<name> :: (`
         col_pos := -1;
-        for k in 0 .. (ln.count - 1) {
+        if ln.count >= 2 do for k in 0 .. (ln.count - 1) {
             if ln[k] == ':' && ln[k + 1] == ':' {
                 col_pos = k;
                 break;
@@ -226,7 +321,6 @@ parse_procs_in_source :: (lines: [] str, source_path: str = "", allocator := con
         if col_pos > 0 {
             name := trim_s(ln[0 .. col_pos]);
             rest := trim_s(ln[(col_pos + 2) .. ln.count]);
-            // Strip optional `Type.` method prefix for WAT matching
             short_name := name;
             for k in 0 .. name.count {
                 if name[k] == '.' do short_name = name[(k + 1) .. name.count];
@@ -249,15 +343,14 @@ parse_procs_in_source :: (lines: [] str, source_path: str = "", allocator := con
             }
         }
 
-        // 2. Anonymous / tagged procedure: `(...) [-> Ret] { ... }` (e.g. `@aoc.part1` followed by `(input: str) -> i32 {`)
-        if ln[0] == '(' && str.contains(ln, ")") && (str.contains(ln, "{") || str.contains(ln, "->")) {
+        // 2. Anonymous tagged procedure: `@aoc.part1` followed by `(input_file: str) -> i64 {`
+        if has_tag && ln[0] == '(' {
             end_i, found_brace := find_brace_block_end(lines, i);
             if found_brace {
                 line_1 := cast(u32) (i + 1);
-                disp_name := pending_tag if has_tag else tprintf("anon@L{}", line_1);
-                hint := make_unnamed_wat_hint(source_path, line_1, allocator);
+                hint   := make_unnamed_wat_hint(source_path, line_1, allocator) if source_path.count > 0 else tprintf("_{}", line_1);
                 procs << .{
-                    name       = disp_name,
+                    name       = pending_tag,
                     wat_hint   = hint,
                     start_line = line_1,
                     end_line   = cast(u32) (end_i + 1),
@@ -270,220 +363,16 @@ parse_procs_in_source :: (lines: [] str, source_path: str = "", allocator := con
             }
         }
 
+        if !str.starts_with(ln, "#") do pending_tag = "";
         i += 1;
     }
     return procs;
 }
 
-#local
-is_executable_onyx_line :: (raw: str) -> bool {
-    t := trim_s(raw);
-    if t.count == 0 do return false;
-    if str.starts_with(t, "//") || str.starts_with(t, "/*") || str.starts_with(t, "*") do return false;
-    if str.equal(t, "{") || str.equal(t, "}") || str.equal(t, "};") || str.equal(t, "else {") || str.equal(t, "} else {") do return false;
-    return true;
-}
-
-#local
-refresh_live_locals :: () {
-    for &v in g_dbg.locals {
-        if v.name.count > 0  do str.free(v.name);
-        if v.type.count > 0  do str.free(v.type);
-        if v.value.count > 0 do str.free(v.value);
-    }
-    Array.clear(&g_dbg.locals);
-
-    if g_dbg.source_path.count == 0 do return;
-    src := os.get_contents(g_dbg.source_path);
-    defer if src.count > 0 do delete(&src);
-    lines := split_lines(src, context.temp_allocator);
-    procs := parse_procs_in_source(lines, g_dbg.source_path, context.temp_allocator);
-
-    chosen_ptr: &ParsedProc = null;
-    for &p in procs {
-        if str.equal(p.name, g_dbg.current_func) {
-            chosen_ptr = p;
-            break;
-        }
-    }
-
-    // 1. Evaluate named Onyx parameters & locals up to `g_dbg.current_line`
-    if chosen_ptr != null {
-        vars, ret_val := eval_proc_body(lines, procs, chosen_ptr, g_dbg.current_line, g_dbg.active_call_args, 0);
-        for &v in vars {
-            val_s := eval_val_to_str(v.val, context.temp_allocator);
-            g_dbg.locals << .{
-                name  = str.copy(v.name),
-                type  = str.copy(v.type_str if v.type_str.count > 0 else "any"),
-                value = str.copy(val_s if val_s.count > 0 else "<uninit>"),
-            };
-        }
-        if ret_val.kind != .Unknown {
-            rv_s := eval_val_to_str(ret_val, context.temp_allocator);
-            g_dbg.locals << .{
-                name  = str.copy("return"),
-                type  = str.copy(eval_val_default_type(ret_val)),
-                value = str.copy(rv_s),
-            };
-        }
-    }
-
-    // 2. Evaluate live WASM `local.N` slots up to `g_dbg.current_wat_line`
-    slots, defined := eval_wat_locals(g_dbg.wat_text, g_dbg.current_wat_line, g_dbg.active_call_args);
-    for si in 0 .. 64 {
-        if defined[si] && g_dbg.locals.count < 24 {
-            g_dbg.locals << .{
-                name  = str.copy(tprintf("local.{}", si)),
-                type  = str.copy("i32"),
-                value = str.copy(tprintf("{}", slots[si])),
-            };
-        }
-    }
-}
-
-#local
-load_function_into_debugger :: (source_path: str, func_name: str, target_line: u32, buf_version: u32) -> bool {
-    src := os.get_contents(source_path);
-    defer if src.count > 0 do delete(&src);
-    lines := split_lines(src, context.temp_allocator);
-    procs := parse_procs_in_source(lines, source_path, context.temp_allocator);
-
-    chosen: ParsedProc = .{ name = func_name, wat_hint = func_name, start_line = 1, end_line = cast(u32) lines.count, sig_line = "" };
-    found_proc := false;
-    for &p in procs {
-        if func_name.count > 0 && (str.equal(p.name, func_name) || str.equal(p.wat_hint, func_name)) {
-            chosen = *p;
-            found_proc = true;
-            break;
-        }
-    }
-    if !found_proc && target_line > 0 {
-        for &p in procs {
-            if target_line >= p.start_line && target_line <= p.end_line {
-                chosen = *p;
-                found_proc = true;
-                break;
-            }
-        }
-    }
-    if !found_proc && procs.count > 0 {
-        // Prefer `main`, else first proc
-        chosen = procs[0];
-        for &p in procs {
-            if str.equal(p.name, "main") { chosen = *p; break; }
-        }
-        found_proc = true;
-    }
-
-    wat_lookup := chosen.wat_hint if chosen.wat_hint.count > 0 else chosen.name;
-    wat_raw, _, ok, err := wat_get_function_raw(g_dbg.entry_path, wat_lookup, buf_version, g_dbg.extra_args, g_dbg.explicit_entry);
-    if !ok {
-        g_dbg.status = .Error;
-        if g_dbg.last_error.count > 0 do str.free(g_dbg.last_error);
-        g_dbg.last_error = str.copy(err if err.count > 0 else "Compilation failed");
-        g_dbg.dirty = true;
-        return false;
-    }
-
-    if g_dbg.wat_text.count > 0 do str.free(g_dbg.wat_text);
-    if wat_raw.count > 0 {
-        g_dbg.wat_text = str.copy(wat_raw);
-    } else {
-        g_dbg.wat_text = str.copy(tprintf(";; Function '{}' not found in compiled WASM (may be inlined or unused).", chosen.name));
-    }
-
-    if g_dbg.source_path.count > 0  do str.free(g_dbg.source_path);
-    if g_dbg.current_func.count > 0 do str.free(g_dbg.current_func);
-    g_dbg.source_path  = str.copy(source_path);
-    g_dbg.current_func = str.copy(chosen.name);
-
-    // Collect executable Onyx source lines inside the procedure body
-    Array.clear(&g_dbg.exec_lines);
-    start_l := chosen.start_line + 1; // skip signature line
-    if start_l > chosen.end_line do start_l = chosen.start_line;
-    for ln_1 in start_l .. (chosen.end_line + 1) {
-        idx := cast(i32) ln_1 - 1;
-        if idx >= 0 && idx < lines.count && is_executable_onyx_line(lines[idx]) {
-            g_dbg.exec_lines << ln_1;
-        }
-    }
-    if g_dbg.exec_lines.count == 0 && chosen.start_line > 0 {
-        g_dbg.exec_lines << chosen.start_line;
-    }
-
-    // Count WAT lines and locate instruction body lines (after `(func` and `(local`)
-    wlines := split_lines(g_dbg.wat_text, context.temp_allocator);
-    g_dbg.wat_line_count = wlines.count;
-
-    first_instr: i32 = 0;
-    last_instr:  i32 = wlines.count - 1;
-    for wi in 0 .. wlines.count {
-        wt := trim_s(wlines[wi]);
-        if !str.starts_with(wt, "(func") && !str.starts_with(wt, "(local") && !str.starts_with(wt, ";;") && wt.count > 0 {
-            first_instr = wi;
-            break;
-        }
-    }
-    if last_instr < first_instr do last_instr = first_instr;
-
-    // Build SourceWatMap partitioning WAT instruction lines across executable Onyx lines
-    Array.clear(&g_dbg.line_map);
-    n_exec  := g_dbg.exec_lines.count;
-    n_instr := last_instr - first_instr + 1;
-    for ei in 0 .. n_exec {
-        ws := first_instr + (ei * n_instr) / n_exec;
-        we := first_instr + ((ei + 1) * n_instr) / n_exec - 1;
-        if we < ws do we = ws;
-        if we >= wlines.count do we = wlines.count - 1;
-        g_dbg.line_map << .{
-            onyx_line      = g_dbg.exec_lines[ei],
-            wat_start_line = cast(u32) ws,
-            wat_end_line   = cast(u32) we,
-        };
-    }
-
-    // Position current_line at target_line (or first executable line) and sync current_wat_line
-    g_dbg.current_line = g_dbg.exec_lines[0];
-    if target_line > 0 {
-        for el in g_dbg.exec_lines {
-            if el >= target_line {
-                g_dbg.current_line = el;
-                break;
-            }
-        }
-    }
-    sync_wat_line_from_onyx();
-    refresh_live_locals();
-    return true;
-}
-
-#local
-sync_wat_line_from_onyx :: () {
-    g_dbg.current_wat_line = 0;
-    for &m in g_dbg.line_map {
-        if m.onyx_line == g_dbg.current_line {
-            g_dbg.current_wat_line = cast(i32) m.wat_start_line;
-            return;
-        }
-    }
-}
-
-#local
-sync_onyx_line_from_wat :: () {
-    if g_dbg.current_wat_line < 0 do return;
-    wl := cast(u32) g_dbg.current_wat_line;
-    for &m in g_dbg.line_map {
-        if wl >= m.wat_start_line && wl <= m.wat_end_line {
-            g_dbg.current_line = m.onyx_line;
-            return;
-        }
-    }
-}
-
-/// Parses a user run command (e.g. `onyx run --param 'aoc.day=1' --param aoc.test=true src/day1.onyx`)
-/// or bare file path into `(entry_file, compiler_extra_args, is_explicit_cmd)`.
-dbg_parse_run_command :: (cmd_line: str, allocator := context.temp_allocator) -> (entry_file: str, extra_args: [..] str, is_explicit_cmd: bool) {
-    tokens := make([..] str, 16, context.temp_allocator);
+/// Parses an optional full run command (e.g. `onyx run --param "aoc.day=1" --param "aoc.part=0" src/day1.onyx`)
+/// OR a bare `.onyx` file path into `(entry_file, extra_compiler_args, explicit_entry)`.
+dbg_parse_run_command :: (cmd_line: str, allocator := context.temp_allocator) -> (entry: str, args: [..] str, explicit: bool) {
+    tokens := make([..] str, 16, allocator);
     i := 0;
     n := cmd_line.count;
     while i < n {
@@ -494,20 +383,12 @@ dbg_parse_run_command :: (cmd_line: str, allocator := context.temp_allocator) ->
         while i < n {
             c := cmd_line[i];
             if quote != 0 {
-                if c == quote {
-                    quote = 0;
-                    i += 1;
-                    continue;
-                }
+                if c == quote { quote = 0; i += 1; continue; }
                 buf << c;
                 i += 1;
             } else {
                 if c == ' ' || c == '\t' || c == '\r' || c == '\n' do break;
-                if c == '\'' || c == '"' {
-                    quote = c;
-                    i += 1;
-                    continue;
-                }
+                if c == '\'' || c == '"' { quote = c; i += 1; continue; }
                 buf << c;
                 i += 1;
             }
@@ -517,10 +398,9 @@ dbg_parse_run_command :: (cmd_line: str, allocator := context.temp_allocator) ->
 
     out_entry := "";
     out_args := make([..] str, 8, allocator);
-    explicit := false;
+    explicit = false;
 
     ti := 0;
-    // Skip leading `onyx` binary and subcommand (`run`, `build`, `build-exe`, `check`)
     if ti < tokens.count && (str.equal(tokens[ti], "onyx") || str.ends_with(tokens[ti], "/onyx")) {
         explicit = true;
         ti += 1;
@@ -532,9 +412,9 @@ dbg_parse_run_command :: (cmd_line: str, allocator := context.temp_allocator) ->
 
     while ti < tokens.count {
         tok := tokens[ti];
-        if str.equal(tok, "--") do break; // Program runtime args follow `--`
+        if str.equal(tok, "--") do break;
         if str.equal(tok, "-o") || str.equal(tok, "--output") {
-            ti += 2; // Skip output file (WAT disassembly uses build/.odit_inspect.wasm)
+            ti += 2;
             continue;
         }
         if str.equal(tok, "--param") || str.equal(tok, "-r") || str.equal(tok, "--runtime") || str.equal(tok, "-I") {
@@ -565,31 +445,503 @@ dbg_parse_run_command :: (cmd_line: str, allocator := context.temp_allocator) ->
 }
 
 #local
-find_next_breakpoint :: (cur_path: str, cur_line: u32) -> (path: str, line: u32, found: bool) {
-    // 1. Prefer next breakpoint later in the same file
-    best_line: u32 = 0;
-    for &bp in g_dbg.breakpoints {
-        if str.equal(bp.path, cur_path) && bp.line > cur_line {
-            if best_line == 0 || bp.line < best_line do best_line = bp.line;
+parse_prog_args_after_dd :: (cmd_line: str, allocator := context.temp_allocator) -> [..] str {
+    out := make([..] str, 4, allocator);
+    found_dd := false;
+    i := 0;
+    n := cmd_line.count;
+    while i < n {
+        while i < n && (cmd_line[i] == ' ' || cmd_line[i] == '\t') do i += 1;
+        if i >= n do break;
+        buf := make([..] u8, 32, allocator);
+        quote: u8 = 0;
+        while i < n {
+            c := cmd_line[i];
+            if quote != 0 {
+                if c == quote { quote = 0; i += 1; continue; }
+                buf << c; i += 1;
+            } else {
+                if c == ' ' || c == '\t' do break;
+                if c == '\'' || c == '"' { quote = c; i += 1; continue; }
+                buf << c; i += 1;
+            }
+        }
+        tok := str.{ buf.data, buf.count };
+        if found_dd {
+            if tok.count > 0 do out << tok;
+        } elseif str.equal(tok, "--") {
+            found_dd = true;
         }
     }
-    if best_line > 0 do return cur_path, best_line, true;
-
-    // 2. Otherwise jump to the first breakpoint in any other file
-    for &bp in g_dbg.breakpoints {
-        if !str.equal(bp.path, cur_path) {
-            return bp.path, bp.line, true;
-        }
-    }
-    return "", 0, false;
+    return out;
 }
 
-/// Starts a debug session on `run_cmd_or_entry` (a bare `.onyx` path OR a full `onyx run ...` command).
+// -----------------------------------------------------------------------------
+// Shadow Workspace Builder & Live Process Lifecycle
+// -----------------------------------------------------------------------------
+
+#local
+ensure_parent_dirs :: (path: str) {
+    for i in 1 .. path.count {
+        if path[i] == '/' {
+            dir := path[0 .. i];
+            if !os.Directory.exists(dir) do os.Directory.create(dir);
+        }
+    }
+}
+
+#local
+relative_to_shadow_root :: (rel_path: str, allocator := context.temp_allocator) -> str {
+    // Count `/` depth inside rel_path so e.g. `src/day1.onyx` -> `../__odit_dbg_rt.onyx`
+    out := make(dyn_str, 32, allocator);
+    for i in 0 .. rel_path.count {
+        if rel_path[i] == '/' do Array.concat(&out, "../");
+    }
+    Array.concat(&out, "__odit_dbg_rt.onyx");
+    return out;
+}
+
+#local
+prepare_shadow_workspace :: (entry_path: str, port: i32) -> (shadow_entry: str, ok: bool) {
+    is_abs := entry_path.count > 0 && entry_path[0] == '/';
+    shadow_root := "/tmp/odit_dbg_shadow" if is_abs else ".odit/dbg_shadow";
+
+    if !is_abs {
+        if !os.Directory.exists(".odit") do os.Directory.create(".odit");
+    }
+    if !os.Directory.exists(shadow_root) do os.Directory.create(shadow_root);
+
+    // 1. Write the live debugger TCP runtime
+    rt_path := tprintf("{}/__odit_dbg_rt.onyx", shadow_root);
+    rt_src  := generate_dbg_runtime_source(port, context.temp_allocator);
+    if !os.File.write_contents(rt_path, rt_src) {
+        return "", false;
+    }
+
+    // 2. Absolute standalone file (e.g. unit test in /tmp/foo.onyx)
+    if is_abs {
+        use raw := os.get_contents(entry_path);
+        if raw.count == 0 do return "", false;
+        instr := instrument_onyx_source(raw, entry_path, "./__odit_dbg_rt.onyx", true, context.temp_allocator);
+        dst := tprintf("{}/__entry.onyx", shadow_root);
+        if !os.File.write_contents(dst, instr) do return "", false;
+        return str.copy(dst, context.temp_allocator), true;
+    }
+
+    // 3. Project workspace: symlink `lib` and `bin` so `#load "./../lib/packages"` works untouched!
+    if os.Directory.exists("lib") {
+        lib_link := tprintf("{}/lib", shadow_root);
+        if !os.Directory.exists(lib_link) {
+            os.File.symlink("../../lib", lib_link);
+        }
+    }
+    if os.Directory.exists("bin") {
+        bin_link := tprintf("{}/bin", shadow_root);
+        if !os.Directory.exists(bin_link) {
+            os.File.symlink("../../bin", bin_link);
+        }
+    }
+
+    // 4. Instrument all workspace `.onyx` files (skipping lib/, build/, .odit/)
+    ws_files := workspace_find_files(".", ".onyx", context.temp_allocator);
+    entry_done := false;
+
+    for rel in ws_files {
+        if str.starts_with(rel, "lib/") || str.starts_with(rel, "build/") || str.starts_with(rel, ".odit/") {
+            continue;
+        }
+        // Skip plugins/ and tests/ unless entry_path itself is inside them
+        if str.starts_with(rel, "plugins/") && !str.starts_with(entry_path, "plugins/") do continue;
+        if str.starts_with(rel, "tests/")   && !str.starts_with(entry_path, "tests/")   do continue;
+
+        use raw := os.get_contents(rel);
+        if raw.count == 0 do continue;
+        is_ent := str.equal(rel, entry_path);
+        if is_ent do entry_done = true;
+
+        rt_rel := relative_to_shadow_root(rel, context.temp_allocator);
+        instr := instrument_onyx_source(raw, rel, rt_rel, is_ent, context.temp_allocator);
+        dst := tprintf("{}/{}", shadow_root, rel);
+        ensure_parent_dirs(dst);
+        os.File.write_contents(dst, instr);
+    }
+
+    // Ensure entry_path itself is instrumented even if outside normal scan
+    if !entry_done {
+        use raw := os.get_contents(entry_path);
+        if raw.count == 0 do return "", false;
+        rt_rel := relative_to_shadow_root(entry_path, context.temp_allocator);
+        instr := instrument_onyx_source(raw, entry_path, rt_rel, true, context.temp_allocator);
+        dst := tprintf("{}/{}", shadow_root, entry_path);
+        ensure_parent_dirs(dst);
+        if !os.File.write_contents(dst, instr) do return "", false;
+    }
+
+    return tprintf("{}/{}", shadow_root, entry_path), true;
+}
+
+#local
+send_tcp_line :: (s: str) {
+    if !g_dbg.tcp_connected || s.count == 0 do return;
+    dbg_srv_write(s.data, s.count);
+}
+
+#local
+sync_breakpoints_to_child :: () {
+    if !g_dbg.tcp_connected do return;
+    buf := make(dyn_str, 256, context.temp_allocator);
+    Array.concat(&buf, "CLRBP\n");
+    for &bp in g_dbg.breakpoints {
+        Array.concat(&buf, tprintf("BP\t{}\t{}\n", bp.path, bp.line));
+    }
+    send_tcp_line(buf);
+}
+
+#local
+clear_live_arrays :: () {
+    for &v in g_dbg.locals {
+        if v.name.count > 0  do str.free(v.name);
+        if v.type.count > 0  do str.free(v.type);
+        if v.value.count > 0 do str.free(v.value);
+    }
+    Array.clear(&g_dbg.locals);
+
+    for &f in g_dbg.frames {
+        if f.func.count > 0 do str.free(f.func);
+        if f.path.count > 0 do str.free(f.path);
+    }
+    Array.clear(&g_dbg.frames);
+}
+
+#local
+clear_pending_pause :: () {
+    if g_dbg.pend_file.count > 0   { str.free(g_dbg.pend_file);   g_dbg.pend_file = ""; }
+    if g_dbg.pend_func.count > 0   { str.free(g_dbg.pend_func);   g_dbg.pend_func = ""; }
+    if g_dbg.pend_reason.count > 0 { str.free(g_dbg.pend_reason); g_dbg.pend_reason = ""; }
+    g_dbg.pend_line = 0;
+    for &f in g_dbg.pend_frames {
+        if f.func.count > 0 do str.free(f.func);
+        if f.path.count > 0 do str.free(f.path);
+    }
+    Array.clear(&g_dbg.pend_frames);
+    for &v in g_dbg.pend_vars {
+        if v.name.count > 0  do str.free(v.name);
+        if v.type.count > 0  do str.free(v.type);
+        if v.value.count > 0 do str.free(v.value);
+    }
+    Array.clear(&g_dbg.pend_vars);
+    g_dbg.collecting_pause = false;
+}
+
+#local
+clear_output :: () {
+    for l in g_dbg.output_lines {
+        if l.count > 0 do str.free(l);
+    }
+    Array.clear(&g_dbg.output_lines);
+    Array.clear(&g_dbg.output_partial);
+}
+
+#local
+append_output_chunk :: (data: [] u8) {
+    if data.count == 0 do return;
+    for i in 0 .. data.count {
+        c := data[i];
+        if c == '\r' do continue;
+        if c == '\n' {
+            if g_dbg.output_lines.count >= 300 {
+                if g_dbg.output_lines[0].count > 0 do str.free(g_dbg.output_lines[0]);
+                Array.remove_at(&g_dbg.output_lines, 0);
+            }
+            ln := str.{ g_dbg.output_partial.data, g_dbg.output_partial.count };
+            g_dbg.output_lines << str.copy(ln);
+            Array.clear(&g_dbg.output_partial);
+            g_dbg.dirty = true;
+        } else {
+            g_dbg.output_partial << c;
+        }
+    }
+}
+
+#local
+flush_output_partial :: () {
+    if g_dbg.output_partial.count > 0 {
+        if g_dbg.output_lines.count >= 300 {
+            if g_dbg.output_lines[0].count > 0 do str.free(g_dbg.output_lines[0]);
+            Array.remove_at(&g_dbg.output_lines, 0);
+        }
+        ln := str.{ g_dbg.output_partial.data, g_dbg.output_partial.count };
+        g_dbg.output_lines << str.copy(ln);
+        Array.clear(&g_dbg.output_partial);
+    }
+}
+
+#local
+stop_live_session :: () {
+    if g_dbg.tcp_connected {
+        send_tcp_line("STOP\n");
+    }
+    dbg_srv_close();
+    g_dbg.tcp_connected = false;
+    g_dbg.tcp_port      = -1;
+
+    if g_dbg.proc_handle != 0 {
+        dbg_proc_kill(g_dbg.proc_handle);
+        g_dbg.proc_handle = 0;
+    }
+    Array.clear(&g_dbg.rx_buf);
+    clear_pending_pause();
+}
+
+#local
+parse_u32_s :: (s: str) -> u32 {
+    v: u32 = 0;
+    for i in 0 .. s.count {
+        c := s[i];
+        if c >= '0' && c <= '9' do v = v * 10 + cast(u32) (c - '0');
+    }
+    return v;
+}
+
+#local
+split_tabs :: (line: str, allocator := context.temp_allocator) -> [..] str {
+    parts := make([..] str, 8, allocator);
+    start := 0;
+    for i in 0 .. (line.count + 1) {
+        if i == line.count || line[i] == '\t' {
+            parts << line[start .. i];
+            start = i + 1;
+        }
+    }
+    return parts;
+}
+
+#local
+refresh_wat_cache_if_needed :: () {
+    if g_dbg.source_path.count == 0 || g_dbg.current_func.count == 0 do return;
+    if str.equal(g_dbg.source_path, g_dbg.last_wat_path) && str.equal(g_dbg.current_func, g_dbg.last_wat_func) {
+        return;
+    }
+    // Look up matching proc for WAT hint
+    use src := os.get_contents(g_dbg.source_path);
+    if src.count == 0 do return;
+    lines := split_lines(src, context.temp_allocator);
+    procs := parse_procs_in_source(lines, g_dbg.source_path, context.temp_allocator);
+    wat_hint := g_dbg.current_func;
+    for &p in procs {
+        if str.equal(p.name, g_dbg.current_func) {
+            wat_hint = p.wat_hint;
+            break;
+        }
+    }
+
+    wat_entry := g_dbg.entry_path if g_dbg.entry_path.count > 0 else g_dbg.source_path;
+    wat_txt, _fidx, ok, _err := wat_get_function_raw(wat_entry, wat_hint, g_dbg.buf_version, g_dbg.extra_args, g_dbg.explicit_entry);
+    if ok {
+        if g_dbg.wat_text.count > 0 do str.free(g_dbg.wat_text);
+        g_dbg.wat_text = str.copy(wat_txt);
+        wlines := split_lines(g_dbg.wat_text, context.temp_allocator);
+        g_dbg.wat_line_count   = wlines.count;
+        g_dbg.current_wat_line = 0;
+        if g_dbg.last_wat_path.count > 0 do str.free(g_dbg.last_wat_path);
+        if g_dbg.last_wat_func.count > 0 do str.free(g_dbg.last_wat_func);
+        g_dbg.last_wat_path = str.copy(g_dbg.source_path);
+        g_dbg.last_wat_func = str.copy(g_dbg.current_func);
+    }
+}
+
+#local
+commit_pause_snapshot :: () {
+    if g_dbg.source_path.count > 0  do str.free(g_dbg.source_path);
+    if g_dbg.current_func.count > 0 do str.free(g_dbg.current_func);
+    if g_dbg.pause_reason.count > 0 do str.free(g_dbg.pause_reason);
+
+    g_dbg.source_path  = str.copy(g_dbg.pend_file);
+    g_dbg.current_func = str.copy(g_dbg.pend_func);
+    g_dbg.current_line = g_dbg.pend_line;
+    g_dbg.pause_reason = str.copy(g_dbg.pend_reason);
+
+    // Mark which locals changed compared to previous pause!
+    for &nv in g_dbg.pend_vars {
+        nv.changed = true;
+        for &ov in g_dbg.locals {
+            if str.equal(ov.name, nv.name) {
+                nv.changed = !str.equal(ov.value, nv.value);
+                break;
+            }
+        }
+    }
+
+    clear_live_arrays();
+    for &f in g_dbg.pend_frames {
+        g_dbg.frames << .{ str.copy(f.func), str.copy(f.path), f.line };
+    }
+    for &v in g_dbg.pend_vars {
+        g_dbg.locals << .{ str.copy(v.name), str.copy(v.type), str.copy(v.value), v.changed };
+    }
+    clear_pending_pause();
+
+    g_dbg.status        = .Paused;
+    g_dbg.dirty         = true;
+    g_dbg.markers_dirty = true;
+}
+
+#local
+handle_ipc_line :: (line: str) {
+    if line.count == 0 do return;
+    if str.equal(line, "HELLO") {
+        sync_breakpoints_to_child();
+        if g_dbg.breakpoints.count > 0 {
+            send_tcp_line("CONT\n");
+        } else {
+            send_tcp_line("INTO\n");
+        }
+        return;
+    }
+
+    parts := split_tabs(line, context.temp_allocator);
+    if parts.count == 0 do return;
+    tag := parts[0];
+
+    if str.equal(tag, "PAUSE") && parts.count >= 6 {
+        clear_pending_pause();
+        g_dbg.collecting_pause = true;
+        g_dbg.pend_file   = str.copy(parts[1]);
+        g_dbg.pend_func   = str.copy(parts[2]);
+        g_dbg.pend_line   = parse_u32_s(parts[3]);
+        g_dbg.pend_reason = str.copy(parts[5]);
+    } elseif str.equal(tag, "FRAME") && parts.count >= 4 && g_dbg.collecting_pause {
+        g_dbg.pend_frames << .{ str.copy(parts[1]), str.copy(parts[2]), parse_u32_s(parts[3]) };
+    } elseif str.equal(tag, "VAR") && parts.count >= 4 && g_dbg.collecting_pause {
+        g_dbg.pend_vars << .{ str.copy(parts[1]), str.copy(parts[2]), str.copy(parts[3]), false };
+    } elseif str.equal(tag, "END") && g_dbg.collecting_pause {
+        commit_pause_snapshot();
+    }
+}
+
+/// Polls the live debugged child process (stdout/stderr + TCP IPC). Call once per frame!
+dbg_poll :: () {
+    if g_dbg.proc_handle == 0 do return;
+
+    // 1. Drain child stdout & stderr into console log
+    out_tmp: [4096] u8;
+    for _ in 0 .. 8 {
+        n1 := dbg_proc_read(g_dbg.proc_handle, 1, &out_tmp[0], out_tmp.count);
+        if n1 > 0 do append_output_chunk(out_tmp[0 .. n1]);
+        n2 := dbg_proc_read(g_dbg.proc_handle, 2, &out_tmp[0], out_tmp.count);
+        if n2 > 0 do append_output_chunk(out_tmp[0 .. n2]);
+        if n1 <= 0 && n2 <= 0 do break;
+    }
+
+    // 2. Accept TCP connection from instrumented child runtime
+    if !g_dbg.tcp_connected && g_dbg.tcp_port > 0 {
+        acc := dbg_srv_accept();
+        if acc == 1 {
+            g_dbg.tcp_connected = true;
+        }
+    }
+
+    // 3. Read & dispatch incoming IPC lines non-blockingly
+    if g_dbg.tcp_connected {
+        ipc_tmp: [4096] u8;
+        for _ in 0 .. 16 {
+            r := dbg_srv_read(&ipc_tmp[0], ipc_tmp.count);
+            if r > 0 {
+                for i in 0 .. r do g_dbg.rx_buf << ipc_tmp[i];
+            } else {
+                if r < 0 do g_dbg.tcp_connected = false;
+                break;
+            }
+        }
+        // Process all complete newline-delimited messages
+        while true {
+            nl := -1;
+            for i in 0 .. g_dbg.rx_buf.count {
+                if g_dbg.rx_buf[i] == '\n' { nl = i; break; }
+            }
+            if nl < 0 do break;
+            end := nl;
+            if end > 0 && g_dbg.rx_buf[end - 1] == '\r' do end -= 1;
+            ln := make([] u8, end, context.temp_allocator);
+            for k in 0 .. end do ln[k] = g_dbg.rx_buf[k];
+            rem := g_dbg.rx_buf.count - (nl + 1);
+            for k in 0 .. rem do g_dbg.rx_buf[k] = g_dbg.rx_buf[nl + 1 + k];
+            g_dbg.rx_buf.count = rem;
+            handle_ipc_line(str.{ ln.data, ln.count });
+        }
+    }
+
+    // 4. Poll child process exit
+    ec: i32 = 0;
+    st := dbg_proc_poll(g_dbg.proc_handle, &ec);
+    if st != 1 { // Not Running (Exited / Killed)
+        // Final drain of stdout/stderr
+        for _ in 0 .. 8 {
+            n1 := dbg_proc_read(g_dbg.proc_handle, 1, &out_tmp[0], out_tmp.count);
+            if n1 > 0 do append_output_chunk(out_tmp[0 .. n1]);
+            n2 := dbg_proc_read(g_dbg.proc_handle, 2, &out_tmp[0], out_tmp.count);
+            if n2 > 0 do append_output_chunk(out_tmp[0 .. n2]);
+            if n1 <= 0 && n2 <= 0 do break;
+        }
+        flush_output_partial();
+        dbg_proc_kill(g_dbg.proc_handle);
+        g_dbg.proc_handle   = 0;
+        dbg_srv_close();
+        g_dbg.tcp_connected = false;
+        g_dbg.tcp_port      = -1;
+        g_dbg.exit_code     = ec;
+
+        if ec != 0 {
+            if g_dbg.last_error.count > 0 do str.free(g_dbg.last_error);
+            // Extract first non-empty error line if available
+            err_msg := tprintf("Program exited with code {}", ec);
+            for l in g_dbg.output_lines {
+                tl := trim_s(l);
+                if str.contains(tl, "error:") || str.contains(tl, "Error") {
+                    err_msg = tl;
+                    break;
+                }
+            }
+            g_dbg.last_error = str.copy(err_msg);
+        }
+
+        g_dbg.status           = .Exited;
+        g_dbg.current_line     = 0;
+        g_dbg.current_wat_line = -1;
+        g_dbg.dirty            = true;
+        g_dbg.markers_dirty    = true;
+    }
+}
+
+/// Starts a real live Onyx debug session on `run_cmd_or_entry`.
 dbg_start :: (run_cmd_or_entry: str, active_file: str, cursor_line: u32, buf_version: u32) -> i32 {
+    stop_live_session();
+    clear_live_arrays();
+    clear_output();
+    Array.clear(&g_dbg.line_map);
+    if g_dbg.wat_text.count > 0      { str.free(g_dbg.wat_text);      g_dbg.wat_text = ""; }
+    if g_dbg.last_wat_path.count > 0 { str.free(g_dbg.last_wat_path); g_dbg.last_wat_path = ""; }
+    if g_dbg.last_wat_func.count > 0 { str.free(g_dbg.last_wat_func); g_dbg.last_wat_func = ""; }
+    if g_dbg.last_error.count > 0    { str.free(g_dbg.last_error);    g_dbg.last_error = ""; }
+    g_dbg.current_line     = 0;
+    g_dbg.current_wat_line = -1;
+    g_dbg.exit_code        = 0;
+    g_dbg.buf_version      = buf_version;
+
     parsed_entry, parsed_args, is_explicit := dbg_parse_run_command(run_cmd_or_entry, context.temp_allocator);
+    parsed_prog := parse_prog_args_after_dd(run_cmd_or_entry, context.temp_allocator);
 
     eff_entry := parsed_entry if parsed_entry.count > 0 else active_file;
     if eff_entry.count == 0 do eff_entry = "src/main.onyx";
+
+    // If user didn't pass an explicit entry and active file lacks `main ::`, fall back to `src/main.onyx`
+    if !is_explicit {
+        use check_src := os.get_contents(eff_entry);
+        if !str.contains(check_src, "main ::") {
+            if os.file_exists("src/main.onyx") do eff_entry = "src/main.onyx";
+            elseif os.file_exists("main.onyx") do eff_entry = "main.onyx";
+        }
+    }
 
     if g_dbg.entry_path.count > 0 do str.free(g_dbg.entry_path);
     g_dbg.entry_path     = str.copy(eff_entry);
@@ -599,59 +951,74 @@ dbg_start :: (run_cmd_or_entry: str, active_file: str, cursor_line: u32, buf_ver
     Array.clear(&g_dbg.extra_args);
     for a in parsed_args do g_dbg.extra_args << str.copy(a);
 
-    Array.clear(&g_dbg.call_stack);
-    Array.clear(&g_dbg.active_call_args);
-    g_dbg.visited_tagged_cnt = 0;
-    if g_dbg.last_error.count > 0 { str.free(g_dbg.last_error); g_dbg.last_error = ""; }
+    for a in g_dbg.prog_args do if a.count > 0 do str.free(a);
+    Array.clear(&g_dbg.prog_args);
+    for a in parsed_prog do g_dbg.prog_args << str.copy(a);
 
-    // Prefer pausing at the first breakpoint (in active file, or parsed entry, or any file), else cursor/main
-    target_file := active_file if active_file.count > 0 else eff_entry;
-    target_line: u32 = 0;
-    for &bp in g_dbg.breakpoints {
-        if str.equal(bp.path, target_file) {
-            if target_line == 0 || bp.line < target_line do target_line = bp.line;
-        }
+    // 1. Start loopback TCP debug server
+    port := dbg_srv_start();
+    if port <= 0 {
+        g_dbg.last_error = str.copy("Failed to bind local debugger TCP server");
+        g_dbg.status = .Idle;
+        g_dbg.dirty = true;
+        return cast(i32) abi.AbiError.ProcessFailed;
     }
-    if target_line == 0 && parsed_entry.count > 0 && !str.equal(parsed_entry, target_file) {
-        for &bp in g_dbg.breakpoints {
-            if str.equal(bp.path, parsed_entry) {
-                if target_line == 0 || bp.line < target_line {
-                    target_file = parsed_entry;
-                    target_line = bp.line;
-                }
-            }
-        }
-    }
-    if target_line == 0 && g_dbg.breakpoints.count > 0 {
-        target_file = g_dbg.breakpoints[0].path;
-        target_line = g_dbg.breakpoints[0].line;
-    }
-    if target_line == 0 {
-        if parsed_entry.count > 0 {
-            target_file = parsed_entry;
-            target_line = cursor_line if str.equal(parsed_entry, active_file) else 0;
-        } else {
-            target_line = cursor_line;
-        }
+    g_dbg.tcp_port      = port;
+    g_dbg.tcp_connected = false;
+
+    // 2. Instrument shadow workspace
+    shadow_entry, prep_ok := prepare_shadow_workspace(g_dbg.entry_path, port);
+    if !prep_ok {
+        dbg_srv_close();
+        g_dbg.tcp_port   = -1;
+        g_dbg.last_error = str.copy(tprintf("Failed to instrument '{}'", g_dbg.entry_path));
+        g_dbg.status     = .Idle;
+        g_dbg.dirty      = true;
+        return cast(i32) abi.AbiError.NotFound;
     }
 
-    if !load_function_into_debugger(target_file, "", target_line, buf_version) {
+    // 3. Build `onyx run --no-colors [extra_args...] <shadow_entry> [-- prog_args...]`
+    onyx_exe := resolve_onyx_executable();
+    arg_buf := make(dyn_str, 256, context.temp_allocator);
+    Array.concat(&arg_buf, "run\n--no-colors\n");
+    for a in g_dbg.extra_args {
+        Array.concat(&arg_buf, a);
+        Array.concat(&arg_buf, "\n");
+    }
+    Array.concat(&arg_buf, shadow_entry);
+    if g_dbg.prog_args.count > 0 {
+        Array.concat(&arg_buf, "\n--");
+        for pa in g_dbg.prog_args {
+            Array.concat(&arg_buf, "\n");
+            Array.concat(&arg_buf, pa);
+        }
+    }
+
+    cwd := ".";
+    ph := dbg_proc_spawn(onyx_exe.data, onyx_exe.count, arg_buf.data, arg_buf.count, cwd.data, cwd.count);
+    if ph == 0 {
+        dbg_srv_close();
+        g_dbg.tcp_port   = -1;
+        g_dbg.last_error = str.copy("Failed to spawn onyx process");
+        g_dbg.status     = .Idle;
+        g_dbg.dirty      = true;
         return cast(i32) abi.AbiError.ProcessFailed;
     }
 
-    g_dbg.status        = .Paused;
+    g_dbg.proc_handle   = ph;
+    g_dbg.status        = .Running;
     g_dbg.dirty         = true;
     g_dbg.markers_dirty = true;
     return 0;
 }
 
-/// Executes a debugger control command (`Continue`, `StepOver`, `StepInto`, `StepOut`, `StepInstruction`, `Stop`).
+/// Executes a live debugger control command.
 dbg_command :: (cmd: abi.DebugCommand, buf_version: u32) -> i32 {
     if cmd == .Stop {
+        stop_live_session();
         g_dbg.status           = .Idle;
         g_dbg.current_line     = 0;
         g_dbg.current_wat_line = -1;
-        Array.clear(&g_dbg.call_stack);
         g_dbg.dirty            = true;
         g_dbg.markers_dirty    = true;
         return 0;
@@ -662,199 +1029,82 @@ dbg_command :: (cmd: abi.DebugCommand, buf_version: u32) -> i32 {
     }
 
     switch cmd {
-        case .StepOver {
-            advanced := false;
-            for i in 0 .. g_dbg.exec_lines.count {
-                if g_dbg.exec_lines[i] == g_dbg.current_line {
-                    if i + 1 < g_dbg.exec_lines.count {
-                        g_dbg.current_line = g_dbg.exec_lines[i + 1];
-                        sync_wat_line_from_onyx();
-                        refresh_live_locals();
-                        advanced = true;
-                    }
-                    break;
-                }
-            }
-            if !advanced {
-                // End of function: pop call stack if nested, else jump to next breakpoint if any, else Exited
-                if g_dbg.call_stack.count > 0 {
-                    return dbg_command(.StepOut, buf_version);
-                }
-                bp_path, bp_line, has_next := find_next_breakpoint(g_dbg.source_path, g_dbg.current_line);
-                if has_next {
-                    Array.clear(&g_dbg.active_call_args);
-                    load_function_into_debugger(bp_path, "", bp_line, buf_version);
-                } else {
-                    g_dbg.status           = .Exited;
-                    g_dbg.current_line     = 0;
-                    g_dbg.current_wat_line = -1;
-                }
-            }
-        }
-
-        case .StepInstruction {
-            if g_dbg.current_wat_line + 1 < g_dbg.wat_line_count {
-                g_dbg.current_wat_line += 1;
-                sync_onyx_line_from_wat();
-                refresh_live_locals();
-            } else {
-                if g_dbg.call_stack.count > 0 {
-                    return dbg_command(.StepOut, buf_version);
-                }
-                bp_path, bp_line, has_next := find_next_breakpoint(g_dbg.source_path, g_dbg.current_line);
-                if has_next {
-                    load_function_into_debugger(bp_path, "", bp_line, buf_version);
-                } else {
-                    g_dbg.status           = .Exited;
-                    g_dbg.current_line     = 0;
-                    g_dbg.current_wat_line = -1;
-                }
-            }
-        }
-
-        case .StepInto {
-            // Check if current Onyx line calls a local procedure, passes a callback, or performs an indirect/tagged dispatch (e.g. `aoc.run()` or `call_indirect`)
-            src := os.get_contents(g_dbg.source_path);
-            defer if src.count > 0 do delete(&src);
-            lines := split_lines(src, context.temp_allocator);
-            procs := parse_procs_in_source(lines, g_dbg.source_path, context.temp_allocator);
-
-            entered := false;
-            li := cast(i32) g_dbg.current_line - 1;
-            if li >= 0 && li < lines.count {
-                cur_txt := lines[li];
-
-                // 1. Direct call to another local procedure in the same file: `foo(`
-                for &p in procs {
-                    if str.equal(p.name, g_dbg.current_func) do continue;
-                    if str.starts_with(p.name, "@") do continue;
-                    call_pat := tprintf("{}(", p.name);
-                    if str.contains(cur_txt, call_pat) {
-                        // Evaluate call arguments in caller's scope before pushing frame!
-                        caller_vars := make([..] EvalVar, 0, context.temp_allocator);
-                        for &cp in procs {
-                            if str.equal(cp.name, g_dbg.current_func) {
-                                cv, _ := eval_proc_body(lines, procs, cp, g_dbg.current_line, g_dbg.active_call_args, 0);
-                                caller_vars = cv;
-                                break;
-                            }
-                        }
-                        callee_args := eval_call_args_on_line(cur_txt, p.name, caller_vars, lines, procs);
-
-                        saved := make([..] EvalVal);
-                        for a in g_dbg.active_call_args do saved << a;
-                        g_dbg.call_stack << .{
-                            source_path = str.copy(g_dbg.source_path),
-                            func_name   = str.copy(g_dbg.current_func),
-                            line        = g_dbg.current_line,
-                            wat_line    = g_dbg.current_wat_line,
-                            saved_args  = saved,
-                        };
-                        Array.clear(&g_dbg.active_call_args);
-                        for a in callee_args {
-                            cp_a := a;
-                            if cp_a.kind == .Str && cp_a.str_val.count > 0 do cp_a.str_val = str.copy(cp_a.str_val);
-                            g_dbg.active_call_args << cp_a;
-                        }
-                        load_function_into_debugger(g_dbg.source_path, p.name, 0, buf_version);
-                        entered = true;
-                        break;
-                    }
-                }
-
-                // 2. Callback / function pointer argument referencing a local procedure: `dispatch(my_fn)`
-                if !entered && str.contains(cur_txt, "(") {
-                    for &p in procs {
-                        if str.equal(p.name, g_dbg.current_func) || str.starts_with(p.name, "@") do continue;
-                        if str.contains(cur_txt, p.name) {
-                            g_dbg.call_stack << .{
-                                source_path = str.copy(g_dbg.source_path),
-                                func_name   = str.copy(g_dbg.current_func),
-                                line        = g_dbg.current_line,
-                                wat_line    = g_dbg.current_wat_line,
-                            };
-                            load_function_into_debugger(g_dbg.source_path, p.name, 0, buf_version);
-                            entered = true;
-                            break;
-                        }
-                    }
-                }
-
-                // 3. Indirect / tagged runtime dispatch (e.g. `aoc.run()`, `test.run()`, or WAT `call_indirect`):
-                //    step into the next tagged/anonymous procedure in the file (e.g. `@aoc.part1` -> `@aoc.part2`)!
-                if !entered && (str.contains(cur_txt, "(") || str.contains(g_dbg.wat_text, "call_indirect")) {
-                    tagged_seen := 0;
-                    for &p in procs {
-                        if !p.is_tagged || str.equal(p.name, g_dbg.current_func) do continue;
-                        if tagged_seen == g_dbg.visited_tagged_cnt {
-                            g_dbg.visited_tagged_cnt += 1;
-                            g_dbg.call_stack << .{
-                                source_path = str.copy(g_dbg.source_path),
-                                func_name   = str.copy(g_dbg.current_func),
-                                line        = g_dbg.current_line,
-                                wat_line    = g_dbg.current_wat_line,
-                            };
-                            load_function_into_debugger(g_dbg.source_path, p.name, 0, buf_version);
-                            entered = true;
-                            break;
-                        }
-                        tagged_seen += 1;
-                    }
-                }
-            }
-            if !entered {
-                return dbg_command(.StepOver, buf_version);
-            }
-        }
-
-        case .StepOut {
-            if g_dbg.call_stack.count > 0 {
-                top := g_dbg.call_stack[g_dbg.call_stack.count - 1];
-                Array.pop(&g_dbg.call_stack);
-                Array.clear(&g_dbg.active_call_args);
-                for a in top.saved_args do g_dbg.active_call_args << a;
-                delete(&top.saved_args);
-                load_function_into_debugger(top.source_path, top.func_name, top.line, buf_version);
-                str.free(top.source_path);
-                str.free(top.func_name);
-            } else {
-                g_dbg.status           = .Exited;
-                g_dbg.current_line     = 0;
-                g_dbg.current_wat_line = -1;
-            }
-        }
-
         case .Continue {
-            // Jump to next breakpoint (same file after current_line, or any other file), else finish
-            bp_path, bp_line, has_next := find_next_breakpoint(g_dbg.source_path, g_dbg.current_line);
-            if has_next {
-                load_function_into_debugger(bp_path, "", bp_line, buf_version);
-            } else {
-                g_dbg.status           = .Exited;
-                g_dbg.current_line     = 0;
-                g_dbg.current_wat_line = -1;
+            if !g_dbg.tcp_connected do return cast(i32) abi.AbiError.NotReady;
+            sync_breakpoints_to_child();
+            send_tcp_line("CONT\n");
+            g_dbg.status        = .Running;
+            g_dbg.dirty         = true;
+            g_dbg.markers_dirty = true;
+        }
+        case .StepOver {
+            if !g_dbg.tcp_connected do return cast(i32) abi.AbiError.NotReady;
+            sync_breakpoints_to_child();
+            send_tcp_line("OVER\n");
+            g_dbg.status        = .Running;
+            g_dbg.dirty         = true;
+            g_dbg.markers_dirty = true;
+        }
+        case .StepInto {
+            if !g_dbg.tcp_connected do return cast(i32) abi.AbiError.NotReady;
+            sync_breakpoints_to_child();
+            send_tcp_line("INTO\n");
+            g_dbg.status        = .Running;
+            g_dbg.dirty         = true;
+            g_dbg.markers_dirty = true;
+        }
+        case .StepOut {
+            if !g_dbg.tcp_connected do return cast(i32) abi.AbiError.NotReady;
+            sync_breakpoints_to_child();
+            send_tcp_line("OUT\n");
+            g_dbg.status        = .Running;
+            g_dbg.dirty         = true;
+            g_dbg.markers_dirty = true;
+        }
+        case .Pause {
+            if !g_dbg.tcp_connected do return cast(i32) abi.AbiError.NotReady;
+            send_tcp_line("PAUSE\n");
+        }
+        case .StepInstruction {
+            // Load/advance WAT disassembly view for the currently paused function
+            refresh_wat_cache_if_needed();
+            if g_dbg.wat_line_count > 0 {
+                if g_dbg.current_wat_line + 1 < g_dbg.wat_line_count {
+                    g_dbg.current_wat_line += 1;
+                } else {
+                    g_dbg.current_wat_line = 0;
+                }
+                g_dbg.dirty = true;
             }
         }
-
-        case .Pause {
-            g_dbg.status = .Paused;
-        }
-
         case _ {}
     }
 
-    g_dbg.dirty         = true;
-    g_dbg.markers_dirty = true;
     return 0;
 }
 
+/// Synchronously polls until the live debugger pauses or exits (used in automated tests).
+dbg_wait_for_stop :: (max_iters: i32 = 8000) -> abi.DebugStatus {
+    for _ in 0 .. max_iters {
+        dbg_poll();
+        if g_dbg.status == .Paused || g_dbg.status == .Exited || g_dbg.status == .Idle {
+            return g_dbg.status;
+        }
+        // Small busy-yield via OS poll-friendly loop (each iter ~1ms with tiny work)
+        os.sleep(1);
+    }
+    return g_dbg.status;
+}
+
 dbg_get_state_json :: (allocator := context.temp_allocator) -> str {
-    out := make(dyn_str, g_dbg.wat_text.count + 1024, allocator);
+    out := make(dyn_str, g_dbg.wat_text.count + 2048, allocator);
     Array.concat(&out, tprintf("{{\"status\":{},\"source_path\":\"", cast(u32) g_dbg.status));
     Array.concat(&out, json_esc_wat(g_dbg.source_path));
     Array.concat(&out, tprintf("\",\"current_line\":{},\"current_func\":\"", g_dbg.current_line));
     Array.concat(&out, json_esc_wat(g_dbg.current_func));
-    Array.concat(&out, tprintf("\",\"current_wat_line\":{},\"wat_text\":\"", g_dbg.current_wat_line));
+    Array.concat(&out, "\",\"pause_reason\":\"");
+    Array.concat(&out, json_esc_wat(g_dbg.pause_reason));
+    Array.concat(&out, tprintf("\",\"exit_code\":{},\"current_wat_line\":{},\"wat_text\":\"", g_dbg.exit_code, g_dbg.current_wat_line));
     Array.concat(&out, json_esc_wat(g_dbg.wat_text));
     Array.concat(&out, "\",\"line_map\":[");
     for i in 0 .. g_dbg.line_map.count {
@@ -867,10 +1117,23 @@ dbg_get_state_json :: (allocator := context.temp_allocator) -> str {
     for i in 0 .. g_dbg.locals.count {
         v := &g_dbg.locals[i];
         if i > 0 do Array.concat(&out, ",");
-        Array.concat(&out, tprintf("{{\"name\":\"{}\",\"type\":\"{}\",\"value\":\"{}\"}}",
-            json_esc_wat(v.name), json_esc_wat(v.type), json_esc_wat(v.value)));
+        Array.concat(&out, tprintf("{{\"name\":\"{}\",\"type\":\"{}\",\"value\":\"{}\",\"changed\":{}}}",
+            json_esc_wat(v.name), json_esc_wat(v.type), json_esc_wat(v.value),
+            "true" if v.changed else "false"));
     }
-    Array.concat(&out, "],\"last_error\":\"");
+    Array.concat(&out, "],\"frames\":[");
+    for i in 0 .. g_dbg.frames.count {
+        f := &g_dbg.frames[i];
+        if i > 0 do Array.concat(&out, ",");
+        Array.concat(&out, tprintf("{{\"func\":\"{}\",\"path\":\"{}\",\"line\":{}}}",
+            json_esc_wat(f.func), json_esc_wat(f.path), f.line));
+    }
+    Array.concat(&out, "],\"output\":\"");
+    for i in 0 .. g_dbg.output_lines.count {
+        if i > 0 do Array.concat(&out, "\\n");
+        Array.concat(&out, json_esc_wat(g_dbg.output_lines[i]));
+    }
+    Array.concat(&out, "\",\"last_error\":\"");
     Array.concat(&out, json_esc_wat(g_dbg.last_error));
     Array.concat(&out, "\"}");
     return out;

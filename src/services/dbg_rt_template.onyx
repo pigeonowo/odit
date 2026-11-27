@@ -1,0 +1,403 @@
+use core { net, os, Array, tprintf, conv }
+use runtime
+
+#local
+StepMode :: enum {
+    Continue;
+    StepInto;
+    StepOver;
+    StepOut;
+}
+
+#local
+Frame :: struct {
+    file: str;
+    func: str;
+    line: u32;
+}
+
+#local
+Bp :: struct {
+    file: str;
+    line: u32;
+}
+
+#local
+VarEntry :: struct {
+    name: str;
+    type: str;
+    val:  str;
+}
+
+#local g_inited:       bool = false;
+#local g_connected:    bool = false;
+#local g_sock:         net.Socket;
+#local g_mode:         StepMode = .StepInto;
+#local g_target_depth: i32 = 0;
+#local g_pause_req:    bool = false;
+#local g_ticks:        u32 = 0;
+#local g_frames:       [..] Frame;
+#local g_bps:          [..] Bp;
+#local g_vars:         [..] VarEntry;
+#local g_rx_buf:       [..] u8;
+
+#local
+str_eq :: (a: str, b: str) -> bool {
+    if a.count != b.count do return false;
+    for i in 0 .. a.count {
+        if a[i] != b[i] do return false;
+    }
+    return true;
+}
+
+#local
+str_ends :: (a: str, suffix: str) -> bool {
+    if suffix.count > a.count do return false;
+    off := a.count - suffix.count;
+    for i in 0 .. suffix.count {
+        if a[off + i] != suffix[i] do return false;
+    }
+    return true;
+}
+
+#local
+path_match :: (a: str, b: str) -> bool {
+    if str_eq(a, b) do return true;
+    if str_ends(a, b) && a.count > b.count && a[a.count - b.count - 1] == '/' do return true;
+    if str_ends(b, a) && b.count > a.count && b[b.count - a.count - 1] == '/' do return true;
+    return false;
+}
+
+#local
+has_bp :: (file: str, line: u32) -> bool {
+    for &bp in g_bps {
+        if bp.line == line && path_match(bp.file, file) do return true;
+    }
+    return false;
+}
+
+#local
+send_all :: (s: str) {
+    if !g_connected || s.count == 0 do return;
+    off := 0;
+    while off < s.count {
+        n := g_sock->send(s[off .. s.count]);
+        if n <= 0 {
+            g_connected = false;
+            return;
+        }
+        off += n;
+    }
+}
+
+#local
+read_line :: () -> (str, bool) {
+    if !g_connected do return "", false;
+    while true {
+        for i in 0 .. g_rx_buf.count {
+            if g_rx_buf[i] == '\n' {
+                end := i;
+                if end > 0 && g_rx_buf[end - 1] == '\r' do end -= 1;
+                line := make([] u8, end, context.temp_allocator);
+                for k in 0 .. end do line[k] = g_rx_buf[k];
+                rem := g_rx_buf.count - (i + 1);
+                for k in 0 .. rem do g_rx_buf[k] = g_rx_buf[i + 1 + k];
+                g_rx_buf.count = rem;
+                return str.{ line.data, line.count }, true;
+            }
+        }
+        ch: [1] u8;
+        n := g_sock->recv_into(ch);
+        if n <= 0 {
+            g_connected = false;
+            return "", false;
+        }
+        g_rx_buf << ch[0];
+    }
+    return "", false;
+}
+
+#local
+parse_u32 :: (s: str) -> u32 {
+    v: u32 = 0;
+    for i in 0 .. s.count {
+        c := s[i];
+        if c >= '0' && c <= '9' {
+            v = v * 10 + cast(u32) (c - '0');
+        }
+    }
+    return v;
+}
+
+#local
+copy_heap_str :: (s: str) -> str {
+    if s.count == 0 do return "";
+    b := make([] u8, s.count);
+    for i in 0 .. s.count do b[i] = s[i];
+    return str.{ b.data, b.count };
+}
+
+#local
+apply_cmd :: (line: str) -> bool {
+    if str_eq(line, "CLRBP") {
+        for &bp in g_bps {
+            if bp.file.count > 0 do delete(&bp.file);
+        }
+        Array.clear(&g_bps);
+        return false;
+    }
+    if line.count > 3 && line[0] == 'B' && line[1] == 'P' && line[2] == '\t' {
+        rest := line[3 .. line.count];
+        tab := -1;
+        for i in 0 .. rest.count {
+            if rest[i] == '\t' { tab = i; break; }
+        }
+        if tab > 0 && tab + 1 < rest.count {
+            fp := copy_heap_str(rest[0 .. tab]);
+            ln := parse_u32(rest[(tab + 1) .. rest.count]);
+            g_bps << .{ fp, ln };
+        }
+        return false;
+    }
+    if str_eq(line, "CONT") {
+        g_mode = .Continue;
+        g_pause_req = false;
+        return true;
+    }
+    if str_eq(line, "INTO") {
+        g_mode = .StepInto;
+        g_pause_req = false;
+        return true;
+    }
+    if str_eq(line, "OVER") {
+        g_mode = .StepOver;
+        g_target_depth = g_frames.count;
+        g_pause_req = false;
+        return true;
+    }
+    if str_eq(line, "OUT") {
+        g_mode = .StepOut;
+        g_target_depth = g_frames.count;
+        g_pause_req = false;
+        return true;
+    }
+    if str_eq(line, "PAUSE") {
+        g_pause_req = true;
+        return false;
+    }
+    if str_eq(line, "STOP") {
+        if g_connected do g_sock->close();
+        os.exit(0);
+    }
+    return false;
+}
+
+#local
+ensure_connected :: () {
+    if g_inited do return;
+    g_inited = true;
+    g_frames = make([..] Frame, 32);
+    g_bps    = make([..] Bp, 16);
+    g_vars   = make([..] VarEntry, 32);
+    g_rx_buf = make([..] u8, 512);
+
+    switch net.dial("127.0.0.1", ODIT_DBG_PORT, .Stream) {
+        case .Ok as s {
+            g_sock = s;
+            g_connected = true;
+            send_all("HELLO\n");
+            while g_connected {
+                ln, ok := read_line();
+                if !ok do break;
+                if apply_cmd(ln) do break;
+            }
+        }
+        case .Err {
+            g_connected = false;
+            g_mode = .Continue;
+        }
+    }
+}
+
+enter :: (file: str, func: str, line: u32) {
+    ensure_connected();
+    g_frames << .{ file, func, line };
+}
+
+leave :: () {
+    if g_frames.count > 0 {
+        g_frames.count -= 1;
+    }
+}
+
+will_pause :: (file: str, line: u32) -> bool {
+    if !g_inited do ensure_connected();
+    if g_frames.count > 0 {
+        g_frames[g_frames.count - 1].file = file;
+        g_frames[g_frames.count - 1].line = line;
+    }
+    if !g_connected do return false;
+
+    if has_bp(file, line) do return true;
+    if g_pause_req        do return true;
+
+    switch g_mode {
+        case .StepInto do return true;
+        case .StepOver do if g_frames.count <= g_target_depth do return true;
+        case .StepOut  do if g_frames.count < g_target_depth  do return true;
+        case .Continue {
+            g_ticks += 1;
+            if (g_ticks & 63) == 0 {
+                while true {
+                    st := g_sock->poll(0);
+                    if st == .Closed {
+                        g_connected = false;
+                        return false;
+                    }
+                    if st != .Readable do break;
+                    ch: [1] u8;
+                    n := g_sock->recv_into(ch);
+                    if n <= 0 {
+                        g_connected = false;
+                        return false;
+                    }
+                    g_rx_buf << ch[0];
+                    if ch[0] == '\n' {
+                        end := g_rx_buf.count - 1;
+                        if end > 0 && g_rx_buf[end - 1] == '\r' do end -= 1;
+                        ln := make([] u8, end, context.temp_allocator);
+                        for k in 0 .. end do ln[k] = g_rx_buf[k];
+                        g_rx_buf.count = 0;
+                        _ := apply_cmd(str.{ ln.data, ln.count });
+                    }
+                }
+                if g_pause_req || has_bp(file, line) do return true;
+            }
+        }
+    }
+    return false;
+}
+
+begin_vars :: () {
+    Array.clear(&g_vars);
+}
+
+#local
+sanitize_field :: (s: str, max_len: i32) -> str {
+    out := make([..] u8, (s.count if s.count < max_len else max_len) + 8, context.temp_allocator);
+    n := s.count if s.count < max_len else max_len;
+    for i in 0 .. n {
+        c := s[i];
+        if c == '\n' {
+            out << '\\'; out << 'n';
+        } elseif c == '\r' {
+            // skip
+        } elseif c == '\t' {
+            out << '\\'; out << 't';
+        } elseif c >= 32 && c < 127 {
+            out << c;
+        } else {
+            out << '?';
+        }
+    }
+    if s.count > max_len {
+        Array.concat(&out, "...");
+    }
+    return str.{ out.data, out.count };
+}
+
+#local
+fmt_val :: (val: any, max_len: i32) -> str {
+    buf: [256] u8;
+    s := conv.format_va(buf, "{}", any.[ val ]);
+    return sanitize_field(s, max_len);
+}
+
+#local
+format_any_safe :: (val: any) -> (str, str) {
+    ti := runtime.info.get_type_info(val.type);
+    tname := sanitize_field(tprintf("{}", val.type), 48);
+    if val.data == null do return tname, "null";
+
+    switch ti.kind {
+        case .Function do return tname, "<proc>";
+        case .Basic {
+            tb := cast(&runtime.info.Type_Info_Basic) ti;
+            if tb.basic_kind == .Void do return "void", "void";
+            return tname, fmt_val(val, 140);
+        }
+        case .Slice {
+            ts := cast(&runtime.info.Type_Info_Slice) ti;
+            raw_sl := *cast(&[] u8) val.data;
+            if ts.of == u8 {
+                if raw_sl.data == null do return "str", "\"\"";
+                s := str.{ raw_sl.data, raw_sl.count };
+                if s.count > 80 {
+                    return "str", tprintf("\"{}\" (len={})", sanitize_field(s, 72), s.count);
+                }
+                return "str", tprintf("\"{}\"", sanitize_field(s, 80));
+            }
+            if raw_sl.count > 12 {
+                return tname, tprintf("[... {} items]", raw_sl.count);
+            }
+            return tname, fmt_val(val, 140);
+        }
+        case .Dynamic_Array {
+            da := *cast(&[..] u8) val.data;
+            if da.count > 12 {
+                return tname, tprintf("[... {} items]", da.count);
+            }
+            return tname, fmt_val(val, 140);
+        }
+        case .Pointer {
+            p := *cast(&rawptr) val.data;
+            if p == null do return tname, "null";
+            return tname, tprintf("0x{b16}", cast(u64) p);
+        }
+        case _ {
+            return tname, fmt_val(val, 140);
+        }
+    }
+}
+
+var :: (name: str, val: any) {
+    tname, vstr := format_any_safe(val);
+    for &e in g_vars {
+        if str_eq(e.name, name) {
+            e.type = tname;
+            e.val  = vstr;
+            return;
+        }
+    }
+    g_vars << .{ name, tname, vstr };
+}
+
+pause :: (file: str, line: u32) {
+    if !g_connected do return;
+
+    reason := "breakpoint" if has_bp(file, line) else ("pause" if g_pause_req else "step");
+    cur_func := g_frames[g_frames.count - 1].func if g_frames.count > 0 else "main";
+
+    pkt := make([..] u8, 1024, context.temp_allocator);
+    Array.concat(&pkt, tprintf("PAUSE\t{}\t{}\t{}\t{}\t{}\n",
+        file, cur_func, line, g_frames.count, reason));
+
+    fi: i32 = cast(i32) g_frames.count - 1;
+    while fi >= 0 {
+        fr := &g_frames[fi];
+        Array.concat(&pkt, tprintf("FRAME\t{}\t{}\t{}\n", fr.func, fr.file, fr.line));
+        fi -= 1;
+    }
+
+    for &v in g_vars {
+        Array.concat(&pkt, tprintf("VAR\t{}\t{}\t{}\n", v.name, v.type, v.val));
+    }
+    Array.concat(&pkt, "END\n");
+    send_all(str.{ pkt.data, pkt.count });
+
+    while g_connected {
+        ln, ok := read_line();
+        if !ok do break;
+        if apply_cmd(ln) do break;
+    }
+}

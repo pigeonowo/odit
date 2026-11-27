@@ -1,13 +1,18 @@
 // =============================================================================
-// ODIT Plugin: Live Onyx <-> WASM Debugger (`build/plugins/debugger.wasm`)
+// ODIT Plugin: Real Live Onyx Debugger (`build/plugins/debugger.wasm`)
 // =============================================================================
-// Side-by-side Live Debugger plugin:
-//   - Left pane:  Onyx source lines with clickable breakpoint gutter (red dots)
-//                 and active execution line highlight
-//   - Right pane: Disassembled WebAssembly Text Format (`.wat`) for the active
-//                 function with Onyx-line <-> WAT-range mapping and single
-//                 WAT-instruction stepping (`F11` / `WAT` button)
-//   - Bottom bar: Parameters & WASM local slots inspection
+// Full IDE debugger panel backed by real shadow-instrumented Onyx execution:
+//   - Toolbar: Debug/Continue (F5), Pause, Step Over (F10), Step Into (F11),
+//     Step Out (Shift+F11), Stop (Shift+F5), status & live location pills
+//   - Editable `Cmd:` bar supporting full `onyx run --param ... file.onyx -- args`
+//   - Left pane: Source view with clickable breakpoint gutter (red dots) and
+//     highlighted active execution line (`>`) with auto-centering
+//   - Right pane: Tabbed live inspector:
+//       * Locals  — live runtime values & types with change highlighting + copy
+//       * Stack   — real call stack frames (click to jump)
+//       * BPs     — all workspace breakpoints (click to jump or remove)
+//       * Out     — live captured stdout / stderr console
+//       * WAT     — on-demand WebAssembly Text disassembly of active function
 
 #load "../../abi/abi.onyx"
 #load "../../sdk/plugin_sdk.onyx"
@@ -17,45 +22,66 @@ use odit.abi
 use odit.sdk
 
 LocalVar :: struct {
-    name:  str;
-    type:  str;
-    value: str;
+    name:    str;
+    type:    str;
+    value:   str;
+    changed: bool;
 }
 
-LineMapEntry :: struct {
-    onyx_line:      u32;
-    wat_start_line: u32;
-    wat_end_line:   u32;
+StackFrame :: struct {
+    func: str;
+    path: str;
+    line: u32;
+}
+
+BpItem :: struct {
+    path: str;
+    line: u32;
+}
+
+InspectorTab :: enum (i32) {
+    Locals      :: 0;
+    Stack       :: 1;
+    Breakpoints :: 2;
+    Output      :: 3;
+    Wat         :: 4;
 }
 
 @sdk.Plugin.{
     id             = "odit.debugger",
     title          = "Live Debugger",
-    version        = "0.1.0",
+    version        = "0.2.0",
     default_slot   = 0,
-    default_width  = 580.0f,
-    default_height = 440.0f,
-    event_mask     = 195, // ActiveFileChanged (1) | BufferModified (2) | CommandInvoked (64) | DebugStateChanged (128)
+    default_width  = 640.0f,
+    default_height = 460.0f,
+    event_mask     = 0xFFFFFFFF,
     allow_multiple = false,
 }
 DebuggerPlugin :: struct {
     status:           abi.DebugStatus;
     source_path:      str;
+    view_path:        str; // May differ from source_path when inspecting a caller stack frame
+    view_line:        u32;
     current_line:     u32;
     current_func:     str;
+    pause_reason:     str;
+    exit_code:        i32;
     current_wat_line: i32;
     last_error:       str;
 
     src_lines:        [..] str;
     wat_lines:        [..] str;
-    breakpoints:      [..] u32;
-    line_map:         [..] LineMapEntry;
+    out_lines:        [..] str;
+    all_bps:          [..] BpItem;
     locals:           [..] LocalVar;
+    frames:           [..] StackFrame;
 
+    active_tab:       InspectorTab;
     src_scroll_y:     f32;
     src_scroll_x:     f32;
-    wat_scroll_y:     f32;
+    right_scroll_y:   f32;
     wat_scroll_x:     f32;
+
     cmd_buf:          [256] u8;
     cmd_len:          u32;
     cmd_user_edited:  bool;
@@ -86,20 +112,23 @@ split_into_lines :: (dst: &[..] str, text: str) {
 
 #local
 refresh_breakpoints :: (self: &DebuggerPlugin) {
-    Array.clear(&self.breakpoints);
-    if self.source_path.count == 0 do return;
-    js := sdk.debug_get_breakpoints_json(self.source_path, context.temp_allocator);
+    for &b in self.all_bps do sdk.free_str(b.path);
+    Array.clear(&self.all_bps);
+    js := sdk.debug_get_breakpoints_json("", context.temp_allocator);
     if js.count == 0 do return;
     sdk.each_json_object(js, [obj] {
-        ln := sdk.json_get_i32(obj, "line");
-        if ln > 0 do self.breakpoints << cast(u32) ln;
+        bp_path := sdk.json_get_str(obj, "path", context.temp_allocator);
+        bp_line := sdk.json_get_i32(obj, "line");
+        if bp_path.count > 0 && bp_line > 0 {
+            self.all_bps << .{ sdk.copy_str(bp_path), cast(u32) bp_line };
+        }
     });
 }
 
 #local
-has_bp :: (self: &DebuggerPlugin, line: u32) -> bool {
-    for b in self.breakpoints {
-        if b == line do return true;
+has_bp_in_view :: (self: &DebuggerPlugin, line: u32) -> bool {
+    for &b in self.all_bps {
+        if b.line == line && str.equal(b.path, self.view_path) do return true;
     }
     return false;
 }
@@ -118,30 +147,37 @@ current_run_cmd :: (self: &DebuggerPlugin) -> str {
     if self.cmd_len > 0 {
         return str.{ &self.cmd_buf[0], cast(i32) self.cmd_len };
     }
-    return self.source_path;
+    return self.view_path;
 }
 
 #local
-reload_source_file :: (self: &DebuggerPlugin, path: str) {
+load_view_file :: (self: &DebuggerPlugin, path: str, focus_line: u32) {
     if path.count == 0 do return;
     set_default_cmd(self, path);
-    src := sdk.workspace_read_file(path, context.temp_allocator);
-    split_into_lines(&self.src_lines, src);
+    if !str.equal(path, self.view_path) || self.src_lines.count == 0 {
+        sdk.free_str(self.view_path);
+        self.view_path = sdk.copy_str(path);
+        src := sdk.workspace_read_file(path, context.temp_allocator);
+        split_into_lines(&self.src_lines, src);
+    }
+    self.view_line = focus_line;
+    self.auto_scroll_req = true;
 }
 
 #local
 apply_state_json :: (self: &DebuggerPlugin, js: str) {
     if js.count == 0 do return;
 
+    prev_status := self.status;
     self.status           = cast(abi.DebugStatus) sdk.json_get_i32(js, "status");
     self.current_line     = cast(u32) sdk.json_get_i32(js, "current_line");
+    self.exit_code        = sdk.json_get_i32(js, "exit_code");
     self.current_wat_line = sdk.json_get_i32(js, "current_wat_line");
 
     sp := sdk.json_get_str(js, "source_path", context.temp_allocator);
     if sp.count == 0 do sp = sdk.editor_active_path(context.temp_allocator);
 
-    path_changed := !str.equal(sp, self.source_path);
-    if path_changed {
+    if !str.equal(sp, self.source_path) {
         sdk.free_str(self.source_path);
         self.source_path = sdk.copy_str(sp);
     }
@@ -150,6 +186,10 @@ apply_state_json :: (self: &DebuggerPlugin, js: str) {
     sdk.free_str(self.current_func);
     self.current_func = sdk.copy_str(fn);
 
+    pr := sdk.json_get_str(js, "pause_reason", context.temp_allocator);
+    sdk.free_str(self.pause_reason);
+    self.pause_reason = sdk.copy_str(pr);
+
     le := sdk.json_get_str(js, "last_error", context.temp_allocator);
     sdk.free_str(self.last_error);
     self.last_error = sdk.copy_str(le);
@@ -157,20 +197,10 @@ apply_state_json :: (self: &DebuggerPlugin, js: str) {
     wt := sdk.json_get_str(js, "wat_text", context.temp_allocator);
     split_into_lines(&self.wat_lines, wt);
 
-    // Parse line_map array
-    Array.clear(&self.line_map);
-    lm_arr := sdk.json_get_array_slice(js, "line_map");
-    if lm_arr.count > 0 {
-        sdk.each_json_object(lm_arr, [obj] {
-            self.line_map << .{
-                onyx_line      = cast(u32) sdk.json_get_i32(obj, "onyx_line"),
-                wat_start_line = cast(u32) sdk.json_get_i32(obj, "wat_start_line"),
-                wat_end_line   = cast(u32) sdk.json_get_i32(obj, "wat_end_line"),
-            };
-        });
-    }
+    out_txt := sdk.json_get_str(js, "output", context.temp_allocator);
+    split_into_lines(&self.out_lines, out_txt);
 
-    // Parse locals array
+    // Parse live locals
     for &v in self.locals {
         sdk.free_str(v.name);
         sdk.free_str(v.type);
@@ -181,18 +211,40 @@ apply_state_json :: (self: &DebuggerPlugin, js: str) {
     if loc_arr.count > 0 {
         sdk.each_json_object(loc_arr, [obj] {
             self.locals << .{
-                name  = sdk.copy_str(sdk.json_get_str(obj, "name", context.temp_allocator)),
-                type  = sdk.copy_str(sdk.json_get_str(obj, "type", context.temp_allocator)),
-                value = sdk.copy_str(sdk.json_get_str(obj, "value", context.temp_allocator)),
+                name    = sdk.copy_str(sdk.json_get_str(obj, "name", context.temp_allocator)),
+                type    = sdk.copy_str(sdk.json_get_str(obj, "type", context.temp_allocator)),
+                value   = sdk.copy_str(sdk.json_get_str(obj, "value", context.temp_allocator)),
+                changed = sdk.json_get_bool(obj, "changed"),
             };
         });
     }
 
-    if path_changed || self.src_lines.count == 0 {
-        reload_source_file(self, self.source_path);
+    // Parse live call stack frames
+    for &f in self.frames {
+        sdk.free_str(f.func);
+        sdk.free_str(f.path);
+    }
+    Array.clear(&self.frames);
+    fr_arr := sdk.json_get_array_slice(js, "frames");
+    if fr_arr.count > 0 {
+        sdk.each_json_object(fr_arr, [obj] {
+            self.frames << .{
+                func = sdk.copy_str(sdk.json_get_str(obj, "func", context.temp_allocator)),
+                path = sdk.copy_str(sdk.json_get_str(obj, "path", context.temp_allocator)),
+                line = cast(u32) sdk.json_get_i32(obj, "line"),
+            };
+        });
+    }
+
+    // Auto-switch to Output tab if program failed with an error on exit
+    if self.status == .Exited && prev_status == .Running && self.exit_code != 0 && self.out_lines.count > 0 {
+        self.active_tab = .Output;
+    }
+
+    if self.source_path.count > 0 {
+        load_view_file(self, self.source_path, self.current_line);
     }
     refresh_breakpoints(self);
-    self.auto_scroll_req = true;
 }
 
 #local
@@ -202,24 +254,11 @@ sync_all :: (self: &DebuggerPlugin) {
         apply_state_json(self, js);
     } else {
         ap := sdk.editor_active_path(context.temp_allocator);
-        if ap.count > 0 && !str.equal(ap, self.source_path) {
-            sdk.free_str(self.source_path);
-            self.source_path = sdk.copy_str(ap);
-            reload_source_file(self, self.source_path);
+        if ap.count > 0 {
+            load_view_file(self, ap, 0);
         }
         refresh_breakpoints(self);
     }
-}
-
-#local
-find_active_wat_range :: (self: &DebuggerPlugin) -> (start: i32, end: i32) {
-    if self.current_line == 0 do return -1, -1;
-    for &m in self.line_map {
-        if m.onyx_line == self.current_line {
-            return cast(i32) m.wat_start_line, cast(i32) m.wat_end_line;
-        }
-    }
-    return -1, -1;
 }
 
 #local
@@ -244,52 +283,63 @@ wat_line_color :: (line: str) -> u32 {
 init :: (self: &DebuggerPlugin, window_id: u32) -> i32 {
     self.src_lines   = make([..] str);
     self.wat_lines   = make([..] str);
-    self.breakpoints = make([..] u32);
-    self.line_map    = make([..] LineMapEntry);
+    self.out_lines   = make([..] str);
+    self.all_bps     = make([..] BpItem);
     self.locals      = make([..] LocalVar);
+    self.frames      = make([..] StackFrame);
+    self.active_tab  = .Locals;
     self.current_wat_line = -1;
     self.needs_sync  = true;
 
-    sdk.register_command("debugger.start",     "Debugger: Start / Continue",      "F5");
-    sdk.register_command("debugger.step_over", "Debugger: Step Over (Onyx Line)", "F10");
-    sdk.register_command("debugger.step_wat",  "Debugger: Step WAT Instruction",  "F11");
-    sdk.register_command("debugger.stop",      "Debugger: Stop Session",          "Shift+F5");
+    sdk.register_command("debugger.start",    "Debugger: Start / Continue (F5)", "");
+    sdk.register_command("debugger.step",     "Debugger: Step Over (F10)",       "");
+    sdk.register_command("debugger.step_in",  "Debugger: Step Into (F11)",       "");
+    sdk.register_command("debugger.step_out", "Debugger: Step Out (Shift+F11)",  "");
+    sdk.register_command("debugger.stop",     "Debugger: Stop Session",          "");
     return 0;
 }
 
 @sdk.PluginEvent
 on_event :: (self: &DebuggerPlugin, window_id: u32, event: sdk.Event) {
     switch event {
-        case .DebugStateChanged as js {
-            apply_state_json(self, js);
-        }
         case .ActiveFileChanged as path {
             if self.status != .Paused && path.count > 0 {
-                sdk.free_str(self.source_path);
-                self.source_path = sdk.copy_str(path);
-                reload_source_file(self, self.source_path);
+                load_view_file(self, path, 0);
                 refresh_breakpoints(self);
             }
         }
         case .BufferModified as bm {
-            if str.equal(bm.path, self.source_path) {
-                reload_source_file(self, self.source_path);
+            if bm.saved && str.equal(bm.path, self.view_path) {
+                src := sdk.workspace_read_file(self.view_path, context.temp_allocator);
+                split_into_lines(&self.src_lines, src);
             }
         }
         case .Command as cmd {
             if str.equal(cmd, "debugger.start") {
                 if self.status == .Paused do sdk.debug_command(.Continue);
-                else                      do sdk.debug_start(current_run_cmd(self));
+                else do sdk.debug_start(current_run_cmd(self));
                 self.needs_sync = true;
-            } elseif str.equal(cmd, "debugger.step_over") {
+            } elseif str.equal(cmd, "debugger.step") {
                 sdk.debug_command(.StepOver);
                 self.needs_sync = true;
-            } elseif str.equal(cmd, "debugger.step_wat") {
-                sdk.debug_command(.StepInstruction);
+            } elseif str.equal(cmd, "debugger.step_in") {
+                sdk.debug_command(.StepInto);
+                self.needs_sync = true;
+            } elseif str.equal(cmd, "debugger.step_out") {
+                sdk.debug_command(.StepOut);
                 self.needs_sync = true;
             } elseif str.equal(cmd, "debugger.stop") {
                 sdk.debug_command(.Stop);
                 self.needs_sync = true;
+            }
+        }
+        case .Raw as raw {
+            if raw.type == .DebugStateChanged {
+                if raw.payload.count > 0 {
+                    apply_state_json(self, str.{ raw.payload.data, raw.payload.count });
+                } else {
+                    self.needs_sync = true;
+                }
             }
         }
         case _ {}
@@ -303,290 +353,364 @@ render :: (self: &DebuggerPlugin, window_id: u32, ctx: &abi.FrameContext) {
         sync_all(self);
     }
 
-    bg_surface := sdk.theme_color(.BgSurface);
-    bg_header  := sdk.theme_color(.BgHeader);
-    bg_hover   := sdk.theme_color(.BgHover);
-    bg_sel     := sdk.theme_color(.BgSelection);
-    border     := sdk.theme_color(.Border);
-    txt_pri    := sdk.theme_color(.TextPrimary);
-    txt_sec    := sdk.theme_color(.TextSecondary);
-    txt_dis    := sdk.theme_color(.TextDisabled);
-    accent     := sdk.theme_color(.Accent);
-    c_ok       := sdk.theme_color(.Success);
-    c_warn     := sdk.theme_color(.Warning);
-    c_err      := sdk.theme_color(.Error);
-    c_info     := sdk.theme_color(.Info);
-
     pad: f32 = 8.0f;
     w := ctx.width;
     h := ctx.height;
+    y := pad;
 
-    // -------------------------------------------------------------------------
-    // 1. Top Toolbar: Status Pill + Debug Control Buttons
-    // -------------------------------------------------------------------------
-    tb_y: f32 = 6.0f;
-    tb_h: f32 = 26.0f;
-    cx: f32 = pad;
+    c_text   := sdk.theme_color(.TextPrimary);
+    c_muted  := sdk.theme_color(.TextSecondary);
+    c_dis    := sdk.theme_color(.TextDisabled);
+    c_accent := sdk.theme_color(.Accent);
+    c_ok     := sdk.theme_color(.Success);
+    c_warn   := sdk.theme_color(.Warning);
+    c_err    := sdk.theme_color(.Error);
+    c_info   := sdk.theme_color(.Info);
+    c_surf   := sdk.theme_color(.BgSurface);
+    c_hdr    := sdk.theme_color(.BgHeader);
+    c_border := sdk.theme_color(.Border);
+    c_base   := sdk.theme_color(.BgBase);
 
-    st_lbl := "IDLE";
-    st_bg  := bg_surface;
-    st_fg  := txt_sec;
-    switch self.status {
-        case .Paused  { st_lbl = "PAUSED"; st_bg = 0xF9E2AF33; st_fg = c_warn; }
-        case .Running { st_lbl = "RUN";    st_bg = 0xA6E3A133; st_fg = c_ok;   }
-        case .Exited  { st_lbl = "EXITED"; st_bg = 0x89B4FA33; st_fg = c_info; }
-        case .Error   { st_lbl = "ERROR";  st_bg = 0xF38BA833; st_fg = c_err;  }
-        case _ {}
+    // ---- Row 1: Control Toolbar ----
+    bx := pad;
+    btn_h: f32 = 24.0f;
+    gap: f32 = 5.0f;
+
+    is_paused  := self.status == .Paused;
+    is_running := self.status == .Running;
+
+    if is_paused {
+        sdk.on_click(1, bx, y, 56.0f, btn_h, "Cont", .Primary) {
+            sdk.debug_command(.Continue);
+        };
+        bx += 56.0f + gap;
+        sdk.on_click(2, bx, y, 52.0f, btn_h, "Over", .{}) {
+            sdk.debug_command(.StepOver);
+        };
+        bx += 52.0f + gap;
+        sdk.on_click(3, bx, y, 48.0f, btn_h, "Into", .{}) {
+            sdk.debug_command(.StepInto);
+        };
+        bx += 48.0f + gap;
+        sdk.on_click(4, bx, y, 44.0f, btn_h, "Out", .{}) {
+            sdk.debug_command(.StepOut);
+        };
+        bx += 44.0f + gap;
+        sdk.on_click(5, bx, y, 48.0f, btn_h, "Stop", .Danger) {
+            sdk.debug_command(.Stop);
+        };
+        bx += 48.0f + gap;
+    } elseif is_running {
+        sdk.on_click(6, bx, y, 58.0f, btn_h, "Pause", .Primary) {
+            sdk.debug_command(.Pause);
+        };
+        bx += 58.0f + gap;
+        sdk.on_click(5, bx, y, 52.0f, btn_h, "Stop", .Danger) {
+            sdk.debug_command(.Stop);
+        };
+        bx += 52.0f + gap;
+    } else {
+        sdk.on_click(1, bx, y, 82.0f, btn_h, "Debug (F5)", .Primary) {
+            rc := sdk.debug_start(current_run_cmd(self));
+            if rc != 0 do self.needs_sync = true;
+        };
+        bx += 82.0f + gap;
     }
-    pw := sdk.pill(cx, tb_y + 3.0f, st_lbl, st_bg, st_fg);
-    cx += pw + 8.0f;
 
-    is_paused := self.status == .Paused;
-    start_lbl := "Cont" if is_paused else "Start";
-    sdk.on_click(100, cx, tb_y, 52.0f, tb_h, start_lbl, .Primary) {
-        if is_paused do sdk.debug_command(.Continue);
-        else         do sdk.debug_start(current_run_cmd(self));
-        self.needs_sync = true;
-    };
-    cx += 56.0f;
-
-    step_style := abi.ButtonFlags.{} if is_paused else abi.ButtonFlags.Disabled;
-    sdk.on_click(101, cx, tb_y, 46.0f, tb_h, "Step", step_style) {
-        if is_paused { sdk.debug_command(.StepOver); self.needs_sync = true; }
-    };
-    cx += 50.0f;
-
-    sdk.on_click(102, cx, tb_y, 46.0f, tb_h, "WAT", step_style) {
-        if is_paused { sdk.debug_command(.StepInstruction); self.needs_sync = true; }
-    };
-    cx += 50.0f;
-
-    sdk.on_click(103, cx, tb_y, 34.0f, tb_h, "In", step_style) {
-        if is_paused { sdk.debug_command(.StepInto); self.needs_sync = true; }
-    };
-    cx += 38.0f;
-
-    sdk.on_click(104, cx, tb_y, 38.0f, tb_h, "Out", step_style) {
-        if is_paused { sdk.debug_command(.StepOut); self.needs_sync = true; }
-    };
-    cx += 42.0f;
-
-    stop_style := abi.ButtonFlags.Danger if is_paused else abi.ButtonFlags.Disabled;
-    sdk.on_click(105, cx, tb_y, 44.0f, tb_h, "Stop", stop_style) {
-        if is_paused { sdk.debug_command(.Stop); self.needs_sync = true; }
-    };
-    cx += 50.0f;
-
-    if self.current_func.count > 0 && cx + 60.0f < w {
-        sdk.draw_text(cx + 4.0f, tb_y + 6.0f, tprintf("{}()", self.current_func), 12.5f, accent, .Bold);
+    // Status pill on right edge
+    st_txt := "IDLE";
+    st_bg  := c_border;
+    st_fg  := c_text;
+    if is_paused {
+        st_txt = "BP" if str.equal(self.pause_reason, "breakpoint") else "PAUSED";
+        st_bg  = c_warn;
+        st_fg  = c_base;
+    } elseif is_running {
+        st_txt = "RUNNING";
+        st_bg  = c_info;
+        st_fg  = c_base;
+    } elseif self.status == .Exited {
+        st_txt = tprintf("EXIT {}", self.exit_code);
+        st_bg  = c_ok if self.exit_code == 0 else c_err;
+        st_fg  = c_base;
     }
+    st_w := sdk.measure_text(st_txt, 11.0f) + 18.0f;
+    sdk.pill(w - pad - st_w, y + 2.0f, st_txt, st_bg, st_fg);
 
-    sdk.draw_line(0.0f, 38.0f, w, 38.0f, 1.0f, border);
+    // Current paused function summary
+    if is_paused && self.current_func.count > 0 && bx + 60.0f < (w - pad - st_w - 8.0f) {
+        loc_txt := tprintf("{}() :{}", self.current_func, self.current_line);
+        sdk.draw_text(bx + 4.0f, y + 5.0f, loc_txt, 12.0f, c_accent, abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
+    }
+    y += btn_h + 6.0f;
 
-    // -------------------------------------------------------------------------
-    // 1b. Run Command Input Bar (supports `onyx run --param ... file.onyx`)
-    // -------------------------------------------------------------------------
-    cmd_y: f32 = 42.0f;
+    // ---- Row 2: Run Command Bar ----
     cmd_h: f32 = 24.0f;
-    sdk.draw_text(pad, cmd_y + 5.0f, "Cmd:", 11.5f, txt_sec, .Bold);
+    sdk.draw_text(pad + 2.0f, y + 5.0f, "Cmd:", 11.5f, c_muted, .Bold);
     cmd_x := pad + 36.0f;
     cmd_w := w - cmd_x - pad;
-    if cmd_w < 80.0f do cmd_w = 80.0f;
-    cmd_st := sdk.input_text(
-        110, cmd_x, cmd_y, cmd_w, cmd_h,
-        self.cmd_buf, &self.cmd_len,
-        "onyx run --param aoc.day=1 src/day1.onyx"
-    );
-    if cmd_st & .Changed {
+    if cmd_w < 100.0f do cmd_w = 100.0f;
+    cst := sdk.input_text(10, cmd_x, y, cmd_w, cmd_h, self.cmd_buf, &self.cmd_len, "onyx run --param ... src/main.onyx");
+    if sdk.is_changed(cst) {
         self.cmd_user_edited = true;
     }
-    if cmd_st & .Submitted {
+    if sdk.is_submitted(cst) {
         sdk.debug_start(current_run_cmd(self));
         self.needs_sync = true;
     }
+    y += cmd_h + 6.0f;
 
-    // -------------------------------------------------------------------------
-    // 2. Side-by-Side Split View: Onyx Source (Left) | Mapped WAT (Right)
-    // -------------------------------------------------------------------------
-    bottom_h: f32 = 96.0f;
-    split_y:  f32 = 72.0f;
-    split_h:  f32 = h - split_y - bottom_h - 6.0f;
-    if split_h < 80.0f do split_h = 80.0f;
+    // Reserve optional error banner at bottom
+    err_h: f32 = 24.0f if self.last_error.count > 0 else 0.0f;
+    body_h := h - y - pad - (err_h + 4.0f if err_h > 0.0f else 0.0f);
+    if body_h < 100.0f do body_h = 100.0f;
 
-    gap: f32 = 6.0f;
-    half_w: f32 = (w - pad * 2.0f - gap) * 0.5f;
-    if half_w < 80.0f do half_w = 80.0f;
+    // ---- Main Split: Left Source (54%) | Right Tabbed Inspector (46%) ----
+    split_gap: f32 = 6.0f;
+    inner_w := w - pad * 2.0f;
+    left_w  := (inner_w - split_gap) * 0.54f;
+    right_w := inner_w - split_gap - left_w;
+    if left_w < 140.0f  do left_w = 140.0f;
+    if right_w < 140.0f do right_w = 140.0f;
+    left_x  := pad;
+    right_x := left_x + left_w + split_gap;
 
-    left_x:  f32 = pad;
-    right_x: f32 = pad + half_w + gap;
-    hdr_h:   f32 = 22.0f;
-    body_y:  f32 = split_y + hdr_h;
-    body_h:  f32 = split_h - hdr_h;
-    if body_h < 40.0f do body_h = 40.0f;
+    // ---- LEFT PANE: Source Code with Breakpoint Gutter ----
+    sdk.draw_rect(left_x, y, left_w, body_h, c_surf, 5.0f, c_border, 1.0f);
+    hdr_h: f32 = 24.0f;
+    sdk.draw_rect(left_x, y, left_w, hdr_h, c_hdr, 4.0f, c_border, 1.0f);
+    src_hdr := self.view_path if self.view_path.count > 0 else "No file open";
+    sdk.draw_text(left_x + 8.0f, y + 5.0f, src_hdr, 11.5f, c_text, abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
 
-    row_h: f32 = 18.0f;
+    // Open in main editor button
+    if self.view_path.count > 0 {
+        sdk.on_click(11, left_x + left_w - 46.0f, y + 2.0f, 42.0f, 20.0f, "Open", .Ghost) {
+            ln := cast(i32) self.view_line if self.view_line > 0 else 1;
+            sdk.editor_open(self.view_path, ln, 1);
+        };
+    }
 
-    // Auto-scroll both panes to keep active Onyx line and active WAT instruction in view
-    if self.auto_scroll_req {
+    src_y := y + hdr_h + 2.0f;
+    src_h := body_h - hdr_h - 4.0f;
+    line_h: f32 = 18.0f;
+    content_h := cast(f32) self.src_lines.count * line_h + 16.0f;
+
+    if self.auto_scroll_req && self.view_line > 0 {
         self.auto_scroll_req = false;
-        if self.current_line > 0 {
-            ty := cast(f32) (self.current_line - 1) * row_h - body_h * 0.35f;
-            if ty < 0.0f do ty = 0.0f;
-            self.src_scroll_y = ty;
-        }
-        if self.current_wat_line >= 0 {
-            wy := cast(f32) self.current_wat_line * row_h - body_h * 0.35f;
-            if wy < 0.0f do wy = 0.0f;
-            self.wat_scroll_y = wy;
-        }
+        target_y := cast(f32) (cast(i32) self.view_line - 1) * line_h - src_h * 0.4f;
+        if target_y < 0.0f do target_y = 0.0f;
+        self.src_scroll_y = target_y;
     }
 
-    // Shift+Wheel horizontal scroll on hovered half
-    if (ctx.flags & abi.FRAME_FLAG_HOVERED) != 0 && ctx.wheel_y != 0.0f && (ctx.key_mods & cast(u32) abi.KeyMod.Shift) != 0 {
-        if ctx.mouse_x < right_x {
-            self.src_scroll_x -= ctx.wheel_y * 36.0f;
-            if self.src_scroll_x < 0.0f do self.src_scroll_x = 0.0f;
-        } else {
-            self.wat_scroll_x -= ctx.wheel_y * 36.0f;
-            if self.wat_scroll_x < 0.0f do self.wat_scroll_x = 0.0f;
+    sdk.scroll_begin(20, left_x + 2.0f, src_y, left_w - 4.0f, src_h, content_h, &self.src_scroll_y);
+    gutter_w: f32 = 44.0f;
+    for i in 0 .. self.src_lines.count {
+        ly := src_y + cast(f32) i * line_h;
+        vis_y := ly - self.src_scroll_y;
+        if vis_y + line_h < src_y || vis_y > src_y + src_h do continue;
+
+        ln_num := cast(u32) (i + 1);
+        is_cur := is_paused && ln_num == self.current_line && str.equal(self.view_path, self.source_path);
+        is_frm := !is_cur && ln_num == self.view_line && self.view_line > 0;
+        has_bp := has_bp_in_view(self, ln_num);
+
+        if is_cur {
+            sdk.draw_rect(left_x + 3.0f, ly, left_w - 8.0f, line_h, 0xF9E2AF2E, 2.0f);
+        } elseif is_frm {
+            sdk.draw_rect(left_x + 3.0f, ly, left_w - 8.0f, line_h, 0x89B4FA24, 2.0f);
         }
+
+        // Clickable gutter toggles breakpoint!
+        gst := sdk.button(cast(u32) (2000 + i), left_x + 2.0f, ly, gutter_w, line_h, "", .Ghost);
+        if sdk.is_clicked(gst) && self.view_path.count > 0 {
+            sdk.debug_toggle_breakpoint(self.view_path, ln_num);
+            refresh_breakpoints(self);
+        }
+
+        if has_bp {
+            sdk.draw_circle(left_x + 11.0f, ly + line_h * 0.5f, 4.2f, c_err);
+        }
+        if is_cur {
+            sdk.draw_text(left_x + 17.0f, ly + 2.0f, ">", 11.5f, c_warn, .Bold);
+        }
+
+        lnum_str := tprintf("{:3}", ln_num);
+        sdk.draw_text(left_x + 22.0f, ly + 2.0f, lnum_str, 11.0f, c_warn if is_cur else c_dis, .Mono);
+        sdk.draw_text(left_x + gutter_w + 4.0f, ly + 2.0f, self.src_lines[i], 11.5f, c_text, abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
     }
+    sdk.scroll_end();
 
-    // ---- LEFT PANE: Onyx Source + Clickable Breakpoint Gutter ----
-    sdk.draw_rect(left_x, split_y, half_w, split_h, bg_surface, 4.0f, border, 1.0f);
-    sdk.draw_rect(left_x, split_y, half_w, hdr_h, bg_header, 4.0f);
-    src_hdr := tprintf("Onyx: {}", self.source_path if self.source_path.count > 0 else "(none)");
-    sdk.clipped(left_x + 6.0f, split_y, half_w - 12.0f, hdr_h) {
-        sdk.draw_text(left_x + 6.0f, split_y + 4.0f, src_hdr, 11.5f, txt_sec, .Bold);
-    };
+    // ---- RIGHT PANE: Tabbed Inspector ----
+    sdk.draw_rect(right_x, y, right_w, body_h, c_surf, 5.0f, c_border, 1.0f);
+    sdk.draw_rect(right_x, y, right_w, hdr_h, c_hdr, 4.0f, c_border, 1.0f);
 
-    src_content_h := cast(f32) self.src_lines.count * row_h + 12.0f;
-    sdk.scroll_area(200, left_x + 1.0f, body_y, half_w - 2.0f, body_h - 1.0f, src_content_h, &self.src_scroll_y) {
-        gutter_w: f32 = 42.0f;
-        first_i := cast(i32) (self.src_scroll_y / row_h);
-        if first_i < 0 do first_i = 0;
-        last_i := first_i + cast(i32) (body_h / row_h) + 3;
-        if last_i > self.src_lines.count do last_i = self.src_lines.count;
+    // Tab buttons
+    tx := right_x + 4.0f;
+    tab_h: f32 = 20.0f;
+    tab_y := y + 2.0f;
 
-        for li in first_i .. last_i {
-            line_1 := cast(u32) (li + 1);
-            ry := body_y + cast(f32) li * row_h;
-            is_cur := is_paused && line_1 == self.current_line;
-            is_bp  := has_bp(self, line_1);
+    loc_lbl := tprintf("Locals({})", self.locals.count);
+    stk_lbl := tprintf("Stack({})",  self.frames.count);
+    bp_lbl  := tprintf("BPs({})",    self.all_bps.count);
 
-            hov, clk := sdk.row_hit(ctx, left_x + 1.0f, ry, half_w - 2.0f, row_h, self.src_scroll_y);
-            if clk && self.source_path.count > 0 {
-                sdk.debug_toggle_breakpoint(self.source_path, line_1);
-                refresh_breakpoints(self);
-            }
-
-            if is_cur {
-                sdk.draw_rect(left_x + 1.0f, ry, half_w - 2.0f, row_h, 0xF9E2AF28);
-            } elseif hov {
-                sdk.draw_rect(left_x + 1.0f, ry, half_w - 2.0f, row_h, bg_hover);
-            }
-
-            // Breakpoint red dot or current-line marker
-            if is_bp {
-                sdk.draw_circle(left_x + 10.0f, ry + row_h * 0.5f, 4.0f, c_err);
-            }
-            if is_cur {
-                sdk.draw_text(left_x + 16.0f, ry + 2.0f, ">", 12.0f, c_warn, .Bold);
-            }
-
-            // Line number
-            lnum := tprintf("{}", line_1);
-            sdk.draw_text(left_x + 22.0f, ry + 3.0f, lnum, 11.0f, txt_pri if is_cur else txt_dis, .Mono);
-
-            // Source text (horizontally scrollable & clipped past gutter)
-            sdk.clipped(left_x + gutter_w, ry, half_w - gutter_w - 4.0f, row_h) {
-                sdk.draw_text(left_x + gutter_w + 4.0f - self.src_scroll_x, ry + 2.0f, self.src_lines[li], 12.0f, txt_pri, .Mono);
-            };
-        }
-    };
-
-    // ---- RIGHT PANE: Mapped WASM (.wat) Instructions ----
-    sdk.draw_rect(right_x, split_y, half_w, split_h, bg_surface, 4.0f, border, 1.0f);
-    sdk.draw_rect(right_x, split_y, half_w, hdr_h, bg_header, 4.0f);
-    wat_hdr := tprintf("WASM (.wat) {}", tprintf("L{}", self.current_wat_line + 1) if self.current_wat_line >= 0 else "");
-    sdk.clipped(right_x + 6.0f, split_y, half_w - 12.0f, hdr_h) {
-        sdk.draw_text(right_x + 6.0f, split_y + 4.0f, wat_hdr, 11.5f, c_info, .Bold);
-    };
-
-    wat_range_s, wat_range_e := find_active_wat_range(self);
-
-    if self.wat_lines.count == 0 {
-        sdk.draw_text(right_x + 10.0f, body_y + 12.0f, "Click a line on the left to set a", 12.0f, txt_sec);
-        sdk.draw_text(right_x + 10.0f, body_y + 30.0f, "breakpoint, then press Start (F5).", 12.0f, txt_sec);
-    } else {
-        wat_content_h := cast(f32) self.wat_lines.count * row_h + 12.0f;
-        sdk.scroll_area(201, right_x + 1.0f, body_y, half_w - 2.0f, body_h - 1.0f, wat_content_h, &self.wat_scroll_y) {
-            first_w := cast(i32) (self.wat_scroll_y / row_h);
-            if first_w < 0 do first_w = 0;
-            last_w := first_w + cast(i32) (body_h / row_h) + 3;
-            if last_w > self.wat_lines.count do last_w = self.wat_lines.count;
-
-            for wi in first_w .. last_w {
-                ry := body_y + cast(f32) wi * row_h;
-                is_cur_w   := is_paused && wi == self.current_wat_line;
-                in_mapped  := is_paused && wat_range_s >= 0 && wi >= wat_range_s && wi <= wat_range_e;
-
-                if is_cur_w {
-                    sdk.draw_rect(right_x + 1.0f, ry, half_w - 2.0f, row_h, 0x89B4FA38);
-                } elseif in_mapped {
-                    sdk.draw_rect(right_x + 1.0f, ry, half_w - 2.0f, row_h, bg_sel);
-                }
-
-                if is_cur_w {
-                    sdk.draw_text(right_x + 5.0f, ry + 2.0f, ">", 12.0f, c_info, .Bold);
-                }
-
-                sdk.clipped(right_x + 16.0f, ry, half_w - 20.0f, row_h) {
-                    col := wat_line_color(self.wat_lines[wi]);
-                    sdk.draw_text(right_x + 18.0f - self.wat_scroll_x, ry + 2.0f, self.wat_lines[wi], 12.0f, col, .Mono);
-                };
+    tabs := str.[ loc_lbl, stk_lbl, bp_lbl, "Out", "WAT" ];
+    for ti in 0 .. 5 {
+        tw := sdk.measure_text(tabs[ti], 10.5f) + 12.0f;
+        if tx + tw > right_x + right_w - 2.0f do tw = (right_x + right_w - 2.0f) - tx;
+        if tw < 26.0f do break;
+        is_sel := cast(i32) self.active_tab == ti;
+        sdk.on_click(cast(u32) (30 + ti), tx, tab_y, tw, tab_h, tabs[ti], .Active if is_sel else .Ghost) {
+            self.active_tab = cast(InspectorTab) ti;
+            self.right_scroll_y = 0.0f;
+            if self.active_tab == .Wat && self.wat_lines.count == 0 && is_paused {
+                sdk.debug_command(.StepInstruction);
             }
         };
+        tx += tw + 3.0f;
     }
 
-    // -------------------------------------------------------------------------
-    // 3. Bottom Strip: Locals / Params & Breakpoints Summary
-    // -------------------------------------------------------------------------
-    bot_y := split_y + split_h + 6.0f;
-    sdk.draw_rect(pad, bot_y, w - pad * 2.0f, bottom_h - 4.0f, bg_surface, 4.0f, border, 1.0f);
+    ry := y + hdr_h + 4.0f;
+    rh := body_h - hdr_h - 6.0f;
 
-    hdr_str := tprintf("Locals & Params ({})  |  Breakpoints: {}  |  F9:BP  F5:Start/Cont  F10:Step  F11:WAT",
-                       self.locals.count, self.breakpoints.count);
-    sdk.clipped(pad + 6.0f, bot_y, w - pad * 2.0f - 12.0f, 20.0f) {
-        sdk.draw_text(pad + 8.0f, bot_y + 5.0f, hdr_str, 11.0f, txt_sec, .Bold);
-    };
-    sdk.draw_line(pad + 6.0f, bot_y + 22.0f, w - pad - 6.0f, bot_y + 22.0f, 1.0f, border);
+    switch self.active_tab {
+        case .Locals {
+            if self.locals.count == 0 {
+                msg := "No locals in scope yet." if is_paused else "Pause at a breakpoint or step to inspect locals.";
+                sdk.draw_text_wrapped(right_x + 10.0f, ry + 8.0f, right_w - 20.0f, msg, 12.0f, c_muted);
+            } else {
+                vrow_h: f32 = 22.0f;
+                vc_h := cast(f32) self.locals.count * vrow_h + 12.0f;
+                sdk.scroll_begin(21, right_x + 2.0f, ry, right_w - 4.0f, rh, vc_h, &self.right_scroll_y);
+                for i in 0 .. self.locals.count {
+                    v := &self.locals[i];
+                    vy := ry + cast(f32) i * vrow_h;
+                    vis := vy - self.right_scroll_y;
+                    if vis + vrow_h < ry || vis > ry + rh do continue;
 
-    if self.last_error.count > 0 {
-        sdk.clipped(pad + 8.0f, bot_y + 26.0f, w - pad * 2.0f - 16.0f, bottom_h - 32.0f) {
-            sdk.draw_text(pad + 8.0f, bot_y + 28.0f, self.last_error, 12.0f, c_err, .Mono);
-        };
-    } elseif self.locals.count == 0 {
-        sdk.draw_text(pad + 8.0f, bot_y + 30.0f, "No active stack frame. Set a breakpoint (click line or F9) and press Start (F5).", 11.5f, txt_dis);
-    } else {
-        lx: f32 = pad + 8.0f;
-        ly: f32 = bot_y + 28.0f;
-        max_x := w - pad - 8.0f;
-        for &v in self.locals {
-            has_val := v.value.count > 0 && !str.equal(v.value, "<uninit>");
-            chip := tprintf("{}: {} = {}", v.name, v.type, v.value) if has_val else tprintf("{}: {}", v.name, v.type);
-            cw := sdk.measure_text(chip, 11.5f) + 18.0f;
-            if lx + cw > max_x && lx > pad + 8.0f {
-                lx = pad + 8.0f;
-                ly += 24.0f;
-                if ly > bot_y + bottom_h - 24.0f do break;
+                    if (i % 2) == 1 {
+                        sdk.draw_rect(right_x + 4.0f, vy, right_w - 10.0f, vrow_h, 0x1E1E2E55, 2.0f);
+                    }
+                    if v.changed {
+                        sdk.draw_rect(right_x + 4.0f, vy, right_w - 10.0f, vrow_h, 0xF9E2AF1E, 2.0f);
+                    }
+
+                    vst := sdk.button(cast(u32) (4000 + i), right_x + 4.0f, vy, right_w - 10.0f, vrow_h, "", .Ghost);
+                    if sdk.is_clicked(vst) {
+                        sdk.set_clipboard(v.value);
+                        sdk.notify(.Info, tprintf("Copied {} = {}", v.name, v.value));
+                    }
+                    if sdk.is_hovered(vst) {
+                        sdk.tooltip(tprintf("{}: {} = {}", v.name, v.type, v.value));
+                    }
+
+                    name_w := right_w * 0.34f;
+                    if name_w < 70.0f do name_w = 70.0f;
+                    sdk.draw_text(right_x + 8.0f, vy + 4.0f, v.name, 11.5f, c_warn if v.changed else c_info, abi.TextFlags.Mono | abi.TextFlags.Bold);
+                    sdk.draw_text(right_x + name_w, vy + 4.0f, tprintf("= {}", v.value), 11.5f, c_warn if v.changed else c_text, abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
+                }
+                sdk.scroll_end();
             }
-            is_wat_slot := str.starts_with(v.name, "local.");
-            is_ret      := str.equal(v.name, "return");
-            bg_c := 0xA6E3A128 if is_ret else (0x89B4FA22 if is_wat_slot else 0xCBA6F728);
-            fg_c := c_ok if is_ret else (c_info if is_wat_slot else (c_warn if has_val else accent));
-            w_used := sdk.pill(lx, ly, chip, bg_c, fg_c);
-            lx += w_used + 6.0f;
         }
+
+        case .Stack {
+            if self.frames.count == 0 {
+                sdk.draw_text(right_x + 10.0f, ry + 8.0f, "Call stack is empty.", 12.0f, c_muted);
+            } else {
+                frow_h: f32 = 24.0f;
+                fc_h := cast(f32) self.frames.count * frow_h + 12.0f;
+                sdk.scroll_begin(22, right_x + 2.0f, ry, right_w - 4.0f, rh, fc_h, &self.right_scroll_y);
+                for i in 0 .. self.frames.count {
+                    fr := &self.frames[i];
+                    fy := ry + cast(f32) i * frow_h;
+                    fst := sdk.button(cast(u32) (5000 + i), right_x + 4.0f, fy, right_w - 10.0f, frow_h, "", .Active if i == 0 else .Ghost);
+                    if sdk.is_clicked(fst) {
+                        load_view_file(self, fr.path, fr.line);
+                        sdk.editor_open(fr.path, cast(i32) fr.line, 1);
+                    }
+                    lbl := tprintf("#{} {}()  {}:{}", i, fr.func, fr.path, fr.line);
+                    sdk.draw_text(right_x + 8.0f, fy + 5.0f, lbl, 11.5f, c_accent if i == 0 else c_text, abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
+                }
+                sdk.scroll_end();
+            }
+        }
+
+        case .Breakpoints {
+            if self.all_bps.count == 0 {
+                sdk.draw_text_wrapped(right_x + 10.0f, ry + 8.0f, right_w - 20.0f, "Click a line gutter or press F9 in the editor to add breakpoints.", 12.0f, c_muted);
+            } else {
+                brow_h: f32 = 24.0f;
+                bc_h := cast(f32) self.all_bps.count * brow_h + 12.0f;
+                sdk.scroll_begin(23, right_x + 2.0f, ry, right_w - 4.0f, rh, bc_h, &self.right_scroll_y);
+                for i in 0 .. self.all_bps.count {
+                    bp := &self.all_bps[i];
+                    by := ry + cast(f32) i * brow_h;
+                    bst := sdk.button(cast(u32) (6000 + i), right_x + 4.0f, by, right_w - 36.0f, brow_h, "", .Ghost);
+                    if sdk.is_clicked(bst) {
+                        load_view_file(self, bp.path, bp.line);
+                        sdk.editor_open(bp.path, cast(i32) bp.line, 1);
+                    }
+                    sdk.draw_circle(right_x + 12.0f, by + brow_h * 0.5f, 4.0f, c_err);
+                    sdk.draw_text(right_x + 22.0f, by + 5.0f, tprintf("{}:{}", bp.path, bp.line), 11.5f, c_text, abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
+
+                    sdk.on_click(cast(u32) (6500 + i), right_x + right_w - 28.0f, by + 2.0f, 22.0f, 20.0f, "x", .Danger) {
+                        sdk.debug_toggle_breakpoint(bp.path, bp.line);
+                        refresh_breakpoints(self);
+                        break;
+                    };
+                }
+                sdk.scroll_end();
+            }
+        }
+
+        case .Output {
+            if self.out_lines.count == 0 {
+                sdk.draw_text(right_x + 10.0f, ry + 8.0f, "Program stdout / stderr will appear here.", 12.0f, c_muted);
+            } else {
+                olh: f32 = 17.0f;
+                oc_h := cast(f32) self.out_lines.count * olh + 12.0f;
+                sdk.scroll_begin(24, right_x + 2.0f, ry, right_w - 4.0f, rh, oc_h, &self.right_scroll_y);
+                for i in 0 .. self.out_lines.count {
+                    oy := ry + cast(f32) i * olh;
+                    vis := oy - self.right_scroll_y;
+                    if vis + olh < ry || vis > ry + rh do continue;
+                    ln := self.out_lines[i];
+                    col := c_err if (str.contains(ln, "error:") || str.contains(ln, "Error")) else c_text;
+                    sdk.draw_text(right_x + 8.0f, oy + 1.0f, ln, 11.5f, col, abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
+                }
+                sdk.scroll_end();
+            }
+        }
+
+        case .Wat {
+            if self.wat_lines.count == 0 {
+                sdk.draw_text_wrapped(right_x + 10.0f, ry + 8.0f, right_w - 20.0f, "Disassemble the active paused function to inspect its WebAssembly Text (.wat).", 12.0f, c_muted);
+                if is_paused {
+                    sdk.on_click(40, right_x + 10.0f, ry + 54.0f, 120.0f, 26.0f, "Load WAT", .Primary) {
+                        sdk.debug_command(.StepInstruction);
+                    };
+                }
+            } else {
+                wlh: f32 = 17.0f;
+                wc_h := cast(f32) self.wat_lines.count * wlh + 12.0f;
+                sdk.scroll_begin(25, right_x + 2.0f, ry, right_w - 4.0f, rh, wc_h, &self.right_scroll_y);
+                for i in 0 .. self.wat_lines.count {
+                    wy := ry + cast(f32) i * wlh;
+                    vis := wy - self.right_scroll_y;
+                    if vis + wlh < ry || vis > ry + rh do continue;
+                    if i == self.current_wat_line {
+                        sdk.draw_rect(right_x + 4.0f, wy, right_w - 10.0f, wlh, 0x89B4FA2E, 2.0f);
+                    }
+                    sdk.draw_text(right_x + 8.0f, wy + 1.0f, self.wat_lines[i], 11.0f, wat_line_color(self.wat_lines[i]), abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
+                }
+                sdk.scroll_end();
+            }
+        }
+    }
+
+    // ---- Optional Error Banner at Bottom ----
+    if err_h > 0.0f {
+        ey := h - pad - err_h;
+        sdk.draw_rect(pad, ey, inner_w, err_h, 0xF38BA822, 4.0f, c_err, 1.0f);
+        sdk.draw_text(pad + 8.0f, ey + 5.0f, self.last_error, 11.5f, c_err, abi.TextFlags.Mono | abi.TextFlags.Ellipsis);
     }
 }
